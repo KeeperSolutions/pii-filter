@@ -4,7 +4,7 @@ PII detection and masking pipeline for Keeper AI Gateway (OpenWebUI Pipelines in
 
 ## Status
 
-**Phase 1 — MVP in progress.** See `Dokument-4-v4.0-Implementation-Roadmap.md` (project files) for full task breakdown.
+**Phase 1 — MVP in progress.** 
 
 Current task: **Task 1 — Skeleton + repo setup** ✅
 
