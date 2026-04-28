@@ -1,0 +1,53 @@
+[project]
+name = "pii-filter"
+version = "0.1.0"
+description = "PII detection and masking pipeline for Keeper AI Gateway (OpenWebUI Pipelines)"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "MIT" }
+authors = [{ name = "Keeper Solutions AI Lab" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["."]
+extend-exclude = ["docs/references"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+files = ["pii_filter.py", "tests"]
+
+# Pipelines container provides `schemas` module at runtime; not available locally.
+[[tool.mypy.overrides]]
+module = "schemas"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function" 
+addopts = "-v --tb=short"

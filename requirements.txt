@@ -1,0 +1,8 @@
+# Runtime dependencies for pii_filter.py
+# Task 1 (skeleton): no runtime dependencies yet
+# Task 3 will add: presidio-analyzer, spacy, redis
+# Task 5 will add: redis (for thread vault)
+
+# IMPORTANT: This file mirrors what goes in the `requirements:` frontmatter line of pii_filter.py.
+# When deploying to Pipelines container, the container reads frontmatter, NOT this file.
+# This file exists for local development setup only.
