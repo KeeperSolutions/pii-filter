@@ -1,8 +1,15 @@
 # Runtime dependencies for pii_filter.py
-# Task 1 (skeleton): no runtime dependencies yet
-# Task 3 will add: presidio-analyzer, spacy, redis
-# Task 5 will add: redis (for thread vault)
+# Task 3: Presidio engine + 12 custom recognizers + HR NLP
+# Future tasks: Task 5 will add `redis` (for thread vault).
 
 # IMPORTANT: This file mirrors what goes in the `requirements:` frontmatter line of pii_filter.py.
 # When deploying to Pipelines container, the container reads frontmatter, NOT this file.
 # This file exists for local development setup only.
+
+presidio-analyzer>=2.2.0
+presidio-anonymizer>=2.2.0
+spacy>=3.7.0
+
+# HR spaCy model (hard requirement — no EN fallback per spec).
+# Pipelines container reads this URL line from the frontmatter `requirements:` field.
+https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
