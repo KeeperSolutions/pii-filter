@@ -33,7 +33,7 @@ def test_valves_have_defaults(pipeline: Pipeline) -> None:
     assert valves.pipelines == ["*"]
     assert valves.priority == 0
     assert valves.enabled is True
-    assert valves.languages == ["hr", "en"]
+    assert valves.languages == ["hr"]
     assert valves.degradation_mode == "block"
 
 

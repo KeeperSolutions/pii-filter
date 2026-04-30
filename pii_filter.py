@@ -380,7 +380,7 @@ class Pipeline:
         pipelines: list[str] = ["*"]
         priority: int = 0
         enabled: bool = True
-        languages: list[str] = ["hr", "en"]
+        languages: list[str] = ["hr"]
         # Behavior when the analyzer fails mid-request.
         #   "block" (default) — fail-closed: raise so the request never
         #     reaches the LLM unfiltered. GDPR-safe; recommended for prod.
@@ -515,18 +515,27 @@ class Pipeline:
             logger.warning("inlet called before on_startup completed; returning body unchanged")
             return body
 
-        # Defensive extraction of last user message text.
+        # Defensive extraction of the most recent user message text.
+        # The last entry in `messages` may be assistant/tool/system in
+        # multi-turn or tool-call flows, so iterate backwards until we
+        # find the most recent user-authored string content.
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             logger.warning("inlet: no messages in body, skipping analysis")
             return body
-        last_msg = messages[-1]
-        if not isinstance(last_msg, dict):
-            logger.warning("inlet: last message is not a dict, skipping analysis")
-            return body
-        text = last_msg.get("content", "")
-        if not isinstance(text, str) or not text.strip():
-            logger.debug("inlet: empty/non-string content, skipping analysis")
+        text: str | None = None
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = content
+            break
+        if text is None:
+            logger.debug("inlet: no non-empty user message content found, skipping analysis")
             return body
 
         try:
