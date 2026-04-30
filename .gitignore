@@ -38,3 +38,5 @@ Thumbs.db
 
 # Pipelines container artifacts (if running locally)
 pipelines/
+
+scratch/
