@@ -2,10 +2,10 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-04-30
-version: 0.3.0
+date: 2026-05-04
+version: 0.3.1
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 4 — inlet masking + placeholder generation. Detected spans in the last user message are replaced with deterministic placeholders ([ENTITY_N]); forward + reverse maps are stashed in body.metadata for outlet restoration (Task 6).
+description: PII detection and masking filter for Keeper AI Gateway. Task 4 — inlet masking + placeholder generation. Detected spans in the last user message are replaced with deterministic placeholders ([ENTITY_N]); forward + reverse maps are stashed in body.metadata for outlet restoration (Task 6). Bugfixes: removed spurious LOCATION→ADDRESS mapping (Task 10 scope), added whitespace tolerance to IBAN recognizers.
 requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
 """
 
@@ -43,10 +43,13 @@ _nlp_engine_cache: Any = None
 def _iban_mod_97_check(iban: str) -> bool:
     """ISO 13616 / MOD 97-10 IBAN checksum verification.
 
-    Strips spaces, moves the first 4 chars to the end, converts letters to
-    digits (A=10, B=11, ..., Z=35), and checks `int(numeric) % 97 == 1`.
+    Strips all whitespace (ASCII space, tabs, newlines), moves the first 4
+    chars to the end, converts letters to digits (A=10, B=11, ..., Z=35), and
+    checks `int(numeric) % 97 == 1`. Whitespace stripping lets the recognizer
+    patterns match the ISO 13616 4-char grouped form ("HR12 1001 ...") that
+    banking apps display, then funnel the same value through this checksum.
     """
-    pt = iban.replace(" ", "")
+    pt = re.sub(r"\s+", "", iban)
     rearranged = pt[4:] + pt[:4]
     numeric = ""
     for ch in rearranged:
@@ -111,9 +114,17 @@ class JMBGRecognizer(PatternRecognizer):
 
 
 class HRIBANRecognizer(PatternRecognizer):
-    """HR IBAN — 21-char IBAN starting HR, MOD 97-10 checksum."""
+    """HR IBAN — 21-char IBAN starting HR, MOD 97-10 checksum.
 
-    PATTERNS: ClassVar[list[Pattern]] = [Pattern("HR IBAN", r"\bHR\d{19}\b", 0.5)]
+    The pattern accepts both concatenated form ("HR1210010051863000160")
+    and the ISO 13616 4-char grouped form ("HR12 1001 0051 8630 0016 0")
+    that banking apps display by default. The whitespace is stripped before
+    the checksum runs, so the same input passes both gates.
+    """
+
+    PATTERNS: ClassVar[list[Pattern]] = [
+        Pattern("HR IBAN", r"\bHR\d{2}(?:\s?\d{4}){4}\s?\d\b", 0.5)
+    ]
 
     def __init__(self, supported_language: str = LANG) -> None:
         super().__init__(
@@ -331,12 +342,21 @@ def make_iban_recognizer(
 
     The factory delegates checksum validation to the shared
     `_iban_mod_97_check` helper, eliminating the duplication in the benchmark.
+
+    The regex accepts both concatenated form and the ISO 13616 4-char
+    grouped form ("IE29 AIBK 9311 5212 3456 78") banking apps display.
+    Country code + check digits form the first 4-char group; the BBAN is
+    split into `bban_length // 4` groups of 4 plus an optional trailing
+    group with the remaining `bban_length % 4` chars. Whitespace between
+    groups is optional; `_iban_mod_97_check` strips it before validation.
     """
-    iban_pattern = Pattern(
-        f"{country_code} IBAN",
-        rf"\b{country_code}\d{{2}}[A-Z0-9]{{{bban_length}}}\b",
-        0.5,
-    )
+    full_groups = bban_length // 4
+    remainder = bban_length % 4
+    pattern_str = rf"\b{country_code}\d{{2}}(?:\s?[A-Z0-9]{{4}}){{{full_groups}}}"
+    if remainder:
+        pattern_str += rf"\s?[A-Z0-9]{{{remainder}}}"
+    pattern_str += r"\b"
+    iban_pattern = Pattern(f"{country_code} IBAN", pattern_str, 0.5)
 
     class _IBANRecog(PatternRecognizer):
         def __init__(self) -> None:
@@ -537,11 +557,18 @@ class Pipeline:
     # Whitelist mapping: only entities in this dict are forwarded downstream;
     # everything else is dropped. Keys are raw Presidio entity types, values
     # are the Keeper-standardized type names used in metadata + masking.
+    #
+    # NOTE on LOCATION: spaCy NER + Presidio's built-in LocationRecognizer
+    # emit LOCATION for country/city names (e.g. "Hrvatska", "Njemačka").
+    # These are NOT addresses and masking them destroys LLM context. Real
+    # ADDRESS detection (street + number + postal code) is Task 10 scope —
+    # it will land its own canonical type then. Until then, LOCATION is
+    # intentionally absent from this whitelist so any LOCATION detection is
+    # silently dropped before masking, the same way unmapped types already are.
     PRESIDIO_TO_STANDARD: ClassVar[dict[str, str]] = {
         "PERSON": "PERSON",
         "EMAIL_ADDRESS": "EMAIL",
         "PHONE_NUMBER": "PHONE",
-        "LOCATION": "ADDRESS",
         "DATE_TIME": "DATE",
         "CREDIT_CARD": "CREDIT_CARD",
         "HR_OIB": "HR_OIB",

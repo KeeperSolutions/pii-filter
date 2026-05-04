@@ -408,6 +408,53 @@ async def test_inlet_disabled_valve_skips_masking(started_pipeline: Pipeline) ->
 
 
 @pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_masks_grouped_iban(started_pipeline: Pipeline) -> None:
+    """End-to-end: an HR IBAN in ISO 13616 4-char grouped form must be
+    detected by the recognizer regex, validated by the mod-97 check, and
+    masked with a placeholder. This is the user-facing form banking apps
+    display, so a miss here is a real PII leak."""
+    grouped = "HR12 1001 0051 8630 0016 0"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"Moj IBAN je {grouped}."}]
+    }
+    result = await started_pipeline.inlet(body)
+
+    masked_text = result["messages"][-1]["content"]
+    assert grouped not in masked_text, "raw IBAN leaked into masked text"
+    assert "[HR_IBAN_1]" in masked_text
+
+    fwd = result["metadata"]["pii_placeholder_map"]
+    assert fwd[grouped] == "[HR_IBAN_1]"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_does_not_mask_country_names(started_pipeline: Pipeline) -> None:
+    """Country names detected as LOCATION must not be masked.
+
+    Real ADDRESS recognition (street + number + postal code) is Task 10 scope.
+    Until then LOCATION is intentionally not in PRESIDIO_TO_STANDARD, so
+    spaCy/Presidio LOCATION hits are dropped silently before masking and
+    country names like 'Hrvatska' / 'Njemačku' stay in the prompt the LLM sees.
+    """
+    original = "Pišem iz Hrvatske, putujem u Njemačku."
+    body: dict[str, Any] = {"messages": [{"role": "user", "content": original}]}
+    result = await started_pipeline.inlet(body)
+
+    detections = result["metadata"].get("pii_detections", [])
+    address_detections = [d for d in detections if d.get("entity_type") == "ADDRESS"]
+    location_detections = [d for d in detections if d.get("entity_type") == "LOCATION"]
+    assert address_detections == [], "ADDRESS detection out of Task 4 scope"
+    assert location_detections == [], "LOCATION must not appear as canonical entity"
+
+    assert result["messages"][-1]["content"] == original
+
+    fwd = result["metadata"].get("pii_placeholder_map", {})
+    assert "Hrvatska" not in fwd
+    assert "Hrvatske" not in fwd
+    assert "Njemačku" not in fwd
+
+
+@pytest.mark.asyncio(loop_scope="module")
 async def test_inlet_no_misc_entity_in_detections(started_pipeline: Pipeline) -> None:
     """labels_to_ignore=['MISC','O'] suppresses the spaCy MISC label so it
     never reaches Presidio's mapper. Verify no detection comes back as MISC."""
