@@ -1,9 +1,9 @@
 """Unit tests for `mask_text` and inlet integration tests for masking.
 
 `mask_text` is exercised directly with synthesized `RecognizerResult` instances
-so the tests don't depend on the spaCy model. Inlet integration tests reuse
-the module-scoped `started_pipeline` fixture from `test_recognizers.py` via
-the conftest fixtures and run a real analyzer pass.
+so the tests don't depend on the spaCy model. Inlet integration tests in this
+module run a real analyzer pass using the module-scoped `started_pipeline`
+fixture defined below.
 """
 
 from __future__ import annotations
@@ -455,21 +455,22 @@ async def test_inlet_does_not_mask_country_names(started_pipeline: Pipeline) -> 
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_no_misc_entity_in_detections(started_pipeline: Pipeline) -> None:
-    """labels_to_ignore=['MISC','O'] suppresses the spaCy MISC label so it
-    never reaches Presidio's mapper. Verify no detection comes back as MISC."""
-    body: dict[str, Any] = {
-        "messages": [
-            {
-                "role": "user",
-                "content": "Microsoft Office i Hrvatska Pošta su tvrtke u zagrebu.",
-            }
-        ]
-    }
-    result = await started_pipeline.inlet(body)
-    detections = result["metadata"].get("pii_detections", [])
-    misc = [d for d in detections if "MISC" in (d.get("entity_type"), d.get("raw_entity_type"))]
-    assert misc == []
+async def test_analyzer_no_misc_entity_in_raw_results(started_pipeline: Pipeline) -> None:
+    """labels_to_ignore=['MISC','O'] must suppress the spaCy MISC label at
+    the NER stage so it never reaches Presidio's entity mapper.
+
+    Calling `inlet()` and inspecting `metadata.pii_detections` cannot prove
+    this — those results are already filtered through PRESIDIO_TO_STANDARD
+    (which doesn't include MISC), so MISC would be dropped regardless of the
+    NLP-engine config. Hit the analyzer directly and inspect raw results so
+    a regression in the `labels_to_ignore` config would actually fail the
+    test instead of silently passing on the whitelist drop.
+    """
+    assert started_pipeline.analyzer is not None
+    text = "Microsoft Office i Hrvatska Pošta su tvrtke u zagrebu."
+    raw = started_pipeline.analyzer.analyze(text=text, language="hr")
+    misc_or_o = [r for r in raw if r.entity_type in {"MISC", "O"}]
+    assert misc_or_o == [], f"expected MISC/O suppressed at NER stage, got {misc_or_o!r}"
 
 
 # ---------------------------------------------------------------------------
