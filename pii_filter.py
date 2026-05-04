@@ -3,23 +3,28 @@ title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
 date: 2026-05-04
-version: 0.3.1
+version: 0.4.0
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 4 — inlet masking + placeholder generation. Detected spans in the last user message are replaced with deterministic placeholders ([ENTITY_N]); forward + reverse maps are stashed in body.metadata for outlet restoration (Task 6). Bugfixes: removed spurious LOCATION→ADDRESS mapping (Task 10 scope), added whitespace tolerance to IBAN recognizers.
-requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
+description: PII detection and masking filter for Keeper AI Gateway. Task 5 — Redis thread vault: per-request placeholder maps replaced with a thread-scoped, Redis-backed vault keyed by chat_id, so the same PII value gets the same placeholder across every message in one OpenWebUI conversation. Falls back to per-request scope (Task 4 behaviour) when Redis is unavailable and Valves.degradation_mode='passthrough'.
+requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Iterator
-from typing import Any, ClassVar
+import uuid
+from collections.abc import Awaitable, Callable, Iterator
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import CreditCardRecognizer
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from redis.asyncio import Redis as RedisAsync
+    from redis.commands.core import AsyncScript
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +408,70 @@ CUSTOM_ENTITY_TYPES: frozenset[str] = frozenset(
 )
 
 
+def _select_accepted_detections(
+    text: str,
+    detections: list[RecognizerResult],
+    presidio_to_standard: dict[str, str],
+) -> list[RecognizerResult]:
+    """Filter, prioritize, and de-overlap raw analyzer detections.
+
+    Shared by `mask_text` (Task 4 fallback path) and the Task 5 inlet
+    Redis-vault path. The placeholder *source* differs between them but
+    detection *selection* is identical and must stay in lockstep.
+
+    Returns surviving detections sorted by `start` ASC, ready to be spliced
+    into the masked output. Empty list if `text` is falsy, no detections,
+    or no detection survives the whitelist + overlap filters.
+
+    Overlap resolution: sort by `(score DESC, custom_first, start ASC)`,
+    iterate, accept only if the span does not intersect any already-accepted
+    span. Zero-length / inverted spans are skipped defensively so a buggy
+    custom recognizer cannot inject a placeholder for an empty original.
+    """
+    if not text or not detections:
+        return []
+    candidates: list[RecognizerResult] = [
+        d for d in detections if d.entity_type in presidio_to_standard
+    ]
+    if not candidates:
+        return []
+    candidates.sort(
+        key=lambda d: (
+            -d.score,
+            0 if d.entity_type in CUSTOM_ENTITY_TYPES else 1,
+            d.start,
+        )
+    )
+    accepted: list[RecognizerResult] = []
+    for det in candidates:
+        if det.start >= det.end:
+            continue
+        if any(not (det.end <= a.start or a.end <= det.start) for a in accepted):
+            continue
+        accepted.append(det)
+    accepted.sort(key=lambda d: d.start)
+    return accepted
+
+
+def _build_enriched_detection(
+    det: RecognizerResult,
+    text: str,
+    standard_type: str,
+    original: str,
+    placeholder: str,
+) -> dict[str, Any]:
+    """Assemble the per-detection metadata dict the inlet stashes in body.metadata."""
+    return {
+        "entity_type": standard_type,
+        "start": det.start,
+        "end": det.end,
+        "score": det.score,
+        "raw_entity_type": det.entity_type,
+        "original": original,
+        "placeholder": placeholder,
+    }
+
+
 def mask_text(
     text: str,
     detections: list[RecognizerResult],
@@ -438,42 +507,19 @@ def mask_text(
         and accept a detection only if its `[start, end)` span does not
         intersect any already-accepted span. The algorithm is O(n^2) in the
         number of detections, which is fine for the typical n < 50 case.
+
+    Note:
+        Selection logic is shared with the Task 5 Redis-vault inlet path via
+        `_select_accepted_detections`. Only the placeholder *source* differs.
     """
-    if not text or not detections:
+    accepted = _select_accepted_detections(text, detections, presidio_to_standard)
+    if not accepted:
         return text, []
 
-    # Step 1: filter to whitelisted types.
-    candidates: list[RecognizerResult] = [
-        d for d in detections if d.entity_type in presidio_to_standard
-    ]
-    if not candidates:
-        return text, []
-
-    # Step 2: sort by score DESC, custom-first, start ASC.
-    candidates.sort(
-        key=lambda d: (
-            -d.score,
-            0 if d.entity_type in CUSTOM_ENTITY_TYPES else 1,
-            d.start,
-        )
-    )
-
-    # Step 3: greedily accept non-overlapping detections in priority order.
-    # Skip zero-length / inverted spans defensively — a buggy custom recognizer
-    # producing start >= end would otherwise allocate a placeholder for an
-    # empty original string and inject it into the masked text.
-    accepted: list[RecognizerResult] = []
-    for det in candidates:
-        if det.start >= det.end:
-            continue
-        if any(not (det.end <= a.start or a.end <= det.start) for a in accepted):
-            continue
-        accepted.append(det)
-
-    # Step 4: re-sort survivors by start ASC for the masking pass.
-    accepted.sort(key=lambda d: d.start)
-
-    # Step 5: build masked text in a single left-to-right pass + enrich detections.
+    # Build masked text in a single left-to-right pass and enrich detections.
+    # The placeholder *source* here is the local `forward_map` / `counter_state`
+    # passed in by the caller; the Task 5 Redis-vault inlet path uses the same
+    # selection logic but sources placeholders from `ThreadVault`.
     pieces: list[str] = []
     enriched: list[dict[str, Any]] = []
     last_end = 0
@@ -490,20 +536,242 @@ def mask_text(
         pieces.append(text[last_end : det.start])
         pieces.append(placeholder)
         last_end = det.end
-        enriched.append(
-            {
-                "entity_type": standard_type,
-                "start": det.start,
-                "end": det.end,
-                "score": det.score,
-                "raw_entity_type": det.entity_type,
-                "original": original,
-                "placeholder": placeholder,
-            }
-        )
+        enriched.append(_build_enriched_detection(det, text, standard_type, original, placeholder))
     pieces.append(text[last_end:])
 
     return "".join(pieces), enriched
+
+
+# ---------------------------------------------------------------------------
+# Thread vault (Task 5 — Redis-backed, thread-scoped placeholder storage)
+# ---------------------------------------------------------------------------
+
+
+# Atomic get-or-mint executed server-side by Redis. Eliminates the read-then-
+# mint race that would otherwise let two concurrent inlet calls in the same
+# thread allocate two placeholders for the same original.
+#
+# KEYS[1]   pii:thread:{chat_id}:forward             HASH  original -> placeholder
+# KEYS[2]   pii:thread:{chat_id}:counter:{TYPE}      INT
+# KEYS[3]   pii:thread:{chat_id}:reverse             HASH  placeholder -> original
+# ARGV[1]   original value
+# ARGV[2]   standardized entity_type (used in the placeholder string)
+# ARGV[3]   TTL seconds for all three keys
+#
+# Returns the placeholder string (existing or freshly minted).
+_LUA_GET_OR_MINT = """
+local existing = redis.call('HGET', KEYS[1], ARGV[1])
+if existing then
+  redis.call('EXPIRE', KEYS[1], ARGV[3])
+  redis.call('EXPIRE', KEYS[2], ARGV[3])
+  redis.call('EXPIRE', KEYS[3], ARGV[3])
+  return existing
+end
+local n = redis.call('INCR', KEYS[2])
+local placeholder = '[' .. ARGV[2] .. '_' .. n .. ']'
+redis.call('HSET', KEYS[1], ARGV[1], placeholder)
+redis.call('HSET', KEYS[3], placeholder, ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+redis.call('EXPIRE', KEYS[3], ARGV[3])
+return placeholder
+"""
+
+
+_EPHEMERAL_PREFIX = "ephemeral:"
+
+
+def make_ephemeral_thread_id() -> str:
+    """Generate a fresh ephemeral thread id used when chat_id is missing.
+
+    The `ephemeral:` prefix is recognized by `ThreadVault` for selecting the
+    short TTL (per spec §2.1.4 — `ephemeral_ttl_seconds`). Single-request
+    mask/unmask works; cross-request consistency does not — there's no
+    chat_id to thread on next time anyway.
+    """
+    return f"{_EPHEMERAL_PREFIX}{uuid.uuid4()}"
+
+
+class ThreadVault:
+    """Thread-scoped placeholder vault backed by Redis.
+
+    Replaces Task 4's per-request dicts with a `chat_id`-keyed Redis store
+    so the same original PII value gets the same placeholder across every
+    message in one OpenWebUI conversation. Cross-thread isolation is
+    automatic via the `pii:thread:{chat_id}:*` key prefix.
+
+    The Redis client is created lazily on first use so test substitution
+    is clean and pytest collection does not open sockets. Atomic
+    get-or-mint is enforced server-side by `_LUA_GET_OR_MINT`. TTL is
+    renewed on every public method that touches a thread's keys
+    (spec §3.5).
+
+    Schema (verbatim from Dokument 3 §8.4):
+        pii:thread:{chat_id}:forward          HASH   original -> placeholder
+        pii:thread:{chat_id}:reverse          HASH   placeholder -> original
+        pii:thread:{chat_id}:counter:{TYPE}   INT
+    """
+
+    def __init__(
+        self,
+        url: str = "redis://localhost:6379/0",
+        *,
+        connect_timeout_ms: int = 200,
+        socket_timeout_ms: int = 500,
+        thread_ttl_seconds: int = 86400,
+        ephemeral_ttl_seconds: int = 600,
+        client: RedisAsync | None = None,
+    ) -> None:
+        self._url = url
+        self._connect_timeout = connect_timeout_ms / 1000.0
+        self._socket_timeout = socket_timeout_ms / 1000.0
+        self._thread_ttl = thread_ttl_seconds
+        self._ephemeral_ttl = ephemeral_ttl_seconds
+        # `client` lets tests inject `fakeredis.aioredis.FakeRedis`. When
+        # None, a real `redis.asyncio.Redis` is built lazily on first use.
+        self._client: RedisAsync | None = client
+        self._lua: AsyncScript | None = None
+
+    # -- key building --------------------------------------------------------
+
+    @staticmethod
+    def _key_forward(chat_id: str) -> str:
+        return f"pii:thread:{chat_id}:forward"
+
+    @staticmethod
+    def _key_reverse(chat_id: str) -> str:
+        return f"pii:thread:{chat_id}:reverse"
+
+    @staticmethod
+    def _key_counter(chat_id: str, entity_type: str) -> str:
+        return f"pii:thread:{chat_id}:counter:{entity_type}"
+
+    @staticmethod
+    def _counter_pattern(chat_id: str) -> str:
+        return f"pii:thread:{chat_id}:counter:*"
+
+    def _ttl_for(self, chat_id: str) -> int:
+        return self._ephemeral_ttl if chat_id.startswith(_EPHEMERAL_PREFIX) else self._thread_ttl
+
+    # -- client lifecycle ----------------------------------------------------
+
+    async def _get_client(self) -> RedisAsync:
+        """Lazily build the Redis client and register the Lua script."""
+        if self._client is None:
+            from redis.asyncio import Redis as _Redis
+
+            self._client = _Redis.from_url(
+                self._url,
+                socket_connect_timeout=self._connect_timeout,
+                socket_timeout=self._socket_timeout,
+                decode_responses=True,
+            )
+        if self._lua is None:
+            self._lua = self._client.register_script(_LUA_GET_OR_MINT)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the underlying Redis client if one was instantiated."""
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("ThreadVault aclose() raised: %s", exc)
+            finally:
+                self._client = None
+                self._lua = None
+
+    # -- TTL renewal ---------------------------------------------------------
+
+    async def _renew_ttl(self, chat_id: str) -> None:
+        """Push EXPIRE on the three primary keys plus all per-type counters.
+
+        EXPIRE on a missing key is a no-op so this is safe before any data
+        exists. Counter cardinality per thread is bounded (~12 entity types)
+        so a single KEYS lookup is cheaper than walking with SCAN.
+        """
+        client = await self._get_client()
+        ttl = self._ttl_for(chat_id)
+        await client.expire(self._key_forward(chat_id), ttl)
+        await client.expire(self._key_reverse(chat_id), ttl)
+        cnt_keys = await cast(
+            "Awaitable[list[bytes | str]]", client.keys(self._counter_pattern(chat_id))
+        )
+        for cnt_key in cnt_keys:
+            await client.expire(cnt_key, ttl)
+
+    # -- public API ----------------------------------------------------------
+
+    async def healthcheck(self) -> bool:
+        """Return True if Redis answers PING within the connect timeout."""
+        try:
+            client = await self._get_client()
+            pong = await cast("Awaitable[Any]", client.ping())
+            healthy = bool(pong)
+            logger.debug("ThreadVault healthcheck: redis=%s", healthy)
+            return healthy
+        except Exception as exc:
+            logger.error("ThreadVault healthcheck failed: %s", exc, exc_info=True)
+            return False
+
+    async def get_or_create_thread(self, chat_id: str) -> None:
+        """Refresh TTL on every key belonging to this thread.
+
+        Renewal-on-read prevents stale threads from being garbage-collected
+        mid-conversation if the user pauses for several hours.
+        """
+        await self._renew_ttl(chat_id)
+
+    async def get_placeholder(self, chat_id: str, original: str, entity_type: str) -> str:
+        """Atomic get-or-mint of a placeholder for `original` in this thread.
+
+        Returns the existing placeholder if `original` was already minted
+        in this thread; otherwise INCRs the per-type counter and writes
+        both forward and reverse hash entries. Atomicity is enforced
+        server-side by `_LUA_GET_OR_MINT` — concurrent callers in the same
+        thread cannot produce two placeholders for the same original.
+        """
+        await self._get_client()
+        assert self._lua is not None  # _get_client guarantees this
+        ttl = self._ttl_for(chat_id)
+        result = await self._lua(
+            keys=[
+                self._key_forward(chat_id),
+                self._key_counter(chat_id, entity_type),
+                self._key_reverse(chat_id),
+            ],
+            args=[original, entity_type, ttl],
+        )
+        return cast(str, result)
+
+    async def restore(self, chat_id: str, placeholder: str) -> str | None:
+        """Reverse-lookup a placeholder. Returns None if not minted in this thread.
+
+        Task 6 uses None to leave hallucinated placeholders alone.
+        """
+        client = await self._get_client()
+        original = await cast(
+            "Awaitable[str | None]", client.hget(self._key_reverse(chat_id), placeholder)
+        )
+        await self._renew_ttl(chat_id)
+        return original
+
+    async def snapshot_for_request(self, chat_id: str) -> tuple[dict[str, str], dict[str, str]]:
+        """Read the full forward + reverse maps for this thread.
+
+        Used by `inlet` to populate `body["metadata"]["pii_placeholder_map"]`
+        and `pii_reverse_map` so the outlet (Task 6) keeps reading from
+        body.metadata regardless of Redis being the source of truth.
+        """
+        client = await self._get_client()
+        forward = await cast(
+            "Awaitable[dict[str, str]]", client.hgetall(self._key_forward(chat_id))
+        )
+        reverse = await cast(
+            "Awaitable[dict[str, str]]", client.hgetall(self._key_reverse(chat_id))
+        )
+        await self._renew_ttl(chat_id)
+        return forward, reverse
 
 
 # ---------------------------------------------------------------------------
@@ -536,13 +804,29 @@ class Pipeline:
         priority: int = 0
         enabled: bool = True
         languages: list[str] = ["hr"]
-        # Behavior when the analyzer fails mid-request.
+        # Behavior when the analyzer (or the Redis vault) fails mid-request.
         #   "block" (default) — fail-closed: raise so the request never
         #     reaches the LLM unfiltered. GDPR-safe; recommended for prod.
         #   "passthrough" — fail-open: log and let the request through
         #     without PII filtering. Use only if availability outweighs
         #     leak risk. Any unrecognized value is treated as "block".
         degradation_mode: str = "block"
+        # ---- Task 5: Redis thread vault ------------------------------------
+        # Global kill switch. When False, the inlet always uses Task 4's
+        # per-request dicts and never touches Redis.
+        redis_enabled: bool = True
+        # Connection string. The Pipelines container default expects a
+        # Redis instance reachable at this URL; override per-environment.
+        redis_url: str = "redis://localhost:6379/0"
+        # Fast-fail timeout on first connect / PING so the inlet doesn't add
+        # hundreds of ms on a dead Redis.
+        redis_connect_timeout_ms: int = 200
+        # Per-operation timeout once connected.
+        redis_socket_timeout_ms: int = 500
+        # 24h. Renewed on every read or write touching the thread.
+        thread_ttl_seconds: int = 86400
+        # 10 min for chat_id-less ephemeral fallback threads.
+        ephemeral_ttl_seconds: int = 600
 
     class UserValves(BaseModel):
         """Per-user toggles. Schema only — Task 8 wires the masking toggle.
@@ -597,6 +881,9 @@ class Pipeline:
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
         self.analyzer: AnalyzerEngine | None = None
+        # ThreadVault is built in `on_startup` from the current valves so
+        # admin-edited Redis settings take effect on Pipelines restart.
+        self.vault: ThreadVault | None = None
 
         logger.info("PII Filter pipeline initialized (analyzer not loaded yet)")
 
@@ -674,12 +961,31 @@ class Pipeline:
         analyzer.analyze(text="warmup", language=LANG, entities=None)
 
         self.analyzer = analyzer
-        logger.info("PII Filter on_startup complete: 12 custom + CreditCard recognizers registered")
+
+        # Build the ThreadVault from the current valves. Connection is lazy:
+        # the underlying Redis client is created on first use, not here, so
+        # `on_startup` does not block on a Redis daemon.
+        self.vault = ThreadVault(
+            url=self.valves.redis_url,
+            connect_timeout_ms=self.valves.redis_connect_timeout_ms,
+            socket_timeout_ms=self.valves.redis_socket_timeout_ms,
+            thread_ttl_seconds=self.valves.thread_ttl_seconds,
+            ephemeral_ttl_seconds=self.valves.ephemeral_ttl_seconds,
+        )
+        logger.info(
+            "PII Filter on_startup complete: 12 custom + CreditCard recognizers "
+            "registered; ThreadVault wired (redis_enabled=%s, url=%s)",
+            self.valves.redis_enabled,
+            self.valves.redis_url,
+        )
 
     async def on_shutdown(self) -> None:
         """Called when Pipelines container stops."""
         logger.info("PII Filter on_shutdown")
         self.analyzer = None
+        if self.vault is not None:
+            await self.vault.aclose()
+            self.vault = None
 
     def _iter_maskable_parts(
         self, message: dict[str, Any]
@@ -723,14 +1029,35 @@ class Pipeline:
 
                 yield text_val, _write_back_part
 
+    @staticmethod
+    def _resolve_chat_id(body: dict[str, Any]) -> tuple[str | None, str]:
+        """Pull `chat_id` from body (top-level then metadata) and pick the
+        thread_id used by the vault. Returns `(raw_chat_id, thread_id)`:
+
+        * `raw_chat_id` is the original `chat_id` from the body, or `None`
+          when the request didn't supply one.
+        * `thread_id` is what's used for Redis key building — equal to
+          `raw_chat_id` when present, otherwise a fresh ephemeral id.
+        """
+        raw = body.get("chat_id")
+        if not raw:
+            metadata = body.get("metadata")
+            if isinstance(metadata, dict):
+                raw = metadata.get("chat_id")
+        if isinstance(raw, str) and raw:
+            return raw, raw
+        return None, make_ephemeral_thread_id()
+
     async def inlet(
         self, body: dict[str, Any], user: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Detect PII in the last user message, mask it in place, and stash
-        the placeholder maps in `body["metadata"]` for the outlet (Task 6).
+        """Detect PII in the last user message, mask it in place using the
+        thread-scoped Redis vault (Task 5), and stash forward + reverse maps
+        in `body["metadata"]` so the outlet (Task 6) keeps reading the same
+        keys regardless of Redis being the source of truth.
 
         Mutates the matched message's `content` field. All other body keys
-        are left untouched. On analyzer failure, behavior follows
+        are left untouched. On analyzer / vault failure, behavior follows
         `valves.degradation_mode` (block → raise; passthrough → return).
         """
         if not self.valves.enabled:
@@ -761,27 +1088,94 @@ class Pipeline:
             logger.debug("inlet: target message has no maskable text parts")
             return body
 
-        # Per-request mapping state. Counters and maps are shared across all
-        # text parts of the message so dedupe works across multi-modal parts.
+        raw_chat_id, thread_id = self._resolve_chat_id(body)
+        if raw_chat_id is None:
+            logger.warning("inlet: chat_id missing, using ephemeral thread_id=%s", thread_id)
+
+        # Decide whether to use Redis or fall back to per-request dicts.
+        # Redis path requires `redis_enabled=True`, a vault instance, and
+        # a healthy PING. On any of those failing in `block` mode we raise
+        # so the request never reaches the LLM unfiltered.
+        use_redis = self.valves.redis_enabled and self.vault is not None
+        if use_redis:
+            assert self.vault is not None  # for mypy
+            try:
+                healthy = await self.vault.healthcheck()
+            except Exception:
+                logger.exception("inlet: vault healthcheck raised; treating as unhealthy")
+                healthy = False
+            if not healthy:
+                if self.valves.degradation_mode != "passthrough":
+                    raise RuntimeError(
+                        "PII filter blocked the request: Redis thread vault is "
+                        "unavailable and degradation_mode='block'. Set "
+                        "valves.degradation_mode='passthrough' to fall back to "
+                        "per-request scope on Redis outages (NOT recommended "
+                        "in production)."
+                    )
+                logger.warning(
+                    "Redis unavailable, falling back to per-request scope. "
+                    "Thread consistency disabled for chat_id=%s",
+                    raw_chat_id,
+                )
+                use_redis = False
+
+        # Per-request mapping state. Used in the fallback path; in the Redis
+        # path we read the snapshot back from the vault at the end.
         counter_state: dict[str, int] = {}
         forward_map: dict[str, str] = {}
         reverse_map: dict[str, str] = {}
         all_enriched: list[dict[str, Any]] = []
 
+        if use_redis:
+            assert self.vault is not None  # for mypy
+            try:
+                await self.vault.get_or_create_thread(thread_id)
+            except Exception:
+                logger.exception("inlet: vault get_or_create_thread raised")
+                if self.valves.degradation_mode != "passthrough":
+                    raise RuntimeError(
+                        "PII filter blocked the request: Redis thread vault is "
+                        "unreachable and degradation_mode='block'."
+                    ) from None
+                use_redis = False
+
         try:
             for text, write_back in parts:
                 results = self.analyzer.analyze(text=text, language=LANG)
-                masked, enriched = mask_text(
-                    text,
-                    results,
-                    self.PRESIDIO_TO_STANDARD,
-                    counter_state,
-                    forward_map,
-                    reverse_map,
-                )
-                if enriched:
-                    write_back(masked)
-                all_enriched.extend(enriched)
+                accepted = _select_accepted_detections(text, results, self.PRESIDIO_TO_STANDARD)
+                if not accepted:
+                    continue
+
+                pieces: list[str] = []
+                last_end = 0
+                for det in accepted:
+                    original = text[det.start : det.end]
+                    standard_type = self.PRESIDIO_TO_STANDARD[det.entity_type]
+                    placeholder: str
+                    if use_redis:
+                        assert self.vault is not None  # for mypy
+                        placeholder = await self.vault.get_placeholder(
+                            thread_id, original, standard_type
+                        )
+                    else:
+                        existing = forward_map.get(original)
+                        if existing is None:
+                            n = counter_state.get(standard_type, 0) + 1
+                            counter_state[standard_type] = n
+                            placeholder = f"[{standard_type}_{n}]"
+                            forward_map[original] = placeholder
+                            reverse_map[placeholder] = original
+                        else:
+                            placeholder = existing
+                    pieces.append(text[last_end : det.start])
+                    pieces.append(placeholder)
+                    last_end = det.end
+                    all_enriched.append(
+                        _build_enriched_detection(det, text, standard_type, original, placeholder)
+                    )
+                pieces.append(text[last_end:])
+                write_back("".join(pieces))
         except Exception as exc:
             logger.exception("inlet: analyzer/mask pipeline failed")
             if self.valves.degradation_mode == "passthrough":
@@ -806,6 +1200,13 @@ class Pipeline:
                 "through on filter errors (NOT recommended in production)."
             ) from exc
 
+        # Spec §3.3 step 7 — body-metadata snapshot is the forward-compat hinge
+        # for Task 6: outlet keeps reading from these keys regardless of Redis
+        # being the source of truth.
+        if use_redis:
+            assert self.vault is not None  # for mypy
+            forward_map, reverse_map = await self.vault.snapshot_for_request(thread_id)
+
         metadata = body.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
@@ -814,12 +1215,15 @@ class Pipeline:
         metadata["pii_placeholder_map"] = forward_map
         metadata["pii_reverse_map"] = reverse_map
 
-        chat_id = metadata.get("chat_id") or body.get("chat_id")
+        redis_state = ("ephemeral" if raw_chat_id is None else "on") if use_redis else "off"
         logger.info(
-            "pii_filter inlet processed: chat_id=%s detections=%d masked=%d",
-            chat_id,
+            "pii_filter inlet processed: chat_id=%s thread_id=%s detections=%d "
+            "masked=%d redis=%s",
+            raw_chat_id,
+            thread_id,
             len(all_enriched),
             len(forward_map),
+            redis_state,
         )
 
         return body

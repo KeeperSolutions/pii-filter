@@ -4,9 +4,9 @@ PII detection and masking pipeline for Keeper AI Gateway (OpenWebUI Pipelines in
 
 ## Status
 
-**Phase 1 — MVP in progress.** 
+**Phase 1 — MVP in progress.**
 
-Current task: **Task 1 — Skeleton + repo setup** ✅
+Current task: **Task 5 — Redis thread vault** ✅ (in review)
 
 ## Overview
 
@@ -54,6 +54,19 @@ source .venv/bin/activate
 # Install dev dependencies
 pip install -r requirements-dev.txt
 ```
+
+### Local Redis (Task 5)
+
+The thread vault talks to Redis. The test suite uses `fakeredis` (no daemon
+needed), but smoke testing the running pipeline against a real container is
+how Cloud Run deploys behave. Spin up a local Redis with:
+
+```bash
+docker run -d --name keeper-redis -p 6379:6379 redis:7-alpine
+```
+
+The default `Valves.redis_url` (`redis://localhost:6379/0`) hits this
+container straight away. Stop it with `docker stop keeper-redis` when done.
 
 ### Tests
 

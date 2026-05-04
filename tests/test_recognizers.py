@@ -438,9 +438,7 @@ def test_hr_iban_validates_grouped_form() -> None:
         ("GB", 18, "GB_IBAN"),
     ],
 )
-def test_factory_iban_validates_grouped_form(
-    country: str, bban_length: int, entity: str
-) -> None:
+def test_factory_iban_validates_grouped_form(country: str, bban_length: int, entity: str) -> None:
     """ISO 13616 whitespace grouping must pass validation for all factory IBANs."""
     bban = "AAAA" + "1" * (bban_length - 4)
     valid = _make_iban(country, bban)
