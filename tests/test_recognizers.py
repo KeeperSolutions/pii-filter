@@ -410,6 +410,86 @@ def test_factory_iban_rejects_invalid(
 
 
 # ---------------------------------------------------------------------------
+# IBAN whitespace tolerance (ISO 13616 4-char grouped form)
+# ---------------------------------------------------------------------------
+
+
+def _group_iban(concatenated: str) -> str:
+    """Insert ASCII spaces every 4 chars from the start (ISO 13616 grouping).
+
+    "HR1210010051863000160" -> "HR12 1001 0051 8630 0016 0".
+    """
+    return " ".join(concatenated[i : i + 4] for i in range(0, len(concatenated), 4))
+
+
+def test_hr_iban_validates_grouped_form() -> None:
+    """ISO 13616 whitespace grouping must pass validation (mod-97 strips spaces)."""
+    valid = _make_iban("HR", "10010051863000160")
+    grouped = _group_iban(valid)
+    assert " " in grouped
+    assert HRIBANRecognizer().validate_result(grouped) is True
+
+
+@pytest.mark.parametrize(
+    "country,bban_length,entity",
+    [
+        ("IE", 18, "IE_IBAN"),
+        ("RO", 20, "RO_IBAN"),
+        ("GB", 18, "GB_IBAN"),
+    ],
+)
+def test_factory_iban_validates_grouped_form(
+    country: str, bban_length: int, entity: str
+) -> None:
+    """ISO 13616 whitespace grouping must pass validation for all factory IBANs."""
+    bban = "AAAA" + "1" * (bban_length - 4)
+    valid = _make_iban(country, bban)
+    grouped = _group_iban(valid)
+    assert " " in grouped
+    rec = make_iban_recognizer(country, bban_length, entity)
+    assert rec.validate_result(grouped) is True
+
+
+@pytest.mark.parametrize(
+    "country,bban_length,entity",
+    [
+        ("IE", 18, "IE_IBAN"),
+        ("RO", 20, "RO_IBAN"),
+        ("GB", 18, "GB_IBAN"),
+    ],
+)
+def test_factory_iban_pattern_matches_grouped_form(
+    country: str, bban_length: int, entity: str
+) -> None:
+    """Recognizer regex must capture the entire grouped IBAN as one span."""
+    import re as _re
+
+    bban = "AAAA" + "1" * (bban_length - 4)
+    valid = _make_iban(country, bban)
+    grouped = _group_iban(valid)
+    rec = make_iban_recognizer(country, bban_length, entity)
+    text = f"Moj IBAN je {grouped}."
+    match = _re.search(rec.patterns[0].regex, text)
+    assert match is not None, f"{entity} pattern failed to match grouped form"
+    matched = match.group()
+    # Span must cover the whole grouped IBAN; first 4 chars are country+check.
+    assert matched.startswith(grouped[:4])
+    assert matched.replace(" ", "") == valid
+
+
+def test_hr_iban_pattern_matches_grouped_form() -> None:
+    """HR recognizer regex must capture the grouped IBAN as one span."""
+    import re as _re
+
+    valid = _make_iban("HR", "10010051863000160")
+    grouped = _group_iban(valid)
+    text = f"Moj IBAN je {grouped}."
+    match = _re.search(HRIBANRecognizer().patterns[0].regex, text)
+    assert match is not None, "HR_IBAN pattern failed to match grouped form"
+    assert match.group().replace(" ", "") == valid
+
+
+# ---------------------------------------------------------------------------
 # UK_UTR span integrity (lookbehind keeps span on digits only)
 # ---------------------------------------------------------------------------
 
