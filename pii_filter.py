@@ -684,21 +684,27 @@ class ThreadVault:
     # -- TTL renewal ---------------------------------------------------------
 
     async def _renew_ttl(self, chat_id: str) -> None:
-        """Push EXPIRE on the three primary keys plus all per-type counters.
+        """Push EXPIRE on the primary keys plus all per-type counters.
 
         EXPIRE on a missing key is a no-op so this is safe before any data
-        exists. Counter cardinality per thread is bounded (~12 entity types)
-        so a single KEYS lookup is cheaper than walking with SCAN.
+        exists. Counter keys are discovered incrementally with SCAN to avoid
+        blocking Redis with a full-keyspace KEYS lookup on shared instances.
         """
         client = await self._get_client()
         ttl = self._ttl_for(chat_id)
         await client.expire(self._key_forward(chat_id), ttl)
         await client.expire(self._key_reverse(chat_id), ttl)
-        cnt_keys = await cast(
-            "Awaitable[list[bytes | str]]", client.keys(self._counter_pattern(chat_id))
-        )
-        for cnt_key in cnt_keys:
-            await client.expire(cnt_key, ttl)
+        cursor: int = 0
+        pattern = self._counter_pattern(chat_id)
+        while True:
+            cursor, cnt_keys = await cast(
+                "Awaitable[tuple[int, list[bytes | str]]]",
+                client.scan(cursor=cursor, match=pattern, count=16),
+            )
+            for cnt_key in cnt_keys:
+                await client.expire(cnt_key, ttl)
+            if cursor == 0:
+                break
 
     # -- public API ----------------------------------------------------------
 
@@ -1205,7 +1211,20 @@ class Pipeline:
         # being the source of truth.
         if use_redis:
             assert self.vault is not None  # for mypy
-            forward_map, reverse_map = await self.vault.snapshot_for_request(thread_id)
+            try:
+                forward_map, reverse_map = await self.vault.snapshot_for_request(thread_id)
+            except Exception:
+                logger.exception("inlet: vault snapshot_for_request raised")
+                if self.valves.degradation_mode != "passthrough":
+                    raise RuntimeError(
+                        "PII filter blocked the request: Redis thread vault is "
+                        "unreachable and degradation_mode='block'."
+                    ) from None
+                # Passthrough: masking already completed against vault, but we
+                # cannot rebuild the request-scoped maps. Leave them empty so
+                # the request still reaches the LLM; outlet restoration for
+                # this turn will be a no-op.
+                use_redis = False
 
         metadata = body.get("metadata")
         if not isinstance(metadata, dict):

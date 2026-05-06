@@ -12,18 +12,19 @@ from fakeredis import aioredis as fake_aioredis
 from pii_filter import Pipeline, ThreadVault
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def _swap_redis_to_fakeredis() -> Generator[None, None, None]:
-    """Globally redirect `redis.asyncio.Redis.from_url` to fakeredis for the
-    test session so `Pipeline.on_startup` can build a working `ThreadVault`
+    """Redirect `redis.asyncio.Redis.from_url` to fakeredis for each test
+    module so `Pipeline.on_startup` can build a working `ThreadVault`
     without a running Redis daemon. Tests that explicitly inject a client
     via `ThreadVault(client=...)` short-circuit `_get_client` and are
     unaffected.
 
-    A single `FakeServer` backs every `from_url` call so state minted by
-    one Pipeline instance is visible to a later one within the same test
-    session — necessary for Task 5 cross-request consistency assertions
-    against the module-scoped `started_pipeline` fixture.
+    A single `FakeServer` backs every `from_url` call within the current
+    module, so state minted by one Pipeline instance is visible to a later
+    one in the same module — preserving cross-request consistency for
+    module-scoped fixtures such as `started_pipeline` while preventing
+    Redis state from leaking across modules.
     """
     from redis.asyncio import Redis
 
