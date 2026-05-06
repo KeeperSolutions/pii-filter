@@ -414,9 +414,7 @@ async def test_inlet_masks_grouped_iban(started_pipeline: Pipeline) -> None:
     masked with a placeholder. This is the user-facing form banking apps
     display, so a miss here is a real PII leak."""
     grouped = "HR12 1001 0051 8630 0016 0"
-    body: dict[str, Any] = {
-        "messages": [{"role": "user", "content": f"Moj IBAN je {grouped}."}]
-    }
+    body: dict[str, Any] = {"messages": [{"role": "user", "content": f"Moj IBAN je {grouped}."}]}
     result = await started_pipeline.inlet(body)
 
     masked_text = result["messages"][-1]["content"]
@@ -471,6 +469,184 @@ async def test_analyzer_no_misc_entity_in_raw_results(started_pipeline: Pipeline
     raw = started_pipeline.analyzer.analyze(text=text, language="hr")
     misc_or_o = [r for r in raw if r.entity_type in {"MISC", "O"}]
     assert misc_or_o == [], f"expected MISC/O suppressed at NER stage, got {misc_or_o!r}"
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — inlet integration tests against the Redis thread vault
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_thread_consistency_across_requests(
+    started_pipeline: Pipeline,
+) -> None:
+    """Same chat_id + same PII value across two inlet calls reuses the same
+    placeholder. This is the core epic acceptance criterion for Task 5."""
+    oib = _make_oib("1112223330")
+    chat_id = "task5-consistency-thread"
+
+    body1: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    result1 = await started_pipeline.inlet(body1)
+    masked1 = result1["messages"][-1]["content"]
+    fwd1 = result1["metadata"]["pii_placeholder_map"]
+    placeholder_first = fwd1[oib]
+
+    body2: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"Provjera istog OIB-a: {oib}"}],
+    }
+    result2 = await started_pipeline.inlet(body2)
+    masked2 = result2["messages"][-1]["content"]
+    fwd2 = result2["metadata"]["pii_placeholder_map"]
+
+    assert placeholder_first in masked1
+    assert placeholder_first in masked2
+    assert fwd2[oib] == placeholder_first
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_cross_thread_isolation(started_pipeline: Pipeline) -> None:
+    """Different chat_ids hold independent counters: same value yields the
+    same numeric suffix in each thread but they are separate vault entries."""
+    oib = _make_oib("2223334440")
+    body_a: dict[str, Any] = {
+        "chat_id": "task5-isolation-thread-A",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    body_b: dict[str, Any] = {
+        "chat_id": "task5-isolation-thread-B",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+
+    result_a = await started_pipeline.inlet(body_a)
+    result_b = await started_pipeline.inlet(body_b)
+
+    placeholder_a = result_a["metadata"]["pii_placeholder_map"][oib]
+    placeholder_b = result_b["metadata"]["pii_placeholder_map"][oib]
+    assert placeholder_a == "[HR_OIB_1]"
+    assert placeholder_b == "[HR_OIB_1]"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_chat_id_in_body_metadata_fallback(
+    started_pipeline: Pipeline,
+) -> None:
+    """When body has no top-level `chat_id` but `metadata.chat_id` is set,
+    the inlet uses the metadata value as the thread key."""
+    oib = _make_oib("3334445550")
+    chat_id = "task5-metadata-fallback"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+        "metadata": {"chat_id": chat_id},
+    }
+    result = await started_pipeline.inlet(body)
+    placeholder = result["metadata"]["pii_placeholder_map"][oib]
+
+    body2: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"OIB ponovo: {oib}"}],
+    }
+    result2 = await started_pipeline.inlet(body2)
+    assert result2["metadata"]["pii_placeholder_map"][oib] == placeholder
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_ephemeral_thread_when_chat_id_missing(
+    started_pipeline: Pipeline,
+) -> None:
+    """A request without any chat_id still masks for the single turn but
+    cannot share state with future requests (ephemeral thread)."""
+    oib = _make_oib("4445556660")
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    result = await started_pipeline.inlet(body)
+
+    fwd = result["metadata"]["pii_placeholder_map"]
+    assert oib in fwd
+    placeholder = fwd[oib]
+    assert placeholder.startswith("[HR_OIB_")
+    assert placeholder in result["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_writes_snapshot_to_body_metadata(
+    started_pipeline: Pipeline,
+) -> None:
+    """Forward-compat hinge for Task 6: inlet must populate
+    `body.metadata.pii_placeholder_map` and `pii_reverse_map` so the outlet
+    can read them without depending on Redis directly."""
+    oib = _make_oib("5556667770")
+    body: dict[str, Any] = {
+        "chat_id": "task5-snapshot",
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}"}],
+    }
+    result = await started_pipeline.inlet(body)
+    metadata = result["metadata"]
+
+    assert "pii_placeholder_map" in metadata
+    assert "pii_reverse_map" in metadata
+    fwd = metadata["pii_placeholder_map"]
+    rev = metadata["pii_reverse_map"]
+    assert oib in fwd
+    placeholder = fwd[oib]
+    assert rev[placeholder] == oib
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_redis_down_block_mode(
+    started_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the vault healthcheck fails and `degradation_mode='block'` the
+    inlet must raise, never letting the request through unmasked."""
+    assert started_pipeline.vault is not None
+
+    async def _unhealthy() -> bool:
+        return False
+
+    monkeypatch.setattr(started_pipeline.vault, "healthcheck", _unhealthy)
+    assert started_pipeline.valves.degradation_mode == "block"
+
+    oib = _make_oib("6667778880")
+    body: dict[str, Any] = {
+        "chat_id": "task5-block-mode",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    with pytest.raises(RuntimeError, match="degradation_mode='block'"):
+        await started_pipeline.inlet(body)
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_redis_down_passthrough_mode(
+    started_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `degradation_mode='passthrough'` and a dead vault the inlet
+    falls back to per-request dicts (Task 4 behavior); masking still
+    happens and `body.metadata` snapshots are still populated."""
+    assert started_pipeline.vault is not None
+
+    async def _unhealthy() -> bool:
+        return False
+
+    monkeypatch.setattr(started_pipeline.vault, "healthcheck", _unhealthy)
+    monkeypatch.setattr(started_pipeline.valves, "degradation_mode", "passthrough")
+
+    oib = _make_oib("7778889990")
+    body: dict[str, Any] = {
+        "chat_id": "task5-passthrough-mode",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    result = await started_pipeline.inlet(body)
+
+    fwd = result["metadata"]["pii_placeholder_map"]
+    rev = result["metadata"]["pii_reverse_map"]
+    assert oib in fwd
+    placeholder = fwd[oib]
+    assert rev[placeholder] == oib
+    assert placeholder in result["messages"][-1]["content"]
 
 
 # ---------------------------------------------------------------------------

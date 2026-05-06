@@ -1,6 +1,6 @@
 # Runtime dependencies for pii_filter.py
 # Task 3: Presidio engine + 12 custom recognizers + HR NLP
-# Future tasks: Task 5 will add `redis` (for thread vault).
+# Task 5: redis (thread-scoped placeholder vault).
 
 # IMPORTANT: This file mirrors what goes in the `requirements:` frontmatter line of pii_filter.py.
 # When deploying to Pipelines container, the container reads frontmatter, NOT this file.
@@ -9,6 +9,7 @@
 presidio-analyzer>=2.2.0
 presidio-anonymizer>=2.2.0
 spacy>=3.7.0
+redis>=5.0.1
 
 # HR spaCy model (hard requirement — no EN fallback per spec).
 # Pipelines container reads this URL line from the frontmatter `requirements:` field.
