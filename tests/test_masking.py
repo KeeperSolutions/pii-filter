@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 from presidio_analyzer import RecognizerResult
 
-from pii_filter import CUSTOM_ENTITY_TYPES, Pipeline, mask_text
+from pii_filter import CUSTOM_ENTITY_TYPES, Pipeline, mask_text, restore_text
 
 # ---------------------------------------------------------------------------
 # mask_text — unit tests
@@ -254,6 +254,116 @@ def test_three_overlapping_only_one_survives() -> None:
     assert masked == "[HR_JMBG_1]"
     assert len(enriched) == 1
     assert enriched[0]["entity_type"] == "HR_JMBG"
+
+
+# ---------------------------------------------------------------------------
+# restore_text — unit tests (Task 6)
+# ---------------------------------------------------------------------------
+
+
+def test_restore_text_basic_single_placeholder() -> None:
+    text = "Vaš [HR_OIB_1] je validan."
+    reverse_map = {"[HR_OIB_1]": "12345678903"}
+
+    restored, restored_keys, hallucinated_keys = restore_text(text, reverse_map)
+
+    assert restored == "Vaš 12345678903 je validan."
+    assert restored_keys == ["[HR_OIB_1]"]
+    assert hallucinated_keys == []
+
+
+def test_restore_text_multiple_distinct_placeholders() -> None:
+    text = "Bok [PERSON_1], OIB [HR_OIB_1] je tvoj."
+    reverse_map = {"[PERSON_1]": "Ivan Horvat", "[HR_OIB_1]": "12345678903"}
+
+    restored, restored_keys, hallucinated_keys = restore_text(text, reverse_map)
+
+    assert restored == "Bok Ivan Horvat, OIB 12345678903 je tvoj."
+    assert restored_keys == ["[HR_OIB_1]", "[PERSON_1]"]
+    assert hallucinated_keys == []
+
+
+def test_restore_text_same_placeholder_repeated() -> None:
+    """Repeated placeholder substitutes everywhere but is recorded once."""
+    text = "[PERSON_1] je rekao [PERSON_1], i opet [PERSON_1]."
+    reverse_map = {"[PERSON_1]": "Ana"}
+
+    restored, restored_keys, hallucinated_keys = restore_text(text, reverse_map)
+
+    assert restored == "Ana je rekao Ana, i opet Ana."
+    assert restored_keys == ["[PERSON_1]"]
+    assert hallucinated_keys == []
+
+
+def test_restore_text_hallucination_only() -> None:
+    """Placeholder that the regex matches but reverse_map cannot resolve
+    must remain literally in the text and surface in `hallucinated`."""
+    text = "Nepoznati [PERSON_99] u odgovoru."
+    reverse_map = {"[PERSON_1]": "Ivan"}
+
+    restored, restored_keys, hallucinated_keys = restore_text(text, reverse_map)
+
+    assert restored == text  # untouched
+    assert restored_keys == []
+    assert hallucinated_keys == ["[PERSON_99]"]
+
+
+def test_restore_text_mixed_restored_and_hallucinated() -> None:
+    text = "[PERSON_1] zna [HR_OIB_1] ali [PERSON_99] ne zna [HR_OIB_42]."
+    reverse_map = {"[PERSON_1]": "Ivan", "[HR_OIB_1]": "12345678903"}
+
+    restored, restored_keys, hallucinated_keys = restore_text(text, reverse_map)
+
+    assert restored == "Ivan zna 12345678903 ali [PERSON_99] ne zna [HR_OIB_42]."
+    assert restored_keys == ["[HR_OIB_1]", "[PERSON_1]"]
+    assert hallucinated_keys == ["[HR_OIB_42]", "[PERSON_99]"]
+
+
+def test_restore_text_empty_inputs() -> None:
+    """Empty text → empty result; empty map → text unchanged with no records."""
+    assert restore_text("", {}) == ("", [], [])
+    assert restore_text("", {"[PERSON_1]": "Ivan"}) == ("", [], [])
+    assert restore_text("Some text [PERSON_1]", {}) == ("Some text [PERSON_1]", [], [])
+    assert restore_text("No placeholders here.", {"[PERSON_1]": "Ivan"}) == (
+        "No placeholders here.",
+        [],
+        [],
+    )
+
+
+def test_restore_text_unicode_originals() -> None:
+    """Croatian characters round-trip through restoration without corruption."""
+    text = "Zovem se [PERSON_1] iz [PERSON_2]."
+    reverse_map = {"[PERSON_1]": "Ana Ivić", "[PERSON_2]": "Đorđe Šljivančanin"}
+
+    restored, restored_keys, _ = restore_text(text, reverse_map)
+
+    assert restored == "Zovem se Ana Ivić iz Đorđe Šljivančanin."
+    assert restored_keys == ["[PERSON_1]", "[PERSON_2]"]
+
+
+def test_restore_text_original_contains_placeholder_shape() -> None:
+    """Single-pass `re.sub` must NOT re-restore a placeholder-shaped substring
+    that happens to live inside an original value.
+
+    `str.replace` chains would loop again over already-substituted text and
+    risk swapping the inner `[DOC_1]` token; `re.sub` with a callable is
+    atomic and only runs once over the input.
+    """
+    text = "See [DOC_1] for [PERSON_1]."
+    reverse_map = {
+        "[DOC_1]": "the manual at [PERSON_1]",  # original mentions another placeholder shape
+        "[PERSON_1]": "Ivan",
+    }
+
+    restored, restored_keys, _ = restore_text(text, reverse_map)
+
+    # The first match `[DOC_1]` is replaced wholesale with its original; the
+    # second match `[PERSON_1]` (the literal one in the input) is replaced
+    # with "Ivan". The placeholder string baked into DOC_1's original is
+    # NOT re-scanned, so it stays as the literal `[PERSON_1]` substring.
+    assert restored == "See the manual at [PERSON_1] for Ivan."
+    assert restored_keys == ["[DOC_1]", "[PERSON_1]"]
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +757,457 @@ async def test_inlet_redis_down_passthrough_mode(
     placeholder = fwd[oib]
     assert rev[placeholder] == oib
     assert placeholder in result["messages"][-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Outlet — placeholder restoration integration tests (Task 6)
+# ---------------------------------------------------------------------------
+
+
+def _outlet_body_with_choices(
+    content: Any,
+    *,
+    reverse_map: dict[str, str] | None,
+    chat_id: str = "task6-outlet",
+    include_metadata: bool = True,
+    extra_message_keys: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build an OpenAI-shaped non-streaming completion body for outlet tests.
+
+    `reverse_map=None` omits the `pii_reverse_map` key entirely (covers the
+    "missing key" no-op path); pass `{}` to cover the "empty map" no-op
+    path. Set `include_metadata=False` to omit the metadata key entirely.
+    """
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if extra_message_keys:
+        message.update(extra_message_keys)
+    body: dict[str, Any] = {
+        "chat_id": chat_id,
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+    }
+    if include_metadata:
+        metadata: dict[str, Any] = {"chat_id": chat_id}
+        if reverse_map is not None:
+            metadata["pii_reverse_map"] = reverse_map
+        body["metadata"] = metadata
+    return body
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_happy_path_str_content_after_inlet(
+    started_pipeline: Pipeline,
+) -> None:
+    """Full round-trip: inlet masks PII into placeholders, outlet restores
+    the originals when the simulated LLM response keeps the placeholders.
+
+    This is the headline acceptance criterion: end-to-end the user must
+    see the original PII value in the assistant response.
+    """
+    oib = _make_oib("8889990010")
+    chat_id = "task6-roundtrip-str"
+
+    # Step 1 — inlet masks the user message.
+    inlet_body: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}"}],
+    }
+    inlet_result = await started_pipeline.inlet(inlet_body)
+    placeholder = inlet_result["metadata"]["pii_placeholder_map"][oib]
+    reverse_map = inlet_result["metadata"]["pii_reverse_map"]
+    assert placeholder in inlet_result["messages"][-1]["content"]
+
+    # Step 2 — simulate the LLM echoing the placeholder back, then outlet.
+    outlet_body = _outlet_body_with_choices(
+        f"Vaš {placeholder} je validan.",
+        reverse_map=reverse_map,
+        chat_id=chat_id,
+    )
+    outlet_result = await started_pipeline.outlet(outlet_body)
+
+    final_content = outlet_result["choices"][0]["message"]["content"]
+    assert final_content == f"Vaš {oib} je validan."
+    assert placeholder not in final_content
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_happy_path_multimodal_content(
+    started_pipeline: Pipeline,
+) -> None:
+    """Multi-modal `list[dict]` content: every text part is restored
+    independently; non-text parts (image_url) are untouched."""
+    reverse_map = {"[PERSON_1]": "Ivan", "[HR_OIB_1]": "12345678903"}
+    image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,XYZ"}}
+    parts = [
+        {"type": "text", "text": "Pozdrav [PERSON_1]."},
+        image_part,
+        {"type": "text", "text": "OIB [HR_OIB_1] je validan."},
+    ]
+    body = _outlet_body_with_choices(parts, reverse_map=reverse_map)
+
+    result = await started_pipeline.outlet(body)
+    out_parts = result["choices"][0]["message"]["content"]
+
+    assert out_parts[0]["text"] == "Pozdrav Ivan."
+    assert out_parts[1] is image_part
+    assert out_parts[1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,XYZ"}}
+    assert out_parts[2]["text"] == "OIB 12345678903 je validan."
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_empty_reverse_map_is_noop(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Empty `pii_reverse_map` triggers the DEBUG no-op path; body is
+    returned unchanged and no INFO/WARN log lines are emitted."""
+    body = _outlet_body_with_choices("[PERSON_1] je nepoznat.", reverse_map={})
+    snapshot_content = body["choices"][0]["message"]["content"]
+
+    with caplog.at_level("DEBUG", logger="pii_filter"):
+        result = await started_pipeline.outlet(body)
+
+    assert result is body
+    assert result["choices"][0]["message"]["content"] == snapshot_content
+    assert any(
+        "pii_reverse_map missing or empty" in rec.message
+        for rec in caplog.records
+        if rec.levelname == "DEBUG"
+    )
+    # No INFO summary, no WARN hallucination line for an empty-map no-op.
+    assert not any(
+        rec.levelname == "INFO" and "outlet processed" in rec.message for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_missing_reverse_map_key_is_noop(
+    started_pipeline: Pipeline,
+) -> None:
+    """Metadata exists but lacks `pii_reverse_map` — outlet is a no-op."""
+    body = _outlet_body_with_choices("[PERSON_1] je tu.", reverse_map=None)
+    # metadata is present but `pii_reverse_map` is omitted.
+    assert "pii_reverse_map" not in body["metadata"]
+
+    result = await started_pipeline.outlet(body)
+
+    assert result is body
+    assert result["choices"][0]["message"]["content"] == "[PERSON_1] je tu."
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_missing_metadata_is_noop(started_pipeline: Pipeline) -> None:
+    """Body has no `metadata` key at all — outlet is a no-op."""
+    body = _outlet_body_with_choices("[PERSON_1] je tu.", reverse_map=None, include_metadata=False)
+    assert "metadata" not in body
+
+    result = await started_pipeline.outlet(body)
+
+    assert result is body
+    assert result["choices"][0]["message"]["content"] == "[PERSON_1] je tu."
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_hallucination_only_logs_warn_and_keeps_text(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Hallucinated placeholder (in text but not in reverse_map) is left
+    literally in the response and surfaces as a single WARN line."""
+    reverse_map = {"[PERSON_1]": "Ivan"}
+    body = _outlet_body_with_choices(
+        "Tajanstveni [PERSON_99] u odgovoru.",
+        reverse_map=reverse_map,
+        chat_id="task6-hallucination",
+    )
+
+    with caplog.at_level("WARNING", logger="pii_filter"):
+        result = await started_pipeline.outlet(body)
+
+    assert result["choices"][0]["message"]["content"] == "Tajanstveni [PERSON_99] u odgovoru."
+    warn_records = [
+        r for r in caplog.records if r.levelname == "WARNING" and "hallucinations" in r.message
+    ]
+    assert len(warn_records) == 1
+    rec = warn_records[0]
+    assert "task6-hallucination" in rec.getMessage()
+    assert "count=1" in rec.getMessage()
+    assert "[PERSON_99]" in rec.getMessage()
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_mixed_restored_and_hallucinated(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Mixed bag: restored placeholders are substituted; hallucinations
+    are left literal; both lists are accounted for in logs."""
+    reverse_map = {"[PERSON_1]": "Ivan", "[HR_OIB_1]": "12345678903"}
+    body = _outlet_body_with_choices(
+        "[PERSON_1] zna [HR_OIB_1] ali [PERSON_99] ne zna [HR_OIB_42].",
+        reverse_map=reverse_map,
+        chat_id="task6-mixed",
+    )
+
+    with caplog.at_level("INFO", logger="pii_filter"):
+        result = await started_pipeline.outlet(body)
+
+    assert (
+        result["choices"][0]["message"]["content"]
+        == "Ivan zna 12345678903 ali [PERSON_99] ne zna [HR_OIB_42]."
+    )
+    info_recs = [r for r in caplog.records if "outlet processed" in r.message]
+    assert info_recs, "expected an INFO summary line"
+    assert "placeholders_restored=2" in info_recs[-1].getMessage()
+    assert "hallucinations=2" in info_recs[-1].getMessage()
+    warn_recs = [r for r in caplog.records if "hallucinations detected" in r.message]
+    assert len(warn_recs) == 1
+    msg = warn_recs[0].getMessage()
+    assert "[HR_OIB_42]" in msg and "[PERSON_99]" in msg
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_tool_calls_response_is_noop(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Tool-calling LLM response: `message.content is None`, `tool_calls`
+    populated. Outlet skips at DEBUG, body untouched."""
+    reverse_map = {"[PERSON_1]": "Ivan"}
+    body = _outlet_body_with_choices(
+        None,
+        reverse_map=reverse_map,
+        extra_message_keys={
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "x"}}],
+        },
+    )
+
+    with caplog.at_level("DEBUG", logger="pii_filter"):
+        result = await started_pipeline.outlet(body)
+
+    # Body unchanged; the assistant message still has content=None.
+    assert result["choices"][0]["message"]["content"] is None
+    assert any(
+        "tool_calls" in rec.message or "not str|list" in rec.message
+        for rec in caplog.records
+        if rec.levelname == "DEBUG"
+    )
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_streaming_delta_chunk_is_noop(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Streaming chunk shape (`choices[0].delta`, no `message`): outlet
+    skips at DEBUG and returns body unchanged."""
+    body: dict[str, Any] = {
+        "chat_id": "task6-streaming",
+        "choices": [
+            {"index": 0, "delta": {"role": "assistant", "content": "[PERSON_1] kaže..."}},
+        ],
+        "metadata": {
+            "chat_id": "task6-streaming",
+            "pii_reverse_map": {"[PERSON_1]": "Ivan"},
+        },
+    }
+    snapshot = body["choices"][0]["delta"]["content"]
+
+    with caplog.at_level("DEBUG", logger="pii_filter"):
+        result = await started_pipeline.outlet(body)
+
+    assert result["choices"][0]["delta"]["content"] == snapshot
+    assert any(
+        "delta" in rec.message and "streaming" in rec.message
+        for rec in caplog.records
+        if rec.levelname == "DEBUG"
+    )
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_swallows_unexpected_exception_and_logs_error(
+    started_pipeline: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Decision 5 + Task 6 follow-up split: an *unexpected* internal error
+    (anything other than KeyError/AttributeError/TypeError) is caught,
+    logged at ERROR with `exc_info=True`, and the body is returned
+    unchanged. This is the programmer-error path — it should be loud in
+    production observability so somebody triages it."""
+    import pii_filter as pii_filter_module
+
+    def _boom(*_args: object, **_kwargs: object) -> tuple[str, list[str], list[str]]:
+        raise RuntimeError("simulated restore_text failure")
+
+    monkeypatch.setattr(pii_filter_module, "restore_text", _boom)
+
+    reverse_map = {"[PERSON_1]": "Ivan"}
+    body = _outlet_body_with_choices(
+        "[PERSON_1] je tu.",
+        reverse_map=reverse_map,
+        chat_id="task6-boom",
+    )
+    snapshot = body["choices"][0]["message"]["content"]
+
+    with caplog.at_level("ERROR", logger="pii_filter"):
+        result = await started_pipeline.outlet(body)
+
+    assert result is body
+    # Restoration failed → text untouched (the exception fires on the first
+    # text part, no partial mutation possible in this scenario).
+    assert result["choices"][0]["message"]["content"] == snapshot
+    error_recs = [r for r in caplog.records if r.levelname == "ERROR" and "UNEXPECTED" in r.message]
+    assert len(error_recs) == 1
+    rec = error_recs[0]
+    assert "RuntimeError" in rec.getMessage()
+    assert "task6-boom" in rec.getMessage()
+    # `exc_info=True` must propagate the traceback to the log record.
+    assert rec.exc_info is not None, "ERROR record should carry exc_info for tracebacks"
+    assert rec.exc_info[0] is RuntimeError
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_swallows_expected_exception_and_logs_warn(
+    started_pipeline: Pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Decision 5 + Task 6 follow-up split: the *expected* fail-safe family
+    (KeyError, AttributeError, TypeError) is caught, logged at WARN, and
+    the body is returned unchanged. These are operational, not bugs — a
+    malformed body that slipped past the defensive shape guard should not
+    page someone."""
+
+    def _bad_iter(_self: Pipeline, _message: dict[str, Any]) -> Any:
+        raise TypeError("simulated malformed body")
+
+    monkeypatch.setattr(Pipeline, "_iter_text_parts", _bad_iter)
+
+    reverse_map = {"[PERSON_1]": "Ivan"}
+    body = _outlet_body_with_choices(
+        "[PERSON_1] je tu.",
+        reverse_map=reverse_map,
+        chat_id="task6-expected-fail",
+    )
+    snapshot = body["choices"][0]["message"]["content"]
+
+    with caplog.at_level("DEBUG", logger="pii_filter"):
+        result = await started_pipeline.outlet(body)
+
+    assert result is body
+    assert result["choices"][0]["message"]["content"] == snapshot
+    warn_recs = [
+        r for r in caplog.records if r.levelname == "WARNING" and "expected fail-safe" in r.message
+    ]
+    assert len(warn_recs) == 1
+    msg = warn_recs[0].getMessage()
+    assert "TypeError" in msg
+    assert "task6-expected-fail" in msg
+    # Must NOT have escalated to ERROR for the expected family.
+    assert not any(r.levelname == "ERROR" and "UNEXPECTED" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_empty_list_content_logs_specific_debug_message(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Empty `list[dict]` content (`message.content = []`) hits its own
+    dedicated DEBUG line ("empty list") rather than the generic catch-all,
+    so log readers can distinguish "multi-modal with no parts" from "type
+    other than str|list" (e.g. None for tool_calls)."""
+    reverse_map = {"[PERSON_1]": "Ivan"}
+    body = _outlet_body_with_choices([], reverse_map=reverse_map)
+
+    with caplog.at_level("DEBUG", logger="pii_filter"):
+        result = await started_pipeline.outlet(body)
+
+    # Body unchanged; no-op path.
+    assert result is body
+    assert result["choices"][0]["message"]["content"] == []
+    # The specific empty-list message must be present.
+    assert any(
+        "message.content is empty list" in r.message
+        for r in caplog.records
+        if r.levelname == "DEBUG"
+    )
+    # The generic catch-all must NOT have fired (would be misleading here).
+    assert not any("is not str|list" in r.message for r in caplog.records if r.levelname == "DEBUG")
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_messages_fallback_shape(started_pipeline: Pipeline) -> None:
+    """Legacy/test body using `messages[-1]` (no `choices` key) is honored
+    when the last message is an assistant message."""
+    reverse_map = {"[PERSON_1]": "Ivan", "[HR_OIB_1]": "12345678903"}
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": "OIB je 12345678903"},
+            {"role": "assistant", "content": "Bok [PERSON_1], OIB [HR_OIB_1] je tvoj."},
+        ],
+        "metadata": {"chat_id": "task6-msgs", "pii_reverse_map": reverse_map},
+    }
+
+    result = await started_pipeline.outlet(body)
+
+    assert result["messages"][-1]["content"] == "Bok Ivan, OIB 12345678903 je tvoj."
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_messages_fallback_skips_when_last_is_user(
+    started_pipeline: Pipeline,
+) -> None:
+    """Fallback shape with last message as user role is rejected — outlet
+    only restores assistant turns."""
+    reverse_map = {"[PERSON_1]": "Ivan"}
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "assistant", "content": "Bok [PERSON_1]."},
+            {"role": "user", "content": "[PERSON_1] te zove."},
+        ],
+        "metadata": {"chat_id": "task6-user-last", "pii_reverse_map": reverse_map},
+    }
+    snapshot_user = body["messages"][-1]["content"]
+    snapshot_assistant = body["messages"][0]["content"]
+
+    result = await started_pipeline.outlet(body)
+
+    assert result["messages"][-1]["content"] == snapshot_user
+    assert result["messages"][0]["content"] == snapshot_assistant
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_disabled_valve_skips_restoration(
+    started_pipeline: Pipeline,
+) -> None:
+    """When `valves.enabled=False`, outlet returns body unchanged without
+    ever consulting metadata."""
+    started_pipeline.valves.enabled = False
+    try:
+        reverse_map = {"[PERSON_1]": "Ivan"}
+        body = _outlet_body_with_choices("[PERSON_1] je tu.", reverse_map=reverse_map)
+        result = await started_pipeline.outlet(body)
+        assert result["choices"][0]["message"]["content"] == "[PERSON_1] je tu."
+    finally:
+        started_pipeline.valves.enabled = True
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_chat_id_appears_in_info_log(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The summary INFO line includes the chat_id and the count fields
+    required by spec §2.1.10."""
+    reverse_map = {"[PERSON_1]": "Ivan"}
+    body = _outlet_body_with_choices(
+        "[PERSON_1] je tu.",
+        reverse_map=reverse_map,
+        chat_id="task6-info-log",
+    )
+
+    with caplog.at_level("INFO", logger="pii_filter"):
+        await started_pipeline.outlet(body)
+
+    info_recs = [r for r in caplog.records if "outlet processed" in r.message]
+    assert info_recs, "expected an INFO summary line"
+    msg = info_recs[-1].getMessage()
+    assert "chat_id=task6-info-log" in msg
+    assert "placeholders_restored=1" in msg
+    assert "hallucinations=0" in msg
 
 
 # ---------------------------------------------------------------------------

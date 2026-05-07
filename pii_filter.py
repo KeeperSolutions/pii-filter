@@ -2,10 +2,10 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-04
-version: 0.4.0
+date: 2026-05-06
+version: 0.5.0
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 5 — Redis thread vault: per-request placeholder maps replaced with a thread-scoped, Redis-backed vault keyed by chat_id, so the same PII value gets the same placeholder across every message in one OpenWebUI conversation. Falls back to per-request scope (Task 4 behaviour) when Redis is unavailable and Valves.degradation_mode='passthrough'.
+description: PII detection and masking filter for Keeper AI Gateway. Task 6 — non-streaming outlet placeholder restoration: assistant responses have placeholders substituted back to original PII values via `body["metadata"]["pii_reverse_map"]` (populated by the inlet + Task 5 vault snapshot). Hallucinated placeholders are left literally in the response and surfaced as a single deduplicated WARN line per call; outlet never raises and never reads Redis.
 requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
 """
 
@@ -543,6 +543,70 @@ def mask_text(
 
 
 # ---------------------------------------------------------------------------
+# Restoration (Task 6 — outlet placeholder → original substitution)
+# ---------------------------------------------------------------------------
+
+
+# Matches every placeholder shape minted by `mask_text` and the Task 5 vault:
+# square brackets, an UPPER_SNAKE entity type (e.g. `HR_OIB`, `PERSON`,
+# `CREDIT_CARD`), an underscore, then a positive integer counter. Compiled
+# once at module load so `restore_text` does not pay re.compile per call.
+_PLACEHOLDER_RE = re.compile(r"\[[A-Z_]+_\d+\]")
+
+
+def restore_text(
+    text: str,
+    reverse_map: dict[str, str],
+) -> tuple[str, list[str], list[str]]:
+    """Replace placeholders in `text` with their originals from `reverse_map`.
+
+    Args:
+        text: assistant response containing zero or more placeholders of the
+            shape minted by `mask_text` / `ThreadVault.get_placeholder`.
+        reverse_map: `placeholder -> original_value`, populated by inlet and
+            persisted on `body["metadata"]["pii_reverse_map"]`. Outlet treats
+            this as the only source of truth (Task 6 Decision 1).
+
+    Returns:
+        `(restored_text, restored_placeholders, hallucinated_placeholders)`:
+          * `restored_text` — input with each known placeholder substituted
+            for its original value in a single left-to-right pass.
+          * `restored_placeholders` — sorted, deduped list of placeholders
+            that were actually substituted. Useful for counter aggregation.
+          * `hallucinated_placeholders` — sorted, deduped list of
+            placeholder-shaped substrings that the regex matched but that
+            the reverse_map could not resolve. They are left **literally**
+            in `restored_text`. The outlet logs these at WARN level so an
+            LLM that fabricates `[PERSON_99]` is observable, not silently
+            substituted (epic AC: "zero hallucinated restorations").
+
+    Implementation note:
+        Uses `re.sub` with a callable replacement, not a sequence of
+        `str.replace` calls. A `str.replace` chain would do N passes over
+        the text and could re-replace already-restored substrings if an
+        original happened to contain a placeholder-shaped substring (rare
+        but real). The single-pass `re.sub` is O(text length) and atomic.
+    """
+    if not text or not reverse_map:
+        return text, [], []
+
+    restored_set: set[str] = set()
+    hallucinated_set: set[str] = set()
+
+    def _sub(match: re.Match[str]) -> str:
+        placeholder = match.group(0)
+        original = reverse_map.get(placeholder)
+        if original is None:
+            hallucinated_set.add(placeholder)
+            return placeholder
+        restored_set.add(placeholder)
+        return original
+
+    restored_text = _PLACEHOLDER_RE.sub(_sub, text)
+    return restored_text, sorted(restored_set), sorted(hallucinated_set)
+
+
+# ---------------------------------------------------------------------------
 # Thread vault (Task 5 — Redis-backed, thread-scoped placeholder storage)
 # ---------------------------------------------------------------------------
 
@@ -993,12 +1057,14 @@ class Pipeline:
             await self.vault.aclose()
             self.vault = None
 
-    def _iter_maskable_parts(
+    def _iter_text_parts(
         self, message: dict[str, Any]
     ) -> Iterator[tuple[str, Callable[[str], None]]]:
-        """Yield `(text, write_back)` pairs for each maskable text segment.
+        """Yield `(text, write_back)` pairs for each text segment in `message`.
 
-        Handles both content shapes accepted by the OpenAI chat-completion API:
+        Used by both inlet (writeback masks PII) and outlet (writeback
+        restores originals). Handles both content shapes accepted by the
+        OpenAI chat-completion API:
           * `content` is a `str` — yields one pair; write_back replaces the
             whole `message["content"]` value.
           * `content` is a `list[dict]` (multi-modal) — yields one pair per
@@ -1006,7 +1072,7 @@ class Pipeline:
             `text` field. Non-text parts (image_url, file, etc.) are skipped.
 
         Empty / whitespace-only / non-string text segments are skipped so
-        the analyzer is never invoked on uninteresting input.
+        callers never operate on uninteresting input.
         """
         content = message.get("content")
         if isinstance(content, str):
@@ -1089,7 +1155,7 @@ class Pipeline:
             logger.debug("inlet: no user message found, skipping analysis")
             return body
 
-        parts = list(self._iter_maskable_parts(target_msg))
+        parts = list(self._iter_text_parts(target_msg))
         if not parts:
             logger.debug("inlet: target message has no maskable text parts")
             return body
@@ -1247,10 +1313,210 @@ class Pipeline:
 
         return body
 
+    def _extract_assistant_message(self, body: Any) -> dict[str, Any] | None:
+        """Return the assistant message dict if `body` matches a non-streaming
+        completion shape, else None (and log at DEBUG with the specific
+        failure reason).
+
+        Preference order:
+          1. ``body["choices"][0]["message"]`` — OpenAI chat-completion shape
+             (production path).
+          2. ``body["messages"][-1]`` when ``role == "assistant"`` — legacy /
+             test fixture fallback. May be removed once production traffic is
+             verified.
+
+        A streaming chunk shape (``choices[0]["delta"]``) and a tool-calling
+        response (``message.content is None``) both fail the guard and skip
+        restoration — outlet is non-streaming-only by Task 6 design (Task 7
+        owns the streaming path).
+        """
+        if not isinstance(body, dict):
+            logger.debug("pii_filter outlet skipped: body is not a dict")
+            return None
+
+        # Preferred shape: OpenAI chat-completion `choices[0].message`.
+        choices = body.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if not isinstance(first, dict):
+                logger.debug("pii_filter outlet skipped: choices[0] is not a dict")
+                return None
+            message = first.get("message")
+            if not isinstance(message, dict):
+                if isinstance(first.get("delta"), dict):
+                    logger.debug(
+                        "pii_filter outlet skipped: choices[0] has delta (streaming chunk)"
+                    )
+                else:
+                    logger.debug(
+                        "pii_filter outlet skipped: choices[0].message is not a dict "
+                        "(likely tool_calls or non-completion shape)"
+                    )
+                return None
+            content = message.get("content")
+            if isinstance(content, str):
+                if not content:
+                    logger.debug("pii_filter outlet skipped: message.content is empty string")
+                    return None
+                return message
+            if isinstance(content, list):
+                if not content:
+                    logger.debug("pii_filter outlet skipped: message.content is empty list")
+                    return None
+                return message
+            logger.debug(
+                "pii_filter outlet skipped: message.content is not str|list "
+                "(got %s, likely None / tool_calls response)",
+                type(content).__name__,
+            )
+            return None
+
+        # Fallback shape: legacy/test bodies that carry the assistant turn at
+        # `body["messages"][-1]`. Documented as legacy support; may be removed
+        # once production traffic is verified to always use the OpenAI shape.
+        messages = body.get("messages")
+        if isinstance(messages, list) and messages:
+            last = messages[-1]
+            if not isinstance(last, dict):
+                logger.debug("pii_filter outlet skipped: messages[-1] is not a dict")
+                return None
+            if last.get("role") != "assistant":
+                logger.debug("pii_filter outlet skipped: messages[-1].role is not assistant")
+                return None
+            content = last.get("content")
+            if isinstance(content, str):
+                if not content:
+                    logger.debug("pii_filter outlet skipped: messages[-1].content is empty string")
+                    return None
+                return last
+            if isinstance(content, list):
+                if not content:
+                    logger.debug("pii_filter outlet skipped: messages[-1].content is empty list")
+                    return None
+                return last
+            logger.debug(
+                "pii_filter outlet skipped: messages[-1].content is not str|list (got %s)",
+                type(content).__name__,
+            )
+            return None
+
+        logger.debug("pii_filter outlet skipped: body has neither choices nor messages")
+        return None
+
     async def outlet(
         self, body: dict[str, Any], user: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Pass-through for now. Task 6 adds placeholder restoration."""
+        """Restore PII placeholders in the assistant response back to their
+        original values before forwarding the body to the OpenWebUI client.
+
+        Reads `body["metadata"]["pii_reverse_map"]` (populated by inlet via
+        Task 4 + persisted by the Task 5 vault snapshot) as the *only* source
+        of truth — outlet does not touch Redis (Decision 1).
+
+        Outlet **never raises** (Decision 5): the entire restoration path is
+        wrapped in a top-level two-tier `try/except`. The first arm catches
+        the *expected* fail-safe family (``KeyError``/``AttributeError``/
+        ``TypeError`` from a malformed body that slipped past the defensive
+        shape guard) and logs at WARN — these are operational, not bugs.
+        The second arm catches anything else and logs at ERROR with
+        ``exc_info=True`` so the full traceback reaches the log sink — these
+        are programmer errors that need to be triaged. Either way the body
+        is returned unchanged because a partially restored or placeholder-
+        leaking response is strictly better UX than a 500 from the
+        Pipelines container.
+
+        Hallucinated placeholders (regex match without a reverse_map entry)
+        are left literally in the response and surfaced as a single
+        deduplicated WARN line per outlet call (epic AC: zero hallucinated
+        restorations — we never substitute a placeholder we cannot prove
+        originated from inlet).
+        """
+        # Task 8 toggle insertion point: when `UserValves.pii_masking_enabled`
+        # is wired, gate the entire restoration path behind it. Task 6 leaves
+        # the per-user toggle defined-but-unread, same as inlet.
+
         if not self.valves.enabled:
             return body
-        return body
+
+        chat_id_for_log: Any = "unknown"
+        try:
+            if not isinstance(body, dict):
+                logger.debug("pii_filter outlet skipped: body is not a dict")
+                return body
+
+            raw_chat_id, _ = self._resolve_chat_id(body)
+            chat_id_for_log = raw_chat_id  # may be None when no chat_id supplied
+
+            metadata = body.get("metadata")
+            if not isinstance(metadata, dict):
+                logger.debug("pii_filter outlet skipped: no metadata dict")
+                return body
+
+            reverse_map = metadata.get("pii_reverse_map")
+            if not isinstance(reverse_map, dict) or not reverse_map:
+                logger.debug("pii_filter outlet skipped: pii_reverse_map missing or empty")
+                return body
+
+            target_message = self._extract_assistant_message(body)
+            if target_message is None:
+                # _extract_assistant_message has already logged the reason at DEBUG.
+                return body
+
+            restored_set: set[str] = set()
+            hallucinated_set: set[str] = set()
+            for text, write_back in self._iter_text_parts(target_message):
+                restored_text_value, restored_keys, hallucinated_keys = restore_text(
+                    text, reverse_map
+                )
+                if restored_text_value != text:
+                    write_back(restored_text_value)
+                restored_set.update(restored_keys)
+                hallucinated_set.update(hallucinated_keys)
+
+            logger.info(
+                "pii_filter outlet processed: chat_id=%s placeholders_restored=%d "
+                "hallucinations=%d",
+                chat_id_for_log,
+                len(restored_set),
+                len(hallucinated_set),
+            )
+            if hallucinated_set:
+                # One WARN per outlet call (per-call dedupe via the set), not
+                # per occurrence — long responses with repeated hallucinations
+                # would otherwise spam logs and drown out signal.
+                logger.warning(
+                    "pii_filter outlet hallucinations detected: chat_id=%s count=%d unique=%s",
+                    chat_id_for_log,
+                    len(hallucinated_set),
+                    sorted(hallucinated_set),
+                )
+
+            return body
+        except (KeyError, AttributeError, TypeError) as exc:
+            # Expected fail-safe path: the defensive shape guard tries to
+            # cover every malformed body up front, but a future caller could
+            # still pass something the guard misses (missing key, wrong
+            # nested type). These are operational issues, not bugs — log at
+            # WARN and pass the body through.
+            logger.warning(
+                "pii_filter outlet failed (expected fail-safe): " "chat_id=%s error=%s: %s",
+                chat_id_for_log,
+                type(exc).__name__,
+                exc,
+            )
+            return body
+        except Exception as exc:
+            # Unexpected programmer error (typo in restore_text, regex
+            # compile bug, future-task regression). Log at ERROR with the
+            # full traceback so production observability surfaces it
+            # loudly; still swallow so the user sees raw placeholders
+            # rather than a 500.
+            logger.error(
+                "pii_filter outlet UNEXPECTED error (returning body unchanged): "
+                "chat_id=%s error=%s: %s",
+                chat_id_for_log,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            return body
