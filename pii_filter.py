@@ -1904,6 +1904,14 @@ class Pipeline:
         # is wired, gate the entire restoration path behind it. Task 6 leaves
         # the per-user toggle defined-but-unread, same as inlet.
 
+        # TEMP DEBUG — remove after diagnosis
+        logger.info("OUTLET DEBUG: body keys=%s", list(body.keys()) if isinstance(body, dict) else type(body))
+        if isinstance(body, dict):
+            md = body.get("metadata")
+            logger.info("OUTLET DEBUG: metadata type=%s; pii_reverse_map keys=%s",
+                        type(md).__name__,
+                        list(md.get("pii_reverse_map", {}).keys()) if isinstance(md, dict) else "N/A")
+
         if not self.valves.enabled:
             return body
 
