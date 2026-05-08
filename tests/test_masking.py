@@ -16,6 +16,7 @@ import pytest_asyncio
 from presidio_analyzer import RecognizerResult
 
 from pii_filter import CUSTOM_ENTITY_TYPES, Pipeline, mask_text, restore_text
+from tests.conftest import postgres_binary_missing
 
 # ---------------------------------------------------------------------------
 # mask_text — unit tests
@@ -373,7 +374,12 @@ def test_restore_text_original_contains_placeholder_shape() -> None:
 
 @pytest_asyncio.fixture(loop_scope="module", scope="module")
 async def started_pipeline() -> AsyncIterator[Pipeline]:
+    # Existing Task 5/6 inlet+outlet tests run against the Redis (fakeredis)
+    # backend; v0.6.0 switched the default backend to postgres so we opt
+    # back into redis explicitly here. The autouse `_swap_redis_to_fakeredis`
+    # fixture in conftest.py replaces the underlying client with fakeredis.
     p = Pipeline()
+    p.valves.vault_backend = "redis"
     await p.on_startup()
     yield p
     await p.on_shutdown()
@@ -1218,3 +1224,191 @@ async def test_outlet_chat_id_appears_in_info_log(
 def test_user_valves_default() -> None:
     p = Pipeline()
     assert p.user_valves.pii_masking_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Task 5.1 — inlet integration tests against the Postgres thread vault
+# ---------------------------------------------------------------------------
+#
+# These tests require a `pg_ctl` / `postgres` binary on PATH (provided by
+# `pytest-postgresql`). The whole section skips cleanly when the binary is
+# absent. The `started_pipeline_postgres` fixture lives in `conftest.py` and
+# is module-scoped so spaCy loads once for the whole section.
+
+
+_postgres_skip = pytest.mark.skipif(
+    postgres_binary_missing,
+    reason="pg_ctl / postgres binary not on PATH; skipping Postgres-backed tests",
+)
+
+
+@_postgres_skip
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_postgres_backend_thread_consistency_across_requests(
+    started_pipeline_postgres: Pipeline,
+) -> None:
+    """Same chat_id + same PII value across two inlet calls reuses the same
+    placeholder when the Postgres backend is the source of truth — Task 5.1
+    AC mirrors the Task 5 Redis equivalent."""
+    oib = _make_oib("9990001110")
+    chat_id = "task5.1-pg-consistency-thread"
+
+    body1: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    result1 = await started_pipeline_postgres.inlet(body1)
+    masked1 = result1["messages"][-1]["content"]
+    placeholder_first = result1["metadata"]["pii_placeholder_map"][oib]
+
+    body2: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"Provjera istog OIB-a: {oib}"}],
+    }
+    result2 = await started_pipeline_postgres.inlet(body2)
+    masked2 = result2["messages"][-1]["content"]
+    placeholder_second = result2["metadata"]["pii_placeholder_map"][oib]
+
+    assert placeholder_first in masked1
+    assert placeholder_first in masked2
+    assert placeholder_second == placeholder_first
+
+
+@_postgres_skip
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_postgres_backend_cross_thread_isolation(
+    started_pipeline_postgres: Pipeline,
+) -> None:
+    """Different chat_ids hold independent counters: same value yields the
+    same numeric suffix in each thread but they are separate Postgres rows."""
+    oib = _make_oib("8889990000")
+    body_a: dict[str, Any] = {
+        "chat_id": "task5.1-pg-isolation-A",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    body_b: dict[str, Any] = {
+        "chat_id": "task5.1-pg-isolation-B",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+
+    result_a = await started_pipeline_postgres.inlet(body_a)
+    result_b = await started_pipeline_postgres.inlet(body_b)
+
+    placeholder_a = result_a["metadata"]["pii_placeholder_map"][oib]
+    placeholder_b = result_b["metadata"]["pii_placeholder_map"][oib]
+    assert placeholder_a == "[HR_OIB_1]"
+    assert placeholder_b == "[HR_OIB_1]"
+
+
+@_postgres_skip
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_postgres_backend_chat_id_in_body_metadata_fallback(
+    started_pipeline_postgres: Pipeline,
+) -> None:
+    """`body["metadata"]["chat_id"]` resolves through the Postgres path the
+    same way it does through Redis — the chat_id resolver lives in the
+    Pipeline class, not the vault."""
+    oib = _make_oib("7778889990")
+    chat_id = "task5.1-pg-metadata-fallback"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+        "metadata": {"chat_id": chat_id},
+    }
+    result = await started_pipeline_postgres.inlet(body)
+    placeholder = result["metadata"]["pii_placeholder_map"][oib]
+
+    body2: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"OIB ponovo: {oib}"}],
+    }
+    result2 = await started_pipeline_postgres.inlet(body2)
+    assert result2["metadata"]["pii_placeholder_map"][oib] == placeholder
+
+
+@_postgres_skip
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_postgres_backend_writes_snapshot_to_body_metadata(
+    started_pipeline_postgres: Pipeline,
+) -> None:
+    """Task 6 outlet contract preservation — the SINGLE most important
+    Task 5.1 regression guard. After Postgres-backend inlet, both
+    `pii_placeholder_map` and `pii_reverse_map` MUST be `dict[str, str]`
+    populated identically to what the Redis backend writes."""
+    oib = _make_oib("6667778880")
+    body: dict[str, Any] = {
+        "chat_id": "task5.1-pg-snapshot",
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}"}],
+    }
+    result = await started_pipeline_postgres.inlet(body)
+    metadata = result["metadata"]
+
+    assert "pii_placeholder_map" in metadata
+    assert "pii_reverse_map" in metadata
+    fwd = metadata["pii_placeholder_map"]
+    rev = metadata["pii_reverse_map"]
+    assert isinstance(fwd, dict)
+    assert isinstance(rev, dict)
+    # Both maps are dict[str, str].
+    for k, v in fwd.items():
+        assert isinstance(k, str) and isinstance(v, str)
+    for k, v in rev.items():
+        assert isinstance(k, str) and isinstance(v, str)
+    # Round-trip: reverse is the inverse of forward.
+    assert oib in fwd
+    placeholder = fwd[oib]
+    assert rev[placeholder] == oib
+
+
+@_postgres_skip
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_postgres_backend_down_block_mode(
+    started_pipeline_postgres: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the vault healthcheck fails and `degradation_mode='block'` the
+    inlet must raise — backend-agnostic per Task 5 contract."""
+    assert started_pipeline_postgres.vault is not None
+
+    async def _unhealthy() -> bool:
+        return False
+
+    monkeypatch.setattr(started_pipeline_postgres.vault, "healthcheck", _unhealthy)
+    assert started_pipeline_postgres.valves.degradation_mode == "block"
+
+    oib = _make_oib("5556667770")
+    body: dict[str, Any] = {
+        "chat_id": "task5.1-pg-block-mode",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    with pytest.raises(RuntimeError, match="degradation_mode='block'"):
+        await started_pipeline_postgres.inlet(body)
+
+
+@_postgres_skip
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_postgres_backend_down_passthrough_mode(
+    started_pipeline_postgres: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `degradation_mode='passthrough'` and a dead Postgres vault the
+    inlet falls back to per-request dicts (Task 4 behavior); masking still
+    happens and `body.metadata` snapshots are still populated."""
+    assert started_pipeline_postgres.vault is not None
+
+    async def _unhealthy() -> bool:
+        return False
+
+    monkeypatch.setattr(started_pipeline_postgres.vault, "healthcheck", _unhealthy)
+    monkeypatch.setattr(started_pipeline_postgres.valves, "degradation_mode", "passthrough")
+
+    oib = _make_oib("4445556660")
+    body: dict[str, Any] = {
+        "chat_id": "task5.1-pg-passthrough-mode",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    result = await started_pipeline_postgres.inlet(body)
+
+    fwd = result["metadata"]["pii_placeholder_map"]
+    rev = result["metadata"]["pii_reverse_map"]
+    assert oib in fwd
+    placeholder = fwd[oib]
+    assert rev[placeholder] == oib
+    assert placeholder in result["messages"][-1]["content"]

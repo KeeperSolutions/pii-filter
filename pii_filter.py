@@ -2,11 +2,11 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-06
-version: 0.5.0
+date: 2026-05-07
+version: 0.6.0
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 6 — non-streaming outlet placeholder restoration: assistant responses have placeholders substituted back to original PII values via `body["metadata"]["pii_reverse_map"]` (populated by the inlet + Task 5 vault snapshot). Hallucinated placeholders are left literally in the response and surfaced as a single deduplicated WARN line per call; outlet never raises and never reads Redis.
-requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
+description: PII detection and masking filter for Keeper AI Gateway. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). Both backends expose the same async public API; inlet writes the same `body["metadata"]` snapshot regardless of backend so Task 6 outlet runs unchanged. Postgres backend uses `INSERT ... ON CONFLICT` for atomic get-or-mint, lazy expiry filtering on every read, and per-thread TTL renewal on every public method.
+requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
 """
 
 from __future__ import annotations
@@ -15,14 +15,17 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import CreditCardRecognizer
 from pydantic import BaseModel
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
+    import asyncpg
     from redis.asyncio import Redis as RedisAsync
     from redis.commands.core import AsyncScript
 
@@ -845,6 +848,311 @@ class ThreadVault:
 
 
 # ---------------------------------------------------------------------------
+# PostgreSQL ThreadVault (Task 5.1 — coexists with Redis backend)
+# ---------------------------------------------------------------------------
+
+
+# Idempotent DDL run on every `initialize()` call. Two tables: mappings
+# (PK = chat_id+type+original; unique reverse index on chat_id+placeholder)
+# and counters (PK = chat_id+type). Counter is bumped before mapping insert
+# so the candidate placeholder string can encode the freshly minted index.
+# Counter gaps under concurrency are tolerated — placeholder uniqueness
+# within a thread is preserved by the unique reverse index. See spec
+# §2.3 for the race-condition analysis.
+_POSTGRES_DDL = """
+CREATE TABLE IF NOT EXISTS pii_thread_mappings (
+  chat_id        TEXT NOT NULL,
+  entity_type    TEXT NOT NULL,
+  original_value TEXT NOT NULL,
+  placeholder    TEXT NOT NULL,
+  counter_index  INTEGER NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at     TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (chat_id, entity_type, original_value)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pii_mappings_reverse
+  ON pii_thread_mappings (chat_id, placeholder);
+
+CREATE INDEX IF NOT EXISTS idx_pii_mappings_expires
+  ON pii_thread_mappings (expires_at);
+
+CREATE TABLE IF NOT EXISTS pii_thread_counters (
+  chat_id     TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  next_value  INTEGER NOT NULL DEFAULT 1,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (chat_id, entity_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pii_counters_expires
+  ON pii_thread_counters (expires_at);
+"""
+
+
+class PostgresThreadVault:
+    """Thread-scoped placeholder vault backed by PostgreSQL.
+
+    Mirrors the public async API of `ThreadVault` (Redis backend) so the
+    inlet calls either polymorphically via duck typing — no formal Protocol
+    is declared (spec §9.2). Public methods:
+
+        get_or_create_thread(chat_id) -> None
+        get_placeholder(chat_id, original, entity_type) -> str
+        restore(chat_id, placeholder) -> str | None
+        snapshot_for_request(chat_id) -> tuple[dict[str, str], dict[str, str]]
+        healthcheck() -> bool
+        aclose() -> None
+
+    NOTE on `get_placeholder` arg order — matches the existing Redis vault
+    signature `(chat_id, original, entity_type)` so the inlet's call site
+    works against either backend without modification. Spec §2.1.1 / §2.3
+    listed `(chat_id, entity_type, original_value)` but Redis was already
+    shipped in Task 5 with `(original, entity_type)` order; preserving that
+    is mandatory for the duck-typed call to keep working.
+
+    Atomicity: `get_placeholder` issues two `INSERT ... ON CONFLICT`
+    statements inside a single transaction. Counter bump is first (so the
+    candidate placeholder string can include the new index); the mapping
+    insert is second, falling back to `DO UPDATE SET expires_at` on
+    conflict so concurrent callers observe the same placeholder. Counter
+    gaps under concurrency are tolerated; placeholder uniqueness within a
+    thread is preserved by the unique reverse index. See spec §2.3.
+
+    Lazy expiry: every read query filters `WHERE expires_at > now()` so
+    expired rows are invisible to callers without a background cleanup
+    job. TTL renewal is performed on every public method that touches a
+    thread's data; the renewal is in-line with the same query when
+    possible (UPDATE ... RETURNING pattern), or as a sibling UPDATE for
+    bulk paths like `snapshot_for_request`.
+    """
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        pool_min: int = 2,
+        pool_max: int = 10,
+        command_timeout: float = 5.0,
+        thread_ttl_seconds: int = 86400,
+        ephemeral_ttl_seconds: int = 600,
+    ) -> None:
+        self._dsn = dsn
+        self._pool_min = pool_min
+        self._pool_max = pool_max
+        self._command_timeout = command_timeout
+        self._thread_ttl = thread_ttl_seconds
+        self._ephemeral_ttl = ephemeral_ttl_seconds
+        # Pool is created lazily by `initialize()` so `__init__` never opens
+        # sockets and remains safe for unit-test instantiation.
+        self._pool: asyncpg.Pool[asyncpg.Record] | None = None
+
+    # -- helpers -------------------------------------------------------------
+
+    def _ttl_for(self, chat_id: str) -> int:
+        return self._ephemeral_ttl if chat_id.startswith(_EPHEMERAL_PREFIX) else self._thread_ttl
+
+    def _expires_at(self, chat_id: str) -> datetime:
+        return datetime.now(tz=UTC) + timedelta(seconds=self._ttl_for(chat_id))
+
+    def _require_pool(self) -> asyncpg.Pool[asyncpg.Record]:
+        if self._pool is None:
+            raise RuntimeError(
+                "PostgresThreadVault not initialized: call await vault.initialize() first."
+            )
+        return self._pool
+
+    # -- lifecycle -----------------------------------------------------------
+
+    async def initialize(self) -> None:
+        """Create the asyncpg pool and run idempotent DDL.
+
+        Safe to call multiple times in the same process — `CREATE TABLE IF
+        NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` make the schema setup
+        a no-op on subsequent calls. The pool itself is replaced if this
+        method runs after a prior `initialize()` (the previous pool is left
+        for GC; callers that want clean teardown must call `aclose()` first).
+        """
+        import asyncpg as _asyncpg  # local import keeps top-level cheap
+
+        self._pool = await _asyncpg.create_pool(
+            dsn=self._dsn,
+            min_size=self._pool_min,
+            max_size=self._pool_max,
+            command_timeout=self._command_timeout,
+            max_inactive_connection_lifetime=300.0,
+        )
+        assert self._pool is not None  # for mypy; create_pool returns Pool, not None
+        async with self._pool.acquire() as conn:
+            await conn.execute(_POSTGRES_DDL)
+
+    async def aclose(self) -> None:
+        """Close the connection pool. Idempotent — safe to call multiple times."""
+        if self._pool is not None:
+            try:
+                await self._pool.close()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("PostgresThreadVault aclose() raised: %s", exc)
+            finally:
+                self._pool = None
+
+    async def healthcheck(self) -> bool:
+        """Return True if `SELECT 1` succeeds within ~1s, False otherwise.
+
+        Acquires a connection with a 1-second timeout so a saturated pool or
+        an unreachable database fails fast and the inlet's degradation path
+        can branch on the bool. Never raises.
+        """
+        if self._pool is None:
+            return False
+        try:
+            async with self._pool.acquire(timeout=1.0) as conn:
+                # asyncpg ships no `py.typed`, so `fetchval` returns `Any`.
+                # Annotate locally to keep mypy --strict from flagging the
+                # `value == 1` comparison as an Any-leaking return.
+                value: int | None = await conn.fetchval("SELECT 1", timeout=1.0)
+            return value == 1
+        except Exception as exc:
+            logger.warning("PostgresThreadVault healthcheck failed: %s", exc)
+            return False
+
+    # -- public API ----------------------------------------------------------
+
+    async def get_or_create_thread(self, chat_id: str) -> None:
+        """API-parity no-op with the Redis vault.
+
+        The chat_id is the only thread identifier; there is no per-thread
+        row to create until the first mapping is written. Returns None to
+        match `ThreadVault.get_or_create_thread`'s signature so the inlet
+        calls either backend without conditional branching.
+        """
+        return None
+
+    async def get_placeholder(self, chat_id: str, original: str, entity_type: str) -> str:
+        """Atomic get-or-mint. Idempotent under concurrency for the same
+        `(chat_id, entity_type, original)`.
+
+        Step A bumps the per-(chat_id, entity_type) counter and returns the
+        new index. Step B inserts the mapping with `[entity_type_N]` as the
+        placeholder; on conflict (another caller already wrote this row),
+        the existing placeholder is returned via `RETURNING placeholder`.
+        Both steps run inside a single transaction. TTL is bumped on both
+        rows in this call.
+        """
+        pool = self._require_pool()
+        expires_at = self._expires_at(chat_id)
+
+        async with pool.acquire() as conn, conn.transaction():
+            counter_row = await conn.fetchrow(
+                """
+                INSERT INTO pii_thread_counters (chat_id, entity_type, next_value, expires_at)
+                VALUES ($1, $2, 2, $3)
+                ON CONFLICT (chat_id, entity_type) DO UPDATE
+                  SET next_value = pii_thread_counters.next_value + 1,
+                      expires_at = EXCLUDED.expires_at
+                RETURNING next_value - 1 AS minted_index
+                """,
+                chat_id,
+                entity_type,
+                expires_at,
+            )
+            # asyncpg returns Record | None; the INSERT ... RETURNING above
+            # always produces exactly one row, so None is unreachable in
+            # practice — assert for mypy.
+            assert counter_row is not None
+            minted_index = int(counter_row["minted_index"])
+            candidate = f"[{entity_type}_{minted_index}]"
+
+            mapping_row = await conn.fetchrow(
+                """
+                INSERT INTO pii_thread_mappings
+                  (chat_id, entity_type, original_value, placeholder,
+                   counter_index, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (chat_id, entity_type, original_value) DO UPDATE
+                  SET expires_at = EXCLUDED.expires_at
+                RETURNING placeholder
+                """,
+                chat_id,
+                entity_type,
+                original,
+                candidate,
+                minted_index,
+                expires_at,
+            )
+            assert mapping_row is not None
+            return cast(str, mapping_row["placeholder"])
+
+    async def restore(self, chat_id: str, placeholder: str) -> str | None:
+        """Reverse-lookup a placeholder. Returns None for unknown / expired.
+
+        Bumps `expires_at` on hit via `UPDATE ... RETURNING` so a single
+        round-trip covers both the lookup and the TTL renewal. A miss
+        leaves the table untouched; this matches the Redis backend's
+        renew-on-touch behavior (Redis also renews counters/forward keys
+        on every read but only for the chat_id, not on a miss against a
+        specific placeholder).
+        """
+        pool = self._require_pool()
+        expires_at = self._expires_at(chat_id)
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE pii_thread_mappings
+                SET expires_at = $3
+                WHERE chat_id = $1
+                  AND placeholder = $2
+                  AND expires_at > now()
+                RETURNING original_value
+                """,
+                chat_id,
+                placeholder,
+                expires_at,
+            )
+        if row is None:
+            return None
+        return cast("str | None", row["original_value"])
+
+    async def snapshot_for_request(self, chat_id: str) -> tuple[dict[str, str], dict[str, str]]:
+        """Return forward + reverse maps for this thread.
+
+        Bulk TTL renewal: UPDATE all mapping rows for the chat_id, UPDATE
+        all counter rows, then SELECT the snapshot. Lazy-expiry filter
+        `expires_at > now()` is applied to the SELECT so already-expired
+        rows are not returned even if they were just bumped (defensive —
+        the renewal SET happens after `now()` so the filter typically
+        passes for every renewed row).
+        """
+        pool = self._require_pool()
+        expires_at = self._expires_at(chat_id)
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE pii_thread_mappings SET expires_at = $2 WHERE chat_id = $1",
+                chat_id,
+                expires_at,
+            )
+            await conn.execute(
+                "UPDATE pii_thread_counters SET expires_at = $2 WHERE chat_id = $1",
+                chat_id,
+                expires_at,
+            )
+            rows = await conn.fetch(
+                """
+                SELECT original_value, placeholder
+                FROM pii_thread_mappings
+                WHERE chat_id = $1 AND expires_at > now()
+                """,
+                chat_id,
+            )
+
+        forward: dict[str, str] = {row["original_value"]: row["placeholder"] for row in rows}
+        reverse: dict[str, str] = {row["placeholder"]: row["original_value"] for row in rows}
+        return forward, reverse
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -867,8 +1175,28 @@ class Pipeline:
     is still pass-through (masking/restoration come in Tasks 4 + 6).
     """
 
-    class Valves(BaseModel):
-        """Admin-configurable settings (visible in OpenWebUI Admin → Pipelines)."""
+    class Valves(BaseSettings):
+        """Admin-configurable settings (visible in OpenWebUI Admin → Pipelines).
+
+        Backed by `pydantic_settings.BaseSettings`: env vars prefixed with
+        `PII_FILTER_` are auto-loaded, lowercased, stripped of the prefix,
+        and coerced into the declared field types (e.g. `bool`, `int`,
+        `Literal[...]`). Direct kwargs (used by tests) and admin-edited
+        values both still work — env vars only fill in unset fields.
+        """
+
+        model_config = SettingsConfigDict(
+            env_prefix="PII_FILTER_",
+            case_sensitive=False,
+            # Defensive: silently ignore stray env vars that share the
+            # prefix but don't match a declared field, so an operator
+            # typo never crashes Pipelines startup.
+            extra="ignore",
+            # Never auto-read .env files; only os.environ. Prevents
+            # surprise loads from a developer .env that happens to be
+            # in the Pipelines container working directory.
+            env_file=None,
+        )
 
         pipelines: list[str] = ["*"]
         priority: int = 0
@@ -897,6 +1225,27 @@ class Pipeline:
         thread_ttl_seconds: int = 86400
         # 10 min for chat_id-less ephemeral fallback threads.
         ephemeral_ttl_seconds: int = 600
+        # ---- Task 5.1: PostgreSQL backend ----------------------------------
+        # Selects the vault implementation. `postgres` (default in v0.6.0)
+        # uses `PostgresThreadVault`; `redis` falls back to the Task 5
+        # Redis-backed `ThreadVault`. Operators can flip via env var
+        # `PII_FILTER_VAULT_BACKEND` without redeploying code.
+        vault_backend: Literal["redis", "postgres"] = "postgres"
+        # Full Postgres DSN. Empty default means the operator must set
+        # `PII_FILTER_POSTGRES_URL` for the Postgres backend to start —
+        # `on_startup` raises if `vault_backend='postgres'` and this is "".
+        # Cloud SQL pattern:
+        #   "postgresql://user:pass@/db?host=/cloudsql/<INSTANCE_CONN_NAME>"
+        postgres_url: str = ""
+        # Connection pool sizing. min=2 keeps two warm connections post-
+        # cold-start so the first request avoids TCP+TLS+auth handshake.
+        # max=10 caps parallel DB ops; well under Cloud SQL's default
+        # max_connections (~200 on db-custom-2-13312).
+        postgres_pool_min: int = 2
+        postgres_pool_max: int = 10
+        # Per-query timeout (ms). Caps any single query at 5s — prevents
+        # zombie connections from hanging the pool.
+        postgres_command_timeout_ms: int = 5000
 
     class UserValves(BaseModel):
         """Per-user toggles. Schema only — Task 8 wires the masking toggle.
@@ -948,12 +1297,20 @@ class Pipeline:
         """
         self.type = "filter"
         self.name = "PII Filter"
+        # `Valves` is a `pydantic_settings.BaseSettings` subclass with
+        # `env_prefix="PII_FILTER_"` — it reads os.environ itself and
+        # coerces to the declared field types (incl. `Literal` validation
+        # on `vault_backend`). No manual env-var plumbing needed here.
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
         self.analyzer: AnalyzerEngine | None = None
-        # ThreadVault is built in `on_startup` from the current valves so
-        # admin-edited Redis settings take effect on Pipelines restart.
-        self.vault: ThreadVault | None = None
+        # The vault is built in `on_startup` from the current valves so
+        # admin-edited backend settings take effect on Pipelines restart.
+        # The selector logic in `on_startup` picks `ThreadVault` (Redis) or
+        # `PostgresThreadVault` based on `valves.vault_backend`. Inlet calls
+        # vault methods polymorphically via duck typing — both classes
+        # share the same async public API.
+        self.vault: ThreadVault | PostgresThreadVault | None = None
 
         logger.info("PII Filter pipeline initialized (analyzer not loaded yet)")
 
@@ -1032,22 +1389,69 @@ class Pipeline:
 
         self.analyzer = analyzer
 
-        # Build the ThreadVault from the current valves. Connection is lazy:
-        # the underlying Redis client is created on first use, not here, so
-        # `on_startup` does not block on a Redis daemon.
-        self.vault = ThreadVault(
-            url=self.valves.redis_url,
-            connect_timeout_ms=self.valves.redis_connect_timeout_ms,
-            socket_timeout_ms=self.valves.redis_socket_timeout_ms,
-            thread_ttl_seconds=self.valves.thread_ttl_seconds,
-            ephemeral_ttl_seconds=self.valves.ephemeral_ttl_seconds,
-        )
-        logger.info(
-            "PII Filter on_startup complete: 12 custom + CreditCard recognizers "
-            "registered; ThreadVault wired (redis_enabled=%s, url=%s)",
-            self.valves.redis_enabled,
-            self.valves.redis_url,
-        )
+        # Build the vault from the current valves. Backend is selected by
+        # `valves.vault_backend`. For Postgres, `initialize()` opens the
+        # connection pool and runs idempotent DDL — failure here is fatal
+        # and the container fails to start (explicit failure beats silent
+        # fallback per spec §3.7). For Redis, the underlying client is
+        # created lazily on first use so `on_startup` never blocks on a
+        # Redis daemon.
+        backend = self.valves.vault_backend
+        if backend == "postgres":
+            if not self.valves.postgres_url:
+                raise RuntimeError(
+                    "vault_backend='postgres' but postgres_url is empty. "
+                    "Set the PII_FILTER_POSTGRES_URL env var (or the "
+                    "valves.postgres_url admin setting) to a valid DSN."
+                )
+            self.vault = PostgresThreadVault(
+                dsn=self.valves.postgres_url,
+                pool_min=self.valves.postgres_pool_min,
+                pool_max=self.valves.postgres_pool_max,
+                command_timeout=self.valves.postgres_command_timeout_ms / 1000.0,
+                thread_ttl_seconds=self.valves.thread_ttl_seconds,
+                ephemeral_ttl_seconds=self.valves.ephemeral_ttl_seconds,
+            )
+            await self.vault.initialize()
+            logger.info(
+                "PII Filter on_startup complete: 12 custom + CreditCard recognizers "
+                "registered; PostgresThreadVault wired "
+                "(pool_min=%d, pool_max=%d, command_timeout_ms=%d)",
+                self.valves.postgres_pool_min,
+                self.valves.postgres_pool_max,
+                self.valves.postgres_command_timeout_ms,
+            )
+        elif backend == "redis":
+            self.vault = ThreadVault(
+                url=self.valves.redis_url,
+                connect_timeout_ms=self.valves.redis_connect_timeout_ms,
+                socket_timeout_ms=self.valves.redis_socket_timeout_ms,
+                thread_ttl_seconds=self.valves.thread_ttl_seconds,
+                ephemeral_ttl_seconds=self.valves.ephemeral_ttl_seconds,
+            )
+            logger.info(
+                "PII Filter on_startup complete: 12 custom + CreditCard recognizers "
+                "registered; ThreadVault wired (redis_enabled=%s, url=%s)",
+                self.valves.redis_enabled,
+                self.valves.redis_url,
+            )
+        else:
+            # Pydantic's Literal validation should already block invalid
+            # values; this branch exists as a defensive backstop.
+            raise RuntimeError(f"Unknown vault_backend: {backend!r}")
+
+        # Both branches above assigned `self.vault`; the third raises.
+        # Mypy widens the post-`await` `self.vault` to `object` because
+        # `from __future__ import annotations` defers the declared union
+        # type and the attribute is reassigned across awaits, so cast
+        # back to the union explicitly.
+        vault = cast("ThreadVault | PostgresThreadVault", self.vault)
+        if not await vault.healthcheck():
+            logger.warning(
+                "Vault healthcheck failed at startup; backend=%s. The inlet "
+                "will hit its degradation_mode path on first use.",
+                backend,
+            )
 
     async def on_shutdown(self) -> None:
         """Called when Pipelines container stops."""
@@ -1303,12 +1707,13 @@ class Pipeline:
         redis_state = ("ephemeral" if raw_chat_id is None else "on") if use_redis else "off"
         logger.info(
             "pii_filter inlet processed: chat_id=%s thread_id=%s detections=%d "
-            "masked=%d redis=%s",
+            "masked=%d redis=%s backend=%s",
             raw_chat_id,
             thread_id,
             len(all_enriched),
             len(forward_map),
             redis_state,
+            self.valves.vault_backend,
         )
 
         return body
@@ -1520,3 +1925,13 @@ class Pipeline:
                 exc_info=True,
             )
             return body
+
+
+# Resolve forward references for the nested `Valves` BaseSettings.
+# `from __future__ import annotations` defers all annotations to strings;
+# Pydantic v2 in some container Pydantic versions (2.7.x) fails to look up
+# `Literal` while building the nested model and raises
+# `PydanticUserError: Valves is not fully defined`. Rebuilding here with
+# the module globals in scope makes `Literal` resolvable. Cheap at import
+# time, and a no-op if Pydantic already finalized the model.
+Pipeline.Valves.model_rebuild()

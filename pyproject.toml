@@ -45,6 +45,19 @@ files = ["pii_filter.py", "tests"]
 module = "schemas"
 ignore_missing_imports = true
 
+# asyncpg ships no py.typed marker as of 0.31; its public callables surface
+# as Any under mypy --strict. Treat the import as untyped so we can use
+# explicit `cast(...)` at the boundary instead of polluting every line with
+# # type: ignore comments.
+[[tool.mypy.overrides]]
+module = "asyncpg"
+ignore_missing_imports = true
+
+# pytest-postgresql factories return loosely-typed fixtures; same handling.
+[[tool.mypy.overrides]]
+module = "pytest_postgresql.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
