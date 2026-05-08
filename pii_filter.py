@@ -969,11 +969,16 @@ class PostgresThreadVault:
 
         Safe to call multiple times in the same process — `CREATE TABLE IF
         NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` make the schema setup
-        a no-op on subsequent calls. The pool itself is replaced if this
-        method runs after a prior `initialize()` (the previous pool is left
-        for GC; callers that want clean teardown must call `aclose()` first).
+        a no-op on subsequent calls. If a prior pool exists from an earlier
+        `initialize()`, it is closed before being replaced so its open
+        sockets don't leak until GC.
         """
         import asyncpg as _asyncpg  # local import keeps top-level cheap
+
+        # Close any pool from a prior `initialize()` call before
+        # overwriting `self._pool`. `aclose()` is idempotent and a no-op
+        # when `self._pool is None`, so this is safe on the cold path.
+        await self.aclose()
 
         self._pool = await _asyncpg.create_pool(
             dsn=self._dsn,
@@ -1038,11 +1043,32 @@ class PostgresThreadVault:
         the existing placeholder is returned via `RETURNING placeholder`.
         Both steps run inside a single transaction. TTL is bumped on both
         rows in this call.
+
+        Expired rows for `chat_id` are deleted at the top of the
+        transaction so a stale counter never bumps off an old `next_value`
+        and a stale mapping never resurrects an old placeholder via
+        `ON CONFLICT DO UPDATE RETURNING`. This matches the Redis backend,
+        where Redis EXPIRE auto-deletes the keys so a fresh thread always
+        starts at index 1, and is the cleanup hook for GDPR TTLs (PII rows
+        get physically purged on the next access against the same chat_id).
         """
         pool = self._require_pool()
         expires_at = self._expires_at(chat_id)
 
         async with pool.acquire() as conn, conn.transaction():
+            # Purge expired rows for this chat before the UPSERTs.
+            # Scoped to chat_id so unrelated threads' rows are untouched
+            # (a global sweep belongs in a separate cleanup job, not on
+            # the request-path hot path).
+            await conn.execute(
+                "DELETE FROM pii_thread_counters " "WHERE chat_id = $1 AND expires_at <= now()",
+                chat_id,
+            )
+            await conn.execute(
+                "DELETE FROM pii_thread_mappings " "WHERE chat_id = $1 AND expires_at <= now()",
+                chat_id,
+            )
+
             counter_row = await conn.fetchrow(
                 """
                 INSERT INTO pii_thread_counters (chat_id, entity_type, next_value, expires_at)
@@ -1117,24 +1143,28 @@ class PostgresThreadVault:
     async def snapshot_for_request(self, chat_id: str) -> tuple[dict[str, str], dict[str, str]]:
         """Return forward + reverse maps for this thread.
 
-        Bulk TTL renewal: UPDATE all mapping rows for the chat_id, UPDATE
-        all counter rows, then SELECT the snapshot. Lazy-expiry filter
-        `expires_at > now()` is applied to the SELECT so already-expired
-        rows are not returned even if they were just bumped (defensive —
-        the renewal SET happens after `now()` so the filter typically
-        passes for every renewed row).
+        Bulk TTL renewal: UPDATE non-expired mapping rows for the chat_id,
+        UPDATE non-expired counter rows, then SELECT the snapshot. The
+        renewal WHERE clauses include `expires_at > now()` so an
+        already-expired row is NOT bumped back to life by a later
+        snapshot call — that would diverge from Redis (where a key past
+        TTL is gone) and silently extend PII retention past the GDPR
+        deadline. The SELECT applies the same filter so expired rows
+        are also invisible to the caller.
         """
         pool = self._require_pool()
         expires_at = self._expires_at(chat_id)
 
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE pii_thread_mappings SET expires_at = $2 WHERE chat_id = $1",
+                "UPDATE pii_thread_mappings SET expires_at = $2 "
+                "WHERE chat_id = $1 AND expires_at > now()",
                 chat_id,
                 expires_at,
             )
             await conn.execute(
-                "UPDATE pii_thread_counters SET expires_at = $2 WHERE chat_id = $1",
+                "UPDATE pii_thread_counters SET expires_at = $2 "
+                "WHERE chat_id = $1 AND expires_at > now()",
                 chat_id,
                 expires_at,
             )
@@ -1572,8 +1602,8 @@ class Pipeline:
         # Redis path requires `redis_enabled=True`, a vault instance, and
         # a healthy PING. On any of those failing in `block` mode we raise
         # so the request never reaches the LLM unfiltered.
-        use_redis = self.valves.redis_enabled and self.vault is not None
-        if use_redis:
+        use_vault = self.valves.redis_enabled and self.vault is not None
+        if use_vault:
             assert self.vault is not None  # for mypy
             try:
                 healthy = await self.vault.healthcheck()
@@ -1594,7 +1624,7 @@ class Pipeline:
                     "Thread consistency disabled for chat_id=%s",
                     raw_chat_id,
                 )
-                use_redis = False
+                use_vault = False
 
         # Per-request mapping state. Used in the fallback path; in the Redis
         # path we read the snapshot back from the vault at the end.
@@ -1603,7 +1633,7 @@ class Pipeline:
         reverse_map: dict[str, str] = {}
         all_enriched: list[dict[str, Any]] = []
 
-        if use_redis:
+        if use_vault:
             assert self.vault is not None  # for mypy
             try:
                 await self.vault.get_or_create_thread(thread_id)
@@ -1614,7 +1644,7 @@ class Pipeline:
                         "PII filter blocked the request: Redis thread vault is "
                         "unreachable and degradation_mode='block'."
                     ) from None
-                use_redis = False
+                use_vault = False
 
         try:
             for text, write_back in parts:
@@ -1629,7 +1659,7 @@ class Pipeline:
                     original = text[det.start : det.end]
                     standard_type = self.PRESIDIO_TO_STANDARD[det.entity_type]
                     placeholder: str
-                    if use_redis:
+                    if use_vault:
                         assert self.vault is not None  # for mypy
                         placeholder = await self.vault.get_placeholder(
                             thread_id, original, standard_type
@@ -1679,7 +1709,7 @@ class Pipeline:
         # Spec §3.3 step 7 — body-metadata snapshot is the forward-compat hinge
         # for Task 6: outlet keeps reading from these keys regardless of Redis
         # being the source of truth.
-        if use_redis:
+        if use_vault:
             assert self.vault is not None  # for mypy
             try:
                 forward_map, reverse_map = await self.vault.snapshot_for_request(thread_id)
@@ -1694,7 +1724,7 @@ class Pipeline:
                 # cannot rebuild the request-scoped maps. Leave them empty so
                 # the request still reaches the LLM; outlet restoration for
                 # this turn will be a no-op.
-                use_redis = False
+                use_vault = False
 
         metadata = body.get("metadata")
         if not isinstance(metadata, dict):
@@ -1704,15 +1734,20 @@ class Pipeline:
         metadata["pii_placeholder_map"] = forward_map
         metadata["pii_reverse_map"] = reverse_map
 
-        redis_state = ("ephemeral" if raw_chat_id is None else "on") if use_redis else "off"
+        # Backend-agnostic state field. The legacy field name `redis=` was
+        # misleading once the Postgres backend landed: an operator triaging
+        # a Postgres-backend incident saw `redis=on` and (reasonably)
+        # suspected Redis. `vault=` makes intent explicit alongside the
+        # `backend=` field, which carries the actual implementation.
+        vault_state = ("ephemeral" if raw_chat_id is None else "on") if use_vault else "off"
         logger.info(
             "pii_filter inlet processed: chat_id=%s thread_id=%s detections=%d "
-            "masked=%d redis=%s backend=%s",
+            "masked=%d vault=%s backend=%s",
             raw_chat_id,
             thread_id,
             len(all_enriched),
             len(forward_map),
-            redis_state,
+            vault_state,
             self.valves.vault_backend,
         )
 

@@ -95,9 +95,11 @@ if TYPE_CHECKING:
     from pytest_postgresql.executor import PostgreSQLExecutor
 
 
-# pytest-postgresql requires a `pg_ctl` / `postgres` binary on PATH. On hosts
-# without one, postgres-backed tests skip cleanly via this marker.
-postgres_binary_missing = shutil.which("pg_ctl") is None and shutil.which("postgres") is None
+# pytest-postgresql needs BOTH `pg_ctl` (to initdb/start/stop the cluster) and
+# the `postgres` server binary at runtime. Skip if either is missing —
+# `and` would only skip when both are absent, leaving tests to fail with a
+# binary-not-found error on hosts that ship one but not the other.
+postgres_binary_missing = shutil.which("pg_ctl") is None or shutil.which("postgres") is None
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -311,8 +313,7 @@ async def started_pipeline_postgres(
         _admin = await asyncpg.connect(admin_dsn)
         try:
             await _admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = $1",
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity " "WHERE datname = $1",
                 _PIPELINE_POSTGRES_DBNAME,
             )
             await _admin.execute(f'DROP DATABASE IF EXISTS "{_PIPELINE_POSTGRES_DBNAME}"')

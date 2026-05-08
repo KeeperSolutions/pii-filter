@@ -172,6 +172,46 @@ async def test_restore_returns_none_for_expired_row(
     assert result is None
 
 
+async def test_get_placeholder_resets_counter_after_thread_expires(
+    postgres_vault: PostgresThreadVault,
+) -> None:
+    """Parity with Redis: when ALL rows for a chat_id are past their
+    `expires_at`, the next `get_placeholder` mints `[TYPE_1]` against a
+    fresh counter rather than bumping the stale `next_value`. Redis
+    EXPIRE auto-deletes the keys; Postgres must purge them inline at
+    the top of `get_placeholder` to behave the same way (and to honor
+    the GDPR TTL contract).
+    """
+    first = await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
+    assert first == "[PERSON_1]"
+
+    pool = postgres_vault._pool
+    assert pool is not None
+    async with pool.acquire() as conn:
+        past = datetime.now(tz=UTC) - timedelta(seconds=60)
+        await conn.execute(
+            "UPDATE pii_thread_counters SET expires_at = $2 WHERE chat_id = $1",
+            "chatA",
+            past,
+        )
+        await conn.execute(
+            "UPDATE pii_thread_mappings SET expires_at = $2 WHERE chat_id = $1",
+            "chatA",
+            past,
+        )
+
+    # New original on the same chat: counter+mapping are purged inline,
+    # so the fresh insert mints `[PERSON_1]` and not `[PERSON_2]`.
+    second = await postgres_vault.get_placeholder("chatA", "Marko Marić", "PERSON")
+    assert second == "[PERSON_1]"
+
+    # Re-minting the originally-expired value now yields `[PERSON_2]` —
+    # proof that the old mapping was physically deleted, not
+    # resurrected via `ON CONFLICT DO UPDATE RETURNING placeholder`.
+    third = await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
+    assert third == "[PERSON_2]"
+
+
 # ---------------------------------------------------------------------------
 # snapshot_for_request()
 # ---------------------------------------------------------------------------
@@ -243,6 +283,53 @@ async def test_snapshot_excludes_expired_rows(postgres_vault: PostgresThreadVaul
     visible_originals = {row["original_value"] for row in rows}
     assert "Ana Marić" in visible_originals
     assert "Ivan Horvat" not in visible_originals
+
+
+async def test_snapshot_does_not_resurrect_expired_rows(
+    postgres_vault: PostgresThreadVault,
+) -> None:
+    """`snapshot_for_request` must NOT bump `expires_at` on already-expired
+    rows. Renewing them would resurrect PII past the GDPR TTL deadline and
+    diverge from Redis (where keys past TTL are gone, period). The bulk
+    UPDATEs gate on `expires_at > now()` so expired rows stay expired and
+    fall out of the SELECT.
+    """
+    placeholder_ivan = await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
+    placeholder_ana = await postgres_vault.get_placeholder("chatA", "Ana Marić", "PERSON")
+
+    pool = postgres_vault._pool
+    assert pool is not None
+    past = datetime.now(tz=UTC) - timedelta(seconds=60)
+    async with pool.acquire() as conn:
+        # Expire Ivan's mapping but leave Ana's alone.
+        await conn.execute(
+            "UPDATE pii_thread_mappings SET expires_at = $2 "
+            "WHERE chat_id = $1 AND original_value = $3",
+            "chatA",
+            past,
+            "Ivan Horvat",
+        )
+
+    forward, reverse = await postgres_vault.snapshot_for_request("chatA")
+
+    # Ana is live → in the snapshot.
+    assert forward.get("Ana Marić") == placeholder_ana
+    assert reverse.get(placeholder_ana) == "Ana Marić"
+    # Ivan was expired → snapshot must hide him.
+    assert "Ivan Horvat" not in forward
+    assert placeholder_ivan not in reverse
+
+    # Confirm Ivan's row is still expired in DB (not bumped to a future
+    # `expires_at` by the bulk renewal).
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT expires_at FROM pii_thread_mappings "
+            "WHERE chat_id = $1 AND original_value = $2",
+            "chatA",
+            "Ivan Horvat",
+        )
+    assert row is not None
+    assert row["expires_at"] <= datetime.now(tz=UTC)
 
 
 async def test_snapshot_empty_thread_returns_empty_dicts(
