@@ -1412,3 +1412,70 @@ async def test_inlet_postgres_backend_down_passthrough_mode(
     placeholder = fwd[oib]
     assert rev[placeholder] == oib
     assert placeholder in result["messages"][-1]["content"]
+
+
+@_postgres_skip
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_postgres_backend_with_vault_enabled_false_falls_back_to_per_request(
+    started_pipeline_postgres: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bugfix regression: with the Postgres backend wired up but
+    `vault_enabled=False`, the inlet must bypass the vault entirely and
+    fall back to per-request dicts (Task 4 behavior). Verifies the global
+    kill switch is backend-agnostic — `redis_enabled` does not (and must
+    not) gate the Postgres path."""
+    assert started_pipeline_postgres.vault is not None
+
+    async def _spy_get_placeholder(*args: Any, **kwargs: Any) -> str:
+        raise AssertionError("vault.get_placeholder must not be called when vault_enabled=False")
+
+    monkeypatch.setattr(started_pipeline_postgres.vault, "get_placeholder", _spy_get_placeholder)
+    monkeypatch.setattr(started_pipeline_postgres.valves, "vault_enabled", False)
+
+    oib = _make_oib("7770001110")
+    body: dict[str, Any] = {
+        "chat_id": "task5.1-pg-vault-disabled",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    result = await started_pipeline_postgres.inlet(body)
+
+    fwd = result["metadata"]["pii_placeholder_map"]
+    rev = result["metadata"]["pii_reverse_map"]
+    assert oib in fwd
+    placeholder = fwd[oib]
+    assert rev[placeholder] == oib
+    assert placeholder in result["messages"][-1]["content"]
+
+
+@_postgres_skip
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_postgres_backend_with_vault_enabled_true_uses_vault(
+    started_pipeline_postgres: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bugfix regression (positive case): with `vault_enabled=True` and
+    the Postgres backend wired up, the inlet must call
+    `vault.get_placeholder` for every detected entity — proving the
+    Postgres path is reached without depending on `redis_enabled`."""
+    assert started_pipeline_postgres.vault is not None
+    assert started_pipeline_postgres.valves.vault_enabled is True
+
+    real_get_placeholder = started_pipeline_postgres.vault.get_placeholder
+    call_count = 0
+
+    async def _spy_get_placeholder(*args: Any, **kwargs: Any) -> str:
+        nonlocal call_count
+        call_count += 1
+        return await real_get_placeholder(*args, **kwargs)
+
+    monkeypatch.setattr(started_pipeline_postgres.vault, "get_placeholder", _spy_get_placeholder)
+
+    oib = _make_oib("6660001110")
+    body: dict[str, Any] = {
+        "chat_id": "task5.1-pg-vault-enabled",
+        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+    }
+    result = await started_pipeline_postgres.inlet(body)
+
+    fwd = result["metadata"]["pii_placeholder_map"]
+    assert oib in fwd
+    assert call_count >= 1

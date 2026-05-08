@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import CreditCardRecognizer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -1239,10 +1239,24 @@ class Pipeline:
         #     without PII filtering. Use only if availability outweighs
         #     leak risk. Any unrecognized value is treated as "block".
         degradation_mode: str = "block"
+        # ---- Vault kill switch (backend-agnostic) --------------------------
+        # Global vault kill switch. When False, the inlet always uses
+        # Task 4's per-request dicts and never touches the configured
+        # vault backend (Redis or Postgres). Default True.
+        vault_enabled: bool = True
         # ---- Task 5: Redis thread vault ------------------------------------
-        # Global kill switch. When False, the inlet always uses Task 4's
-        # per-request dicts and never touches Redis.
-        redis_enabled: bool = True
+        # DEPRECATED legacy Redis-only kill switch. Kept for backward
+        # compatibility with admins who set it before `vault_enabled`
+        # existed. Only honored when `vault_backend == "redis"`; ignored
+        # entirely for the Postgres backend. Use `vault_enabled` instead.
+        redis_enabled: bool = Field(
+            default=True,
+            description=(
+                "DEPRECATED: legacy Redis-only kill switch. Use "
+                "`vault_enabled` instead. Only consulted when "
+                "`vault_backend='redis'`; ignored for the Postgres backend."
+            ),
+        )
         # Connection string. The Pipelines container default expects a
         # Redis instance reachable at this URL; override per-environment.
         redis_url: str = "redis://localhost:6379/0"
@@ -1452,6 +1466,20 @@ class Pipeline:
                 self.valves.postgres_command_timeout_ms,
             )
         elif backend == "redis":
+            # Reconcile the deprecated `redis_enabled` kill switch with the
+            # new backend-agnostic `vault_enabled`. Contradictory config
+            # (vault_enabled=True but redis_enabled=False) collapses to
+            # the more conservative interpretation (vault disabled), and
+            # we surface the conflict in the logs so an operator can
+            # remove the stale `redis_enabled=False` from their valves.
+            if not self.valves.redis_enabled and self.valves.vault_enabled:
+                logger.warning(
+                    "Contradictory vault config: redis_enabled=False but "
+                    "vault_enabled=True with vault_backend='redis'. Treating "
+                    "as vault_enabled=False (conservative). Migrate your "
+                    "valves to use `vault_enabled` and remove `redis_enabled`."
+                )
+                self.valves.vault_enabled = False
             self.vault = ThreadVault(
                 url=self.valves.redis_url,
                 connect_timeout_ms=self.valves.redis_connect_timeout_ms,
@@ -1598,11 +1626,12 @@ class Pipeline:
         if raw_chat_id is None:
             logger.warning("inlet: chat_id missing, using ephemeral thread_id=%s", thread_id)
 
-        # Decide whether to use Redis or fall back to per-request dicts.
-        # Redis path requires `redis_enabled=True`, a vault instance, and
-        # a healthy PING. On any of those failing in `block` mode we raise
-        # so the request never reaches the LLM unfiltered.
-        use_vault = self.valves.redis_enabled and self.vault is not None
+        # Decide whether to use the vault or fall back to per-request dicts.
+        # Vault path requires `vault_enabled=True`, a vault instance, and
+        # a healthy backend (PING for Redis, SELECT 1 for Postgres). On any
+        # of those failing in `block` mode we raise so the request never
+        # reaches the LLM unfiltered.
+        use_vault = self.valves.vault_enabled and self.vault is not None
         if use_vault:
             assert self.vault is not None  # for mypy
             try:
