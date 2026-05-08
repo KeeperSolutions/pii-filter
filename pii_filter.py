@@ -1878,9 +1878,17 @@ class Pipeline:
         """Restore PII placeholders in the assistant response back to their
         original values before forwarding the body to the OpenWebUI client.
 
-        Reads `body["metadata"]["pii_reverse_map"]` (populated by inlet via
-        Task 4 + persisted by the Task 5 vault snapshot) as the *only* source
-        of truth — outlet does not touch Redis (Decision 1).
+        Source-of-truth selection (post-merge bugfix #2, 2026-05-08): outlet
+        prefers `body["metadata"]["pii_reverse_map"]` when populated by inlet
+        (Task 4) — this preserves backward compatibility for unit tests and
+        any caller that propagates metadata. When metadata is missing or
+        empty, outlet falls back to a direct read of the configured vault
+        via `snapshot_for_request(chat_id)`. The fallback is required by
+        real-world OpenWebUI Pipelines integration: inlet and outlet are
+        served as separate HTTP endpoints with independent request bodies,
+        so the metadata populated by inlet does NOT survive the round-trip
+        to outlet (revising the original Task 6 Decision 1 assumption that
+        outlet never reads from the vault).
 
         Outlet **never raises** (Decision 5): the entire restoration path is
         wrapped in a top-level two-tier `try/except`. The first arm catches
@@ -1904,14 +1912,6 @@ class Pipeline:
         # is wired, gate the entire restoration path behind it. Task 6 leaves
         # the per-user toggle defined-but-unread, same as inlet.
 
-        # TEMP DEBUG — remove after diagnosis
-        logger.info("OUTLET DEBUG: body keys=%s", list(body.keys()) if isinstance(body, dict) else type(body))
-        if isinstance(body, dict):
-            md = body.get("metadata")
-            logger.info("OUTLET DEBUG: metadata type=%s; pii_reverse_map keys=%s",
-                        type(md).__name__,
-                        list(md.get("pii_reverse_map", {}).keys()) if isinstance(md, dict) else "N/A")
-
         if not self.valves.enabled:
             return body
 
@@ -1921,18 +1921,45 @@ class Pipeline:
                 logger.debug("pii_filter outlet skipped: body is not a dict")
                 return body
 
-            raw_chat_id, _ = self._resolve_chat_id(body)
+            raw_chat_id, thread_id = self._resolve_chat_id(body)
             chat_id_for_log = raw_chat_id  # may be None when no chat_id supplied
 
+            # Prefer body metadata (unit tests + callers that propagate it),
+            # then fall back to a direct vault read (real OpenWebUI Pipelines,
+            # which serves outlet as a separate HTTP endpoint without metadata
+            # propagation — see post-merge bugfix #2 in TASK-05.1-COMPLETION).
+            reverse_map: dict[str, str] | None = None
             metadata = body.get("metadata")
-            if not isinstance(metadata, dict):
-                logger.debug("pii_filter outlet skipped: no metadata dict")
-                return body
+            if isinstance(metadata, dict):
+                candidate = metadata.get("pii_reverse_map")
+                if isinstance(candidate, dict) and candidate:
+                    reverse_map = candidate
 
-            reverse_map = metadata.get("pii_reverse_map")
-            if not isinstance(reverse_map, dict) or not reverse_map:
-                logger.debug("pii_filter outlet skipped: pii_reverse_map missing or empty")
-                return body
+            if reverse_map is None:
+                if self.vault is not None and self.valves.vault_enabled and raw_chat_id:
+                    try:
+                        _forward, vault_reverse = await self.vault.snapshot_for_request(thread_id)
+                    except Exception:
+                        logger.exception(
+                            "pii_filter outlet: vault snapshot_for_request raised; "
+                            "returning body unchanged chat_id=%s",
+                            chat_id_for_log,
+                        )
+                        return body
+                    if vault_reverse:
+                        reverse_map = vault_reverse
+                    else:
+                        logger.debug(
+                            "pii_filter outlet skipped: vault snapshot empty " "for chat_id=%s",
+                            chat_id_for_log,
+                        )
+                        return body
+                else:
+                    logger.debug(
+                        "pii_filter outlet skipped: pii_reverse_map missing and "
+                        "vault fallback unavailable"
+                    )
+                    return body
 
             target_message = self._extract_assistant_message(body)
             if target_message is None:

@@ -114,3 +114,95 @@ async def test_outlet_after_postgres_inlet_reverse_map_is_dict_str_str(
         assert isinstance(k, str), f"reverse_map key must be str, got {type(k).__name__}"
         assert isinstance(v, str), f"reverse_map value must be str, got {type(v).__name__}"
         assert k.startswith("[") and k.endswith("]"), f"placeholder shape broken: {k}"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_falls_back_to_vault_when_metadata_missing(
+    started_pipeline_postgres: Pipeline,
+) -> None:
+    """Real OpenWebUI Pipelines serves inlet and outlet as separate HTTP
+    endpoints — the outlet body has no `metadata` key. Outlet must fall
+    back to `vault.snapshot_for_request(chat_id)` to recover the reverse
+    map and successfully restore placeholders. Without this fallback,
+    placeholders leak through to the user-facing UI."""
+    oib = _make_oib("4445556660")
+    chat_id = "task5.1-outlet-vault-fallback"
+
+    request_body: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}."}],
+    }
+    request_body = await started_pipeline_postgres.inlet(request_body)
+    placeholder = request_body["metadata"]["pii_placeholder_map"][oib]
+
+    # Simulate the real Pipelines outlet body shape: NO metadata key.
+    response_body: dict[str, Any] = {
+        "chat_id": chat_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": f"Vaš OIB ({placeholder}) je u redu.",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    assert "metadata" not in response_body
+
+    response_body = await started_pipeline_postgres.outlet(response_body)
+    restored_text: str = response_body["choices"][0]["message"]["content"]
+
+    assert oib in restored_text, "vault fallback failed to restore placeholder"
+    assert placeholder not in restored_text
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_outlet_prefers_metadata_when_both_available(
+    started_pipeline_postgres: Pipeline,
+) -> None:
+    """When the outlet body carries `metadata.pii_reverse_map`, outlet must
+    use it directly and skip the vault snapshot call. Pinned by feeding a
+    `metadata.pii_reverse_map` whose entries do NOT match what the Postgres
+    vault holds — restoration must use the metadata-supplied mapping
+    (proves vault was not consulted)."""
+    oib = _make_oib("5556667770")
+    chat_id = "task5.1-outlet-metadata-priority"
+
+    request_body: dict[str, Any] = {
+        "chat_id": chat_id,
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}."}],
+    }
+    request_body = await started_pipeline_postgres.inlet(request_body)
+    placeholder = request_body["metadata"]["pii_placeholder_map"][oib]
+
+    # Override metadata reverse_map with a sentinel value distinguishable
+    # from what the vault would return for the same placeholder.
+    sentinel = "FROM-METADATA-NOT-VAULT"
+    overridden_metadata = {
+        **request_body["metadata"],
+        "pii_reverse_map": {placeholder: sentinel},
+    }
+
+    response_body: dict[str, Any] = {
+        "chat_id": chat_id,
+        "metadata": overridden_metadata,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": f"Vaš OIB ({placeholder}) je u redu.",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    response_body = await started_pipeline_postgres.outlet(response_body)
+    restored_text: str = response_body["choices"][0]["message"]["content"]
+
+    assert sentinel in restored_text, "outlet must prefer body metadata over vault"
+    assert oib not in restored_text, "vault must not have been consulted"
+    assert placeholder not in restored_text

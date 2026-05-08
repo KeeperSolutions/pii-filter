@@ -873,8 +873,11 @@ async def test_outlet_empty_reverse_map_is_noop(
 
     assert result is body
     assert result["choices"][0]["message"]["content"] == snapshot_content
+    # Empty body metadata triggers vault fallback (post-merge bugfix #2);
+    # the per-test fakeredis vault has no entry for this chat_id, so the
+    # snapshot returns empty and outlet bails out at the DEBUG no-op path.
     assert any(
-        "pii_reverse_map missing or empty" in rec.message
+        ("vault snapshot empty" in rec.message) or ("pii_reverse_map missing" in rec.message)
         for rec in caplog.records
         if rec.levelname == "DEBUG"
     )
