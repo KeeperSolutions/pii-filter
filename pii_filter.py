@@ -427,8 +427,10 @@ def _select_accepted_detections(
 
     Processing order (Task 3.1 additions in steps 2-4):
       1. Whitelist filter — drop entity types not in `presidio_to_standard`.
-      2. Deny-list filter — drop PERSON entities whose lowercased text is in
-         `deny_list` (suppresses spaCy false positives on English/code keywords).
+      2. Deny-list filter — drop PERSON entities whose lowercased text either
+         exactly matches an entry in `deny_list` or starts with a deny-listed
+         entry followed by a space (suppresses spaCy false positives on
+         English/code keywords).
       3. Trailing-token strip — for PERSON entities whose last whitespace-
          separated token is in `trailing_strip`, shorten the span to exclude
          that token (also strips trailing punctuation). Drop if span becomes
@@ -1405,9 +1407,11 @@ class Pipeline:
         # zombie connections from hanging the pool.
         postgres_command_timeout_ms: int = 5000
         # ---- Task 3.1: Recognizer accuracy --------------------------------
-        # Exact-match (case-insensitive) denylist for PERSON entities.
-        # Suppresses spaCy false positives on common English/code keywords
-        # that the hr_core_news_lg model misclassifies as PERSON.
+        # Case-insensitive denylist for PERSON entities. An entity is dropped
+        # if its lowercased text exactly matches an entry OR starts with an
+        # entry followed by a space (prefix + word-boundary rule). Suppresses
+        # spaCy false positives on common English/code keywords that the
+        # hr_core_news_lg model misclassifies as PERSON.
         ner_deny_list: list[str] = Field(
             default_factory=lambda: [
                 "task",
@@ -1918,6 +1922,8 @@ class Pipeline:
                     ) from None
                 use_vault = False
 
+        deny_set = frozenset(s.lower() for s in self.valves.ner_deny_list)
+        trailing_set = frozenset(s.lower() for s in self.valves.ner_trailing_token_strip)
         try:
             for text, write_back in parts:
                 results = self.analyzer.analyze(text=text, language=LANG)
@@ -1925,8 +1931,8 @@ class Pipeline:
                     text,
                     results,
                     self.PRESIDIO_TO_STANDARD,
-                    frozenset(s.lower() for s in self.valves.ner_deny_list),
-                    frozenset(s.lower() for s in self.valves.ner_trailing_token_strip),
+                    deny_set,
+                    trailing_set,
                     self.valves.ner_oib_phone_context_window,
                 )
                 if not accepted:

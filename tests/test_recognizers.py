@@ -694,9 +694,10 @@ async def test_inlet_passes_through_when_degradation_mode_is_passthrough() -> No
 
 _STD: dict[str, str] = Pipeline.PRESIDIO_TO_STANDARD
 
-# Default deny/strip lists from a fresh Pipeline (reads Valves defaults,
-# no model load — __init__ is cheap). Cached at module level for reuse.
-_DEFAULT_VALVES = Pipeline().valves
+# Default deny/strip lists from Valves class defaults only.
+# Use model_construct() so tests do not instantiate Pipeline or read
+# environment-backed settings at import time.
+_DEFAULT_VALVES = Pipeline.Valves.model_construct()
 _DENY_LIST: frozenset[str] = frozenset(s.lower() for s in _DEFAULT_VALVES.ner_deny_list)
 _STRIP_LIST: frozenset[str] = frozenset(s.lower() for s in _DEFAULT_VALVES.ner_trailing_token_strip)
 

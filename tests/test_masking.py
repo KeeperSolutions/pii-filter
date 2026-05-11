@@ -1508,12 +1508,7 @@ async def test_inlet_filters_out_common_english_keywords(
     }
     result = await started_pipeline.inlet(body)
     detections = result["metadata"].get("pii_detections", [])
-    deny_set = {s.lower() for s in started_pipeline.valves.ner_deny_list}
-    leaked = [
-        d["original"]
-        for d in detections
-        if d["entity_type"] == "PERSON" and d["original"].lower().strip() in deny_set
-    ]
+    leaked = [d["original"] for d in detections if d["entity_type"] == "PERSON"]
     assert leaked == [], f"Deny-list failed: {leaked!r} leaked as PERSON detections"
 
 
