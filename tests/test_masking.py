@@ -1546,3 +1546,407 @@ async def test_inlet_rejects_phone_as_oib(
         d for d in detections if d["entity_type"] == "HR_OIB" and d["original"] == "15551234567"
     ]
     assert oib_hits == [], f"Phone number 15551234567 incorrectly classified as HR_OIB: {oib_hits}"
+
+
+# ===========================================================================
+# Task 8.5 — Multi-Turn History Scope Filter tests
+# ===========================================================================
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_masks_all_user_messages_in_history(
+    started_pipeline: Pipeline,
+) -> None:
+    """All user messages in a multi-turn history must be masked, not just the last one."""
+    oib1 = _make_oib("1111111111")
+    oib2 = _make_oib("2222222222")
+    oib3 = _make_oib("3333333333")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"OIB: {oib1}"},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": f"Also: {oib2}"},
+            {"role": "assistant", "content": "Got it."},
+            {"role": "user", "content": f"And: {oib3}"},
+        ],
+        "metadata": {"chat_id": "task8.5-all-messages"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    assert oib1 not in result["messages"][0]["content"]
+    assert oib2 not in result["messages"][2]["content"]
+    assert oib3 not in result["messages"][4]["content"]
+    assert "[HR_OIB_" in result["messages"][0]["content"]
+    assert "[HR_OIB_" in result["messages"][2]["content"]
+    assert "[HR_OIB_" in result["messages"][4]["content"]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_passes_through_assistant_messages(
+    started_pipeline: Pipeline,
+) -> None:
+    """Assistant messages must pass through inlet unchanged."""
+    oib = _make_oib("9876543210")
+    assistant_content = f"For reference, the OIB is {oib}."
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": "What was that OIB?"},
+        ],
+        "metadata": {"chat_id": "task8.5-assistant-passthrough"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    assert result["messages"][0]["content"] == assistant_content
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_skips_already_masked_message_via_regex(
+    started_pipeline: Pipeline,
+) -> None:
+    """A user message containing a placeholder pattern must be skipped (no re-analysis)."""
+    oib = _make_oib("1234509876")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": "My OIB is [HR_OIB_1] from last time."},
+            {"role": "user", "content": f"New message: {oib}"},
+        ],
+        "metadata": {"chat_id": "task8.5-skip-masked"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    assert result["messages"][0]["content"] == "My OIB is [HR_OIB_1] from last time."
+    assert oib not in result["messages"][1]["content"]
+    assert "[HR_OIB_" in result["messages"][1]["content"]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_processes_oldest_first(
+    started_pipeline: Pipeline,
+) -> None:
+    """First user message gets the lowest counter index; later messages get higher ones."""
+    oib1 = _make_oib("1000000001")
+    oib2 = _make_oib("2000000002")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"First: {oib1}"},
+            {"role": "user", "content": f"Second: {oib2}"},
+        ],
+        "metadata": {"chat_id": "task8.5-oldest-first"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    assert "[HR_OIB_1]" in result["messages"][0]["content"]
+    assert "[HR_OIB_2]" in result["messages"][1]["content"]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_cross_message_same_pii_gets_same_placeholder(
+    started_pipeline: Pipeline,
+) -> None:
+    """The same PII value appearing in different history positions yields the same placeholder."""
+    oib = _make_oib("5555555555")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"My OIB: {oib}"},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": f"Confirm OIB: {oib}"},
+        ],
+        "metadata": {"chat_id": "task8.5-same-pii"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    assert "[HR_OIB_1]" in result["messages"][0]["content"]
+    assert "[HR_OIB_1]" in result["messages"][2]["content"]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_respects_max_messages_cap(
+    started_pipeline: Pipeline,
+) -> None:
+    """Only the last N user messages are processed; older ones pass through unchanged."""
+    oib_old = _make_oib("0000000001")
+    oib_new = _make_oib("9999999999")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"Old: {oib_old}"},
+            {"role": "assistant", "content": "Response."},
+            {"role": "user", "content": f"New: {oib_new}"},
+        ],
+        "metadata": {"chat_id": "task8.5-cap-test"},
+    }
+    started_pipeline.valves.multi_turn_history_max_messages = 1
+    try:
+        result = await started_pipeline.inlet(body)
+    finally:
+        started_pipeline.valves.multi_turn_history_max_messages = 20
+
+    assert oib_old in result["messages"][0]["content"], "Old message (beyond cap) must be unchanged"
+    assert (
+        oib_new not in result["messages"][2]["content"]
+    ), "New message (within cap) must be masked"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_cap_zero_disables_history_processing(
+    started_pipeline: Pipeline,
+) -> None:
+    """cap=0 means all history is beyond cap — behaves like Task 4 (only last user message)."""
+    oib_early = _make_oib("1111000001")
+    oib_late = _make_oib("2222000002")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"Early: {oib_early}"},
+            {"role": "user", "content": f"Late: {oib_late}"},
+        ],
+        "metadata": {"chat_id": "task8.5-cap-zero"},
+    }
+    started_pipeline.valves.multi_turn_history_max_messages = 0
+    try:
+        result = await started_pipeline.inlet(body)
+    finally:
+        started_pipeline.valves.multi_turn_history_max_messages = 20
+
+    assert oib_early in result["messages"][0]["content"], "Early message must be unchanged (cap=0)"
+    assert oib_late not in result["messages"][1]["content"], "Late message must be masked"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_multi_turn_disabled_falls_back_to_task4_behavior(
+    started_pipeline: Pipeline,
+) -> None:
+    """multi_turn_history_scope=False reverts to Task 4: only last user message is masked."""
+    oib_early = _make_oib("3333000003")
+    oib_late = _make_oib("4444000004")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"Early: {oib_early}"},
+            {"role": "user", "content": f"Late: {oib_late}"},
+        ],
+        "metadata": {"chat_id": "task8.5-scope-false"},
+    }
+    started_pipeline.valves.multi_turn_history_scope = False
+    try:
+        result = await started_pipeline.inlet(body)
+    finally:
+        started_pipeline.valves.multi_turn_history_scope = True
+
+    assert (
+        oib_early in result["messages"][0]["content"]
+    ), "Early message must be unchanged (scope=False)"
+    assert oib_late not in result["messages"][1]["content"], "Late message must be masked"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_already_masked_message_does_not_call_analyzer(
+    started_pipeline: Pipeline,
+) -> None:
+    """Presidio analyzer must not be invoked for messages that already contain placeholders."""
+    from unittest.mock import MagicMock
+
+    already_masked = "Kontaktiraj [PERSON_1] o [HR_OIB_1]."
+    fresh = "A fresh message with no PII."
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": already_masked},
+            {"role": "user", "content": fresh},
+        ],
+        "metadata": {"chat_id": "task8.5-mock-analyzer"},
+    }
+    real_analyzer = started_pipeline.analyzer
+    mock_analyzer = MagicMock()
+    mock_analyzer.analyze.return_value = []
+    started_pipeline.analyzer = mock_analyzer
+    try:
+        result = await started_pipeline.inlet(body)
+    finally:
+        started_pipeline.analyzer = real_analyzer
+
+    assert (
+        mock_analyzer.analyze.call_count == 1
+    ), f"Expected 1 analyzer call (fresh message only), got {mock_analyzer.analyze.call_count}"
+    assert result["messages"][0]["content"] == already_masked
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_partial_placeholder_message_is_skipped(
+    started_pipeline: Pipeline,
+) -> None:
+    """A message with both a placeholder AND raw PII is treated as already-masked (known limitation)."""
+    oib = _make_oib("7777777777")
+    mixed_content = f"Moj OIB je {oib}, a [PERSON_1] mi je kolega."
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": mixed_content}],
+        "metadata": {"chat_id": "task8.5-partial-skip"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    assert (
+        result["messages"][0]["content"] == mixed_content
+    ), "Mixed message (placeholder + raw PII) must be left unchanged as a documented limitation"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_pii_detections_include_message_index(
+    started_pipeline: Pipeline,
+) -> None:
+    """Each detection record in pii_detections must carry a message_index field."""
+    oib0 = _make_oib("1234000001")
+    oib2 = _make_oib("5678000002")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"OIB: {oib0}"},
+            {"role": "assistant", "content": "Got it."},
+            {"role": "user", "content": f"OIB: {oib2}"},
+        ],
+        "metadata": {"chat_id": "task8.5-message-index"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    detections = result["metadata"].get("pii_detections", [])
+    assert len(detections) >= 2
+    for det in detections:
+        assert "message_index" in det, f"Detection missing message_index field: {det}"
+    indices = {det["message_index"] for det in detections}
+    assert 0 in indices
+    assert 2 in indices
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_metadata_logger_reports_processed_and_skipped_counts(
+    started_pipeline: Pipeline,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The inlet info log line must include messages_processed and messages_skipped_already_masked."""
+    import logging
+
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": "Already masked [HR_OIB_1]."},
+            {"role": "user", "content": "Fresh message with no PII."},
+        ],
+        "metadata": {"chat_id": "task8.5-log-counts"},
+    }
+    with caplog.at_level(logging.INFO, logger="pii_filter"):
+        await started_pipeline.inlet(body)
+
+    log_line = next(
+        (r.message for r in caplog.records if "messages_processed=" in r.message),
+        None,
+    )
+    assert log_line is not None, "Expected log line with 'messages_processed=' not found"
+    assert "messages_skipped_already_masked=" in log_line
+    assert "messages_processed=1" in log_line
+    assert "messages_skipped_already_masked=1" in log_line
+
+
+# --- Integration tests with vault ---
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_multi_turn_with_vault_consistency(
+    started_pipeline: Pipeline,
+) -> None:
+    """Same OIB in message 0 and message 4 of a multi-turn history gets the same placeholder."""
+    oib = _make_oib("8888800001")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"Moj OIB je {oib}."},
+            {"role": "assistant", "content": "Razumijem."},
+            {"role": "user", "content": "Mozesh li potvrditi?"},
+            {"role": "assistant", "content": "Da."},
+            {"role": "user", "content": f"Potvrdi: {oib}"},
+        ],
+        "metadata": {"chat_id": "task8.5-vault-consistency"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    msg0 = result["messages"][0]["content"]
+    msg4 = result["messages"][4]["content"]
+    assert oib not in msg0
+    assert oib not in msg4
+    assert "[HR_OIB_1]" in msg0
+    assert "[HR_OIB_1]" in msg4
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_edit_previous_message_re_mask_is_consistent(
+    started_pipeline: Pipeline,
+) -> None:
+    """Editing a message (re-sending full history with changed content) preserves the OIB placeholder."""
+    oib = _make_oib("1122334455")
+    chat_id = "task8.5-edit-history"
+
+    body1: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"OIB je {oib}."}],
+        "metadata": {"chat_id": chat_id},
+    }
+    result1 = await started_pipeline.inlet(body1)
+    assert result1["metadata"]["pii_placeholder_map"].get(oib) == "[HR_OIB_1]"
+
+    body2: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"OIB je {oib} i ime mi je Ivan."}],
+        "metadata": {"chat_id": chat_id},
+    }
+    result2 = await started_pipeline.inlet(body2)
+
+    assert oib not in result2["messages"][0]["content"]
+    assert "[HR_OIB_1]" in result2["messages"][0]["content"]
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_long_conversation_with_already_masked_history(
+    started_pipeline: Pipeline,
+) -> None:
+    """20-message conversation where 19 are already masked: only last is freshly analyzed."""
+    oib_new = _make_oib("6677889900")
+    already_masked_msgs: list[dict[str, Any]] = [
+        {"role": "user", "content": f"Turn {i}: [HR_OIB_1] and [PERSON_1]."} for i in range(19)
+    ]
+    already_masked_msgs.append({"role": "user", "content": f"New turn: {oib_new}"})
+    body: dict[str, Any] = {
+        "messages": already_masked_msgs,
+        "metadata": {"chat_id": "task8.5-long-mostly-masked"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    for i in range(19):
+        assert result["messages"][i]["content"] == f"Turn {i}: [HR_OIB_1] and [PERSON_1]."
+    assert oib_new not in result["messages"][19]["content"]
+    assert "[HR_OIB_" in result["messages"][19]["content"]
+
+
+# --- Performance test ---
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.benchmark
+async def test_inlet_multi_turn_p95_latency_under_200ms(
+    started_pipeline: Pipeline,
+) -> None:
+    """P95 inlet latency must be under 200ms for 20-message conversations (AC 8.5.8).
+
+    19 already-masked messages are skipped via regex pre-check; only the last
+    message triggers Presidio -- simulating steady-state production traffic.
+    """
+    import time
+
+    oib_fresh = _make_oib("9988776655")
+    already_masked_msgs: list[dict[str, Any]] = [
+        {"role": "user", "content": f"Turn {i}: [HR_OIB_1] and [PERSON_1]."} for i in range(19)
+    ]
+
+    latencies_ms: list[float] = []
+    for _ in range(100):
+        fresh_msg: dict[str, Any] = {"role": "user", "content": f"Fresh: {oib_fresh}"}
+        body: dict[str, Any] = {
+            "messages": already_masked_msgs + [fresh_msg],
+            "metadata": {"chat_id": "task8.5-perf"},
+        }
+        t0 = time.perf_counter()
+        await started_pipeline.inlet(body)
+        latencies_ms.append((time.perf_counter() - t0) * 1000)
+
+    latencies_ms.sort()
+    p95_ms = latencies_ms[94]
+    assert p95_ms < 200.0, f"P95 latency {p95_ms:.1f}ms exceeds 200ms target"

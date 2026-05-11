@@ -2,8 +2,8 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-08
-version: 0.7.0
+date: 2026-05-11
+version: 0.8.0
 license: MIT
 description: PII detection and masking filter for Keeper AI Gateway. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). Both backends expose the same async public API; inlet writes the same `body["metadata"]` snapshot regardless of backend so Task 6 outlet runs unchanged. Postgres backend uses `INSERT ... ON CONFLICT` for atomic get-or-mint, lazy expiry filtering on every read, and per-thread TTL renewal on every public method.
 requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
@@ -672,6 +672,9 @@ _OIB_CONTEXT_PATTERN: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# Task 8.5: compiled once at module level for the per-message already-masked pre-check.
+_ALREADY_MASKED_RE: re.Pattern[str] = re.compile(r"\[[A-Z_]+_\d+\]")
+
 
 def restore_text(
     text: str,
@@ -1313,6 +1316,38 @@ _DISABLED_BUILTIN_RECOGNIZERS: tuple[str, ...] = (
 )
 
 
+def _find_last_user_index(messages: list[dict[str, Any]]) -> int:
+    """Return the index of the last message with role=='user', or -1 if none.
+
+    Preserved for the Task 4 backward-compat path used when
+    multi_turn_history_scope=False or multi_turn_history_max_messages==0.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            return i
+    return -1
+
+
+def _get_message_text_for_precheck(msg: dict[str, Any]) -> str:
+    """Return all text content from a message as a single string for regex pre-check.
+
+    Handles both str content and list[dict] multimodal content.
+    Image-only parts contribute nothing; returns '' if no text exists.
+    """
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text", "")
+                if isinstance(text, str):
+                    parts.append(text)
+        return " ".join(parts)
+    return ""
+
+
 class Pipeline:
     """PII Filter pipeline — Keeper AI Gateway.
 
@@ -1535,6 +1570,36 @@ class Pipeline:
                 "present), the HR_OIB detection is rejected as a likely "
                 "phone number. Set 0 to disable. "
                 "Configurable via PII_FILTER_NER_OIB_PHONE_CONTEXT_WINDOW."
+            ),
+        )
+        # ---- Task 8.5: Multi-turn history scope ----------------------------
+        multi_turn_history_scope: bool = Field(
+            default=True,
+            description=(
+                "When True (default), inlet masks ALL user messages in "
+                "body.messages[], not just the last one. Prevents PII from "
+                "prior turns leaking to the LLM vendor. When False, reverts "
+                "to Task 4 behavior (only last user message). Disable only "
+                "for debugging or compat with single-turn flows."
+            ),
+        )
+        multi_turn_history_max_messages: int = Field(
+            default=20,
+            ge=0,
+            le=100,
+            description=(
+                "Safety cap on how many user messages (from the tail) are "
+                "processed by inlet per request. Older user messages are "
+                "passed through unchanged. Set to 0 to disable history "
+                "processing (equivalent to disabling multi_turn_history_scope)."
+            ),
+        )
+        multi_turn_already_masked_pattern: str = Field(
+            default=r"\[[A-Z_]+_\d+\]",
+            description=(
+                "Regex pattern to detect messages already masked from a prior "
+                "inlet call. Messages matching this pattern are skipped without "
+                "calling Presidio (performance optimization)."
             ),
         )
 
@@ -1832,14 +1897,21 @@ class Pipeline:
     async def inlet(
         self, body: dict[str, Any], user: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Detect PII in the last user message, mask it in place using the
-        thread-scoped Redis vault (Task 5), and stash forward + reverse maps
-        in `body["metadata"]` so the outlet (Task 6) keeps reading the same
-        keys regardless of Redis being the source of truth.
+        """Detect PII in user messages, mask in place via the thread-scoped
+        vault (Task 5/5.1), and stash forward + reverse maps in
+        `body["metadata"]` so the outlet (Task 6) keeps reading the same
+        keys regardless of backend.
 
-        Mutates the matched message's `content` field. All other body keys
-        are left untouched. On analyzer / vault failure, behavior follows
-        `valves.degradation_mode` (block → raise; passthrough → return).
+        Task 8.5: by default (`multi_turn_history_scope=True`), ALL user
+        messages in `body["messages"]` are processed (up to
+        `multi_turn_history_max_messages`), not just the last one.  Already-
+        masked messages (matching `multi_turn_already_masked_pattern`) are
+        skipped via a cheap regex pre-check to avoid redundant Presidio calls.
+        Assistant messages pass through unchanged.
+
+        Mutates each processed message's `content` field in place. All other
+        body keys are left untouched. On analyzer / vault failure, behavior
+        follows `valves.degradation_mode` (block → raise; passthrough → return).
         """
         if not self.valves.enabled:
             return body
@@ -1848,26 +1920,33 @@ class Pipeline:
             logger.warning("inlet called before on_startup completed; returning body unchanged")
             return body
 
-        # The last entry in `messages` may be assistant/tool/system in
-        # multi-turn or tool-call flows, so iterate backwards until we
-        # find the most recent user-authored message.
+        # Task 8.5: determine which user messages to process.
+        # Legacy Task 4 path (scope=False or cap=0): only the last user message.
+        # Multi-turn path (default): all user messages up to cap, oldest-first.
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             logger.warning("inlet: no messages in body, skipping analysis")
             return body
-        target_msg: dict[str, Any] | None = None
-        for msg in reversed(messages):
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                target_msg = msg
-                break
-        if target_msg is None:
-            logger.debug("inlet: no user message found, skipping analysis")
-            return body
 
-        parts = list(self._iter_text_parts(target_msg))
-        if not parts:
-            logger.debug("inlet: target message has no maskable text parts")
-            return body
+        target_indices: list[int]
+        if (
+            not self.valves.multi_turn_history_scope
+            or self.valves.multi_turn_history_max_messages == 0
+        ):
+            last = _find_last_user_index(messages)
+            if last == -1:
+                logger.debug("inlet: no user message found, skipping analysis")
+                return body
+            target_indices = [last]
+        else:
+            all_user_indices = [
+                i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"
+            ]
+            if not all_user_indices:
+                logger.debug("inlet: no user messages found, skipping analysis")
+                return body
+            cap = self.valves.multi_turn_history_max_messages
+            target_indices = all_user_indices[-cap:]
 
         raw_chat_id, thread_id = self._resolve_chat_id(body)
         if raw_chat_id is None:
@@ -1924,49 +2003,77 @@ class Pipeline:
 
         deny_set = frozenset(s.lower() for s in self.valves.ner_deny_list)
         trailing_set = frozenset(s.lower() for s in self.valves.ner_trailing_token_strip)
+        # Per-call compile: respects operator changes to multi_turn_already_masked_pattern
+        # via valve without requiring a restart.
+        already_masked_re = re.compile(self.valves.multi_turn_already_masked_pattern)
+
+        messages_processed = 0
+        messages_skipped = 0
+
         try:
-            for text, write_back in parts:
-                results = self.analyzer.analyze(text=text, language=LANG)
-                accepted = _select_accepted_detections(
-                    text,
-                    results,
-                    self.PRESIDIO_TO_STANDARD,
-                    deny_set,
-                    trailing_set,
-                    self.valves.ner_oib_phone_context_window,
-                )
-                if not accepted:
+            for msg_idx in target_indices:
+                target_msg = messages[msg_idx]
+
+                # Regex pre-check: skip messages already containing placeholders
+                # (from a prior inlet call). This avoids a redundant Presidio
+                # analyzer call — the dominant latency source — for history
+                # messages that were masked in an earlier turn.
+                full_content = _get_message_text_for_precheck(target_msg)
+                if already_masked_re.search(full_content):
+                    messages_skipped += 1
                     continue
 
-                pieces: list[str] = []
-                last_end = 0
-                for det in accepted:
-                    original = text[det.start : det.end]
-                    standard_type = self.PRESIDIO_TO_STANDARD[det.entity_type]
-                    placeholder: str
-                    if use_vault:
-                        assert self.vault is not None  # for mypy
-                        placeholder = await self.vault.get_placeholder(
-                            thread_id, original, standard_type
-                        )
-                    else:
-                        existing = forward_map.get(original)
-                        if existing is None:
-                            n = counter_state.get(standard_type, 0) + 1
-                            counter_state[standard_type] = n
-                            placeholder = f"[{standard_type}_{n}]"
-                            forward_map[original] = placeholder
-                            reverse_map[placeholder] = original
-                        else:
-                            placeholder = existing
-                    pieces.append(text[last_end : det.start])
-                    pieces.append(placeholder)
-                    last_end = det.end
-                    all_enriched.append(
-                        _build_enriched_detection(det, text, standard_type, original, placeholder)
+                parts = list(self._iter_text_parts(target_msg))
+                if not parts:
+                    continue
+
+                for text, write_back in parts:
+                    results = self.analyzer.analyze(text=text, language=LANG)
+                    accepted = _select_accepted_detections(
+                        text,
+                        results,
+                        self.PRESIDIO_TO_STANDARD,
+                        deny_set,
+                        trailing_set,
+                        self.valves.ner_oib_phone_context_window,
                     )
-                pieces.append(text[last_end:])
-                write_back("".join(pieces))
+                    if not accepted:
+                        continue
+
+                    pieces: list[str] = []
+                    last_end = 0
+                    for det in accepted:
+                        original = text[det.start : det.end]
+                        standard_type = self.PRESIDIO_TO_STANDARD[det.entity_type]
+                        placeholder: str
+                        if use_vault:
+                            assert self.vault is not None  # for mypy
+                            placeholder = await self.vault.get_placeholder(
+                                thread_id, original, standard_type
+                            )
+                        else:
+                            existing = forward_map.get(original)
+                            if existing is None:
+                                n = counter_state.get(standard_type, 0) + 1
+                                counter_state[standard_type] = n
+                                placeholder = f"[{standard_type}_{n}]"
+                                forward_map[original] = placeholder
+                                reverse_map[placeholder] = original
+                            else:
+                                placeholder = existing
+                        pieces.append(text[last_end : det.start])
+                        pieces.append(placeholder)
+                        last_end = det.end
+                        enriched_det = _build_enriched_detection(
+                            det, text, standard_type, original, placeholder
+                        )
+                        enriched_det["message_index"] = msg_idx
+                        all_enriched.append(enriched_det)
+                    pieces.append(text[last_end:])
+                    write_back("".join(pieces))
+
+                messages_processed += 1
+
         except Exception as exc:
             logger.exception("inlet: analyzer/mask pipeline failed")
             if self.valves.degradation_mode == "passthrough":
@@ -1990,6 +2097,10 @@ class Pipeline:
                 "Set valves.degradation_mode='passthrough' to allow requests "
                 "through on filter errors (NOT recommended in production)."
             ) from exc
+
+        if messages_processed == 0 and messages_skipped == 0:
+            logger.debug("inlet: no user messages with maskable content, skipping metadata update")
+            return body
 
         # Spec §3.3 step 7 — body-metadata snapshot is the forward-compat hinge
         # for Task 6: outlet keeps reading from these keys regardless of Redis
@@ -2019,17 +2130,15 @@ class Pipeline:
         metadata["pii_placeholder_map"] = forward_map
         metadata["pii_reverse_map"] = reverse_map
 
-        # Backend-agnostic state field. The legacy field name `redis=` was
-        # misleading once the Postgres backend landed: an operator triaging
-        # a Postgres-backend incident saw `redis=on` and (reasonably)
-        # suspected Redis. `vault=` makes intent explicit alongside the
-        # `backend=` field, which carries the actual implementation.
         vault_state = ("ephemeral" if raw_chat_id is None else "on") if use_vault else "off"
         logger.info(
-            "pii_filter inlet processed: chat_id=%s thread_id=%s detections=%d "
-            "masked=%d vault=%s backend=%s",
+            "pii_filter inlet processed: chat_id=%s thread_id=%s "
+            "messages_processed=%d messages_skipped_already_masked=%d "
+            "detections=%d masked=%d vault=%s backend=%s",
             raw_chat_id,
             thread_id,
+            messages_processed,
+            messages_skipped,
             len(all_enriched),
             len(forward_map),
             vault_state,
