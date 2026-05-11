@@ -672,9 +672,6 @@ _OIB_CONTEXT_PATTERN: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Task 8.5: compiled once at module level for the per-message already-masked pre-check.
-_ALREADY_MASKED_RE: re.Pattern[str] = re.compile(r"\[[A-Z_]+_\d+\]")
-
 
 def restore_text(
     text: str,
@@ -1323,7 +1320,8 @@ def _find_last_user_index(messages: list[dict[str, Any]]) -> int:
     multi_turn_history_scope=False or multi_turn_history_max_messages==0.
     """
     for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "user":
+        message = messages[i]
+        if isinstance(message, dict) and message.get("role") == "user":
             return i
     return -1
 
@@ -2005,7 +2003,15 @@ class Pipeline:
         trailing_set = frozenset(s.lower() for s in self.valves.ner_trailing_token_strip)
         # Per-call compile: respects operator changes to multi_turn_already_masked_pattern
         # via valve without requiring a restart.
-        already_masked_re = re.compile(self.valves.multi_turn_already_masked_pattern)
+        _default_masked_pattern = r"\[[A-Z_]+_\d+\]"
+        try:
+            already_masked_re = re.compile(self.valves.multi_turn_already_masked_pattern)
+        except re.error:
+            logger.error(
+                "inlet: invalid multi_turn_already_masked_pattern %r — falling back to default",
+                self.valves.multi_turn_already_masked_pattern,
+            )
+            already_masked_re = re.compile(_default_masked_pattern)
 
         messages_processed = 0
         messages_skipped = 0
