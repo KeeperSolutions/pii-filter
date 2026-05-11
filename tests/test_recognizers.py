@@ -537,8 +537,13 @@ async def started_pipeline() -> AsyncIterator[Pipeline]:
     spaCy `hr_core_news_lg` allocates ~240 MB of contiguous vectors per load,
     so loading once per module instead of once per test keeps memory pressure
     manageable on dev machines.
+
+    v0.6.0 default backend is postgres; opt back into redis (fakeredis via
+    the autouse conftest fixture) so these recognizer-focused tests never
+    require a live postgres process.
     """
     p = Pipeline()
+    p.valves.vault_backend = "redis"
     await p.on_startup()
     yield p
     await p.on_shutdown()
