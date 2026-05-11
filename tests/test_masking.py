@@ -1482,3 +1482,67 @@ async def test_inlet_postgres_backend_with_vault_enabled_true_uses_vault(
     fwd = result["metadata"]["pii_placeholder_map"]
     assert oib in fwd
     assert call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Task 3.1 — Inlet integration tests (deny-list, OIB phone-context)
+#
+# These tests use the module-scoped `started_pipeline` (Redis/fakeredis)
+# fixture so spaCy loads once for the whole module.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_filters_out_common_english_keywords(
+    started_pipeline: Pipeline,
+) -> None:
+    """PERSON detections whose text is in the default deny-list must be dropped.
+
+    spaCy hr_core_news_lg misclassifies common English/code keywords as PERSON
+    at score 0.850 (confirmed per Q2 diagnostic). The deny-list in the default
+    Valves must suppress them so they never reach the vault or counter.
+    """
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "Task: please summarize. JSON output expected."}],
+        "metadata": {"chat_id": "task3.1-deny-list"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result["metadata"].get("pii_detections", [])
+    leaked = [d["original"] for d in detections if d["entity_type"] == "PERSON"]
+    assert leaked == [], f"Deny-list failed: {leaked!r} leaked as PERSON detections"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_preserves_real_pii_with_strict_recognizer(
+    started_pipeline: Pipeline,
+) -> None:
+    """Real PII (OIB, email) must still be detected after Task 3.1 changes.
+    Regression guard for spec AC 3.5 / 3.6."""
+    oib = _make_oib("1234567890")  # "12345678903"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib} i email ivan@example.com"}],
+        "metadata": {"chat_id": "task3.1-real-pii"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result["metadata"].get("pii_detections", [])
+    assert any(
+        d["entity_type"] == "HR_OIB" and d["original"] == oib for d in detections
+    ), f"Valid OIB {oib} not detected after 3.1 changes"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_rejects_phone_as_oib(
+    started_pipeline: Pipeline,
+) -> None:
+    """'15551234567' has a valid OIB checksum (spec Q1 collision) but appears
+    immediately after the phone keyword — must not be stored as HR_OIB."""
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "My phone: 15551234567 please call."}],
+        "metadata": {"chat_id": "task3.1-phone-oib"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result["metadata"].get("pii_detections", [])
+    oib_hits = [
+        d for d in detections if d["entity_type"] == "HR_OIB" and d["original"] == "15551234567"
+    ]
+    assert oib_hits == [], f"Phone number 15551234567 incorrectly classified as HR_OIB: {oib_hits}"
