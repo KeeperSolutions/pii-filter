@@ -78,7 +78,7 @@ if platform.system() == "Windows":
                 proc.terminate()
                 proc.wait(timeout=10)
             except Exception:  # noqa: BLE001 — best-effort teardown
-                try:
+                try:  # noqa: SIM105
                     proc.kill()
                 except Exception:  # noqa: BLE001
                     pass

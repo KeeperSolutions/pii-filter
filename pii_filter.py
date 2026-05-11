@@ -2,8 +2,8 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-07
-version: 0.6.0
+date: 2026-05-08
+version: 0.7.0
 license: MIT
 description: PII detection and masking filter for Keeper AI Gateway. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). Both backends expose the same async public API; inlet writes the same `body["metadata"]` snapshot regardless of backend so Task 6 outlet runs unchanged. Postgres backend uses `INSERT ... ON CONFLICT` for atomic get-or-mint, lazy expiry filtering on every read, and per-thread TTL renewal on every public method.
 requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
@@ -415,29 +415,117 @@ def _select_accepted_detections(
     text: str,
     detections: list[RecognizerResult],
     presidio_to_standard: dict[str, str],
+    deny_list: frozenset[str] = frozenset(),
+    trailing_strip: frozenset[str] = frozenset(),
+    oib_phone_window: int = 0,
 ) -> list[RecognizerResult]:
     """Filter, prioritize, and de-overlap raw analyzer detections.
 
-    Shared by `mask_text` (Task 4 fallback path) and the Task 5 inlet
-    Redis-vault path. The placeholder *source* differs between them but
-    detection *selection* is identical and must stay in lockstep.
+    Shared by `mask_text` (Task 4 fallback path) and the Task 5/5.1 inlet
+    vault path. The placeholder *source* differs between them but detection
+    *selection* is identical and must stay in lockstep.
+
+    Processing order (Task 3.1 additions in steps 2-4):
+      1. Whitelist filter — drop entity types not in `presidio_to_standard`.
+      2. Deny-list filter — drop PERSON entities whose lowercased text is in
+         `deny_list` (suppresses spaCy false positives on English/code keywords).
+      3. Trailing-token strip — for PERSON entities whose last whitespace-
+         separated token is in `trailing_strip`, shorten the span to exclude
+         that token (also strips trailing punctuation). Drop if span becomes
+         empty after stripping.
+      4. OIB phone-context check — for HR_OIB entities, examine the
+         `oib_phone_window` chars immediately preceding the detection start.
+         If a phone-keyword pattern matches AND no OIB context word is present,
+         drop the detection (likely a phone number, not a real OIB).
+      5. Overlap resolution — sort by `(score DESC, custom_first, start ASC)`,
+         accept non-overlapping spans. Zero-length/inverted spans skipped.
 
     Returns surviving detections sorted by `start` ASC, ready to be spliced
-    into the masked output. Empty list if `text` is falsy, no detections,
-    or no detection survives the whitelist + overlap filters.
+    into the masked output. Empty list when `text` is falsy, no detections,
+    or no detection survives all filters.
 
-    Overlap resolution: sort by `(score DESC, custom_first, start ASC)`,
-    iterate, accept only if the span does not intersect any already-accepted
-    span. Zero-length / inverted spans are skipped defensively so a buggy
-    custom recognizer cannot inject a placeholder for an empty original.
+    The `deny_list`, `trailing_strip`, and `oib_phone_window` parameters
+    default to empty/zero so `mask_text` (Task 4 path) continues working
+    without modification — it calls this function without the new kwargs.
     """
     if not text or not detections:
         return []
+
+    # Step 1: Whitelist filter
     candidates: list[RecognizerResult] = [
         d for d in detections if d.entity_type in presidio_to_standard
     ]
     if not candidates:
         return []
+
+    # Step 2: Deny-list filter (PERSON entities only)
+    if deny_list:
+        kept: list[RecognizerResult] = []
+        for d in candidates:
+            if d.entity_type == "PERSON":
+                entity_lower = text[d.start : d.end].lower().strip()
+                if entity_lower in deny_list:
+                    continue
+                if any(entity_lower.startswith(denied + " ") for denied in deny_list):
+                    continue
+            kept.append(d)
+        candidates = kept
+        if not candidates:
+            return []
+
+    # Step 3: Trailing-token strip (PERSON entities only)
+    if trailing_strip:
+        processed: list[RecognizerResult] = []
+        for d in candidates:
+            if d.entity_type == "PERSON":
+                entity_text = text[d.start : d.end]
+                # Strip trailing punctuation first
+                clean = entity_text.rstrip(".,;!?:()")
+                if clean:
+                    tokens = clean.split()
+                    if tokens and tokens[-1].lower() in trailing_strip:
+                        last_tok = tokens[-1]
+                        last_tok_offset = clean.rfind(last_tok)
+                        new_text = clean[:last_tok_offset].rstrip()
+                    else:
+                        new_text = clean
+                else:
+                    new_text = ""
+                if not new_text:
+                    continue  # Drop empty/whitespace-only span
+                if new_text != entity_text:
+                    d = RecognizerResult(
+                        entity_type=d.entity_type,
+                        start=d.start,
+                        end=d.start + len(new_text),
+                        score=d.score,
+                    )
+            processed.append(d)
+        candidates = processed
+        if not candidates:
+            return []
+
+    # Step 4: OIB phone-context check
+    if oib_phone_window > 0:
+        oib_kept: list[RecognizerResult] = []
+        for d in candidates:
+            if d.entity_type == "HR_OIB":
+                window_start = max(0, d.start - oib_phone_window)
+                window = text[window_start : d.start]
+                if _OIB_CONTEXT_PATTERN.search(window):
+                    # Positive OIB context overrides any phone-context match
+                    oib_kept.append(d)
+                elif any(p.search(window) for p in _PHONE_CONTEXT_PATTERNS):
+                    continue  # Phone context — drop
+                else:
+                    oib_kept.append(d)
+            else:
+                oib_kept.append(d)
+        candidates = oib_kept
+        if not candidates:
+            return []
+
+    # Step 5: Overlap resolution (unchanged from Task 3 baseline)
     candidates.sort(
         key=lambda d: (
             -d.score,
@@ -555,6 +643,32 @@ def mask_text(
 # `CREDIT_CARD`), an underscore, then a positive integer counter. Compiled
 # once at module load so `restore_text` does not pay re.compile per call.
 _PLACEHOLDER_RE = re.compile(r"\[[A-Z_]+_\d+\]")
+
+# Compiled once at module load so _select_accepted_detections pays no re.compile per call.
+# Each pattern uses a $ anchor so it only matches when the phone keyword is immediately
+# before the 11-digit number (i.e. at the end of the look-behind window string).
+_PHONE_CONTEXT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"phone\s*[:=]?\s*$",
+        r"tel(?:ephone)?\s*[:=]?\s*$",
+        r"mob(?:ile)?\s*[:=]?\s*$",
+        r"mobitel\s*[:=]?\s*$",
+        r"telefon\s*[:=]?\s*$",
+        r"\+1[-.\s]?$",
+        r"\+385[-.\s]?$",
+        r"\+49[-.\s]?$",
+        r"\(\d{3}\)\s*$",
+        r"\d{3}[-.\s]?\d{3}[-.\s]?$",
+    ]
+)
+
+# Positive override: if an OIB context word is found in the same window, the detection
+# is kept regardless of any phone-context match.
+_OIB_CONTEXT_PATTERN: re.Pattern[str] = re.compile(
+    r"\boib\b|osobni identifikacijski broj|osobni broj",
+    re.IGNORECASE,
+)
 
 
 def restore_text(
@@ -1290,6 +1404,135 @@ class Pipeline:
         # Per-query timeout (ms). Caps any single query at 5s — prevents
         # zombie connections from hanging the pool.
         postgres_command_timeout_ms: int = 5000
+        # ---- Task 3.1: Recognizer accuracy --------------------------------
+        # Exact-match (case-insensitive) denylist for PERSON entities.
+        # Suppresses spaCy false positives on common English/code keywords
+        # that the hr_core_news_lg model misclassifies as PERSON.
+        ner_deny_list: list[str] = Field(
+            default_factory=lambda: [
+                "task",
+                "tasks",
+                "json",
+                "json output",
+                "json array",
+                "json array of strings",
+                "raw",
+                "output",
+                "input",
+                "true",
+                "false",
+                "null",
+                "none",
+                "undefined",
+                "default",
+                "auto",
+                "custom",
+                "emoji",
+                "emojis",
+                "emoji summarizing",
+                "emojis summarizing",
+                "emoji summarizing the conversation",
+                "emojis that enhance understanding",
+                "summarize",
+                "summarization",
+                "summary",
+                "assistant",
+                "user",
+                "system",
+                "prompt",
+                "response",
+                "completion",
+                "get",
+                "post",
+                "put",
+                "delete",
+                "patch",
+                "request",
+                "endpoint",
+                "header",
+                "body",
+                "payload",
+                "please",
+                "thank you",
+                "error",
+                "warning",
+                "info",
+                "debug",
+                "success",
+                "failed",
+                "pending",
+            ],
+            description=(
+                "Lowercase, exact-match denylist for PERSON entities. "
+                "Useful for suppressing spaCy false positives on common "
+                "English/code keywords. Configurable via "
+                "PII_FILTER_NER_DENY_LIST env var."
+            ),
+        )
+        # If a PERSON entity ends with one of these tokens, the trailing
+        # token is stripped from the span before vault insertion.
+        ner_trailing_token_strip: list[str] = Field(
+            default_factory=lambda: [
+                # English function words
+                "has",
+                "had",
+                "have",
+                "is",
+                "was",
+                "are",
+                "were",
+                "be",
+                "been",
+                "being",
+                "does",
+                "did",
+                "do",
+                "says",
+                "said",
+                "say",
+                "goes",
+                "went",
+                "go",
+                "comes",
+                "came",
+                "come",
+                # Croatian function words
+                "je",
+                "su",
+                "ima",
+                "imaju",
+                "bio",
+                "bila",
+                "bile",
+                "bili",
+                "kaže",
+                "rekao",
+                "rekla",
+                "rekli",
+                "ide",
+                "došao",
+                "došla",
+            ],
+            description=(
+                "If a PERSON entity ends with one of these tokens, the "
+                "trailing token is stripped from the entity span. "
+                "Configurable via PII_FILTER_NER_TRAILING_TOKEN_STRIP."
+            ),
+        )
+        # Character window before an 11-digit number to check for phone
+        # context keywords. Set to 0 to disable the OIB context check.
+        ner_oib_phone_context_window: int = Field(
+            default=30,
+            ge=0,
+            le=200,
+            description=(
+                "Character window before an 11-digit number to check for "
+                "phone-context keywords. If found (and no OIB context word "
+                "present), the HR_OIB detection is rejected as a likely "
+                "phone number. Set 0 to disable. "
+                "Configurable via PII_FILTER_NER_OIB_PHONE_CONTEXT_WINDOW."
+            ),
+        )
 
     class UserValves(BaseModel):
         """Per-user toggles. Schema only — Task 8 wires the masking toggle.
@@ -1678,7 +1921,14 @@ class Pipeline:
         try:
             for text, write_back in parts:
                 results = self.analyzer.analyze(text=text, language=LANG)
-                accepted = _select_accepted_detections(text, results, self.PRESIDIO_TO_STANDARD)
+                accepted = _select_accepted_detections(
+                    text,
+                    results,
+                    self.PRESIDIO_TO_STANDARD,
+                    frozenset(s.lower() for s in self.valves.ner_deny_list),
+                    frozenset(s.lower() for s in self.valves.ner_trailing_token_strip),
+                    self.valves.ner_oib_phone_context_window,
+                )
                 if not accepted:
                     continue
 

@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from presidio_analyzer import RecognizerResult
 
 from pii_filter import (
     HRIBANRecognizer,
@@ -29,6 +30,7 @@ from pii_filter import (
     UKUTRRecognizer,
     USEINRecognizer,
     USSSNRecognizer,
+    _select_accepted_detections,
     make_iban_recognizer,
 )
 
@@ -681,3 +683,272 @@ async def test_inlet_passes_through_when_degradation_mode_is_passthrough() -> No
     assert result is body
     # No detections should have been attached.
     assert "pii_detections" not in result.get("metadata", {})
+
+
+# ---------------------------------------------------------------------------
+# Task 3.1 — Deny-list, trailing-token strip, OIB context (unit tests)
+#
+# All tests call `_select_accepted_detections` directly with synthetic
+# RecognizerResult objects so they run without loading spaCy.
+# ---------------------------------------------------------------------------
+
+_STD: dict[str, str] = Pipeline.PRESIDIO_TO_STANDARD
+
+# Default deny/strip lists from a fresh Pipeline (reads Valves defaults,
+# no model load — __init__ is cheap). Cached at module level for reuse.
+_DEFAULT_VALVES = Pipeline().valves
+_DENY_LIST: frozenset[str] = frozenset(s.lower() for s in _DEFAULT_VALVES.ner_deny_list)
+_STRIP_LIST: frozenset[str] = frozenset(s.lower() for s in _DEFAULT_VALVES.ner_trailing_token_strip)
+
+# Confirmed false-positive: passes OIB mod-11,10 checksum but is a stripped
+# US phone number. See spec Q1 diagnostic for derivation.
+_PHONE_COLLISION_OIB = "15551234567"
+
+
+def _det_person(start: int, end: int, score: float = 0.85) -> RecognizerResult:
+    return RecognizerResult(entity_type="PERSON", start=start, end=end, score=score)
+
+
+def _det_oib(start: int, end: int, score: float = 0.4) -> RecognizerResult:
+    return RecognizerResult(entity_type="HR_OIB", start=start, end=end, score=score)
+
+
+# -- Deny-list tests ---------------------------------------------------------
+
+
+def test_deny_list_drops_task_keyword() -> None:
+    text = "Task"
+    result = _select_accepted_detections(text, [_det_person(0, 4)], _STD, deny_list=_DENY_LIST)
+    assert result == []
+
+
+def test_deny_list_drops_json_output() -> None:
+    text = "JSON output expected"
+    result = _select_accepted_detections(text, [_det_person(0, 11)], _STD, deny_list=_DENY_LIST)
+    assert result == []
+
+
+def test_deny_list_drops_emoji_summarizing() -> None:
+    text = "emoji summarizing the conversation"
+    result = _select_accepted_detections(
+        text, [_det_person(0, len(text))], _STD, deny_list=_DENY_LIST
+    )
+    assert result == []
+
+
+def test_deny_list_is_case_insensitive() -> None:
+    # Deny-list stores lowercase "task"; entity text "Task" must still be dropped.
+    text = "Task"
+    result = _select_accepted_detections(
+        text, [_det_person(0, 4)], _STD, deny_list=frozenset(["task"])
+    )
+    assert result == []
+
+
+def test_deny_list_does_not_drop_real_person() -> None:
+    text = "Ivan Horvat"
+    result = _select_accepted_detections(text, [_det_person(0, 11)], _STD, deny_list=_DENY_LIST)
+    assert len(result) == 1
+    assert result[0].entity_type == "PERSON"
+
+
+def test_deny_list_empty_disables_filter() -> None:
+    # Even a deny-list keyword should survive when deny_list is empty frozenset.
+    text = "Task"
+    result = _select_accepted_detections(text, [_det_person(0, 4)], _STD, deny_list=frozenset())
+    assert len(result) == 1
+    assert result[0].entity_type == "PERSON"
+
+
+def test_deny_list_custom_entry_works() -> None:
+    text = "Skywalker"
+    result = _select_accepted_detections(
+        text, [_det_person(0, 9)], _STD, deny_list=frozenset(["skywalker"])
+    )
+    assert result == []
+
+
+# -- Trailing-token strip tests ----------------------------------------------
+
+
+def test_trailing_strip_removes_english_has() -> None:
+    # "Ivan Horvat has" → span shortened to "Ivan Horvat" (length 11, not 15).
+    # Matches spec AC 3.8 / Q3 production evidence.
+    text = "Ivan Horvat has doktor"
+    result = _select_accepted_detections(
+        text, [_det_person(0, 15)], _STD, trailing_strip=_STRIP_LIST
+    )
+    assert len(result) == 1
+    assert result[0].end - result[0].start == 11
+    assert text[result[0].start : result[0].end] == "Ivan Horvat"
+
+
+def test_trailing_strip_removes_croatian_je() -> None:
+    # "Ivan Horvat je" → "Ivan Horvat"
+    text = "Ivan Horvat je doktor"
+    result = _select_accepted_detections(
+        text, [_det_person(0, 14)], _STD, trailing_strip=_STRIP_LIST
+    )
+    assert len(result) == 1
+    assert text[result[0].start : result[0].end] == "Ivan Horvat"
+
+
+def test_trailing_strip_preserves_real_person() -> None:
+    text = "Ivan Horvat"
+    result = _select_accepted_detections(
+        text, [_det_person(0, 11)], _STD, trailing_strip=_STRIP_LIST
+    )
+    assert len(result) == 1
+    assert result[0].end == 11  # span unchanged
+
+
+def test_trailing_strip_handles_punctuation() -> None:
+    # Trailing "." stripped even without a function word match.
+    text = "Ivan Horvat."
+    result = _select_accepted_detections(
+        text, [_det_person(0, 12)], _STD, trailing_strip=_STRIP_LIST
+    )
+    assert len(result) == 1
+    assert text[result[0].start : result[0].end] == "Ivan Horvat"
+
+
+# -- OIB phone-context tests -------------------------------------------------
+
+
+def test_oib_rejected_with_phone_prefix_plus_one() -> None:
+    text = f"+1 {_PHONE_COLLISION_OIB}"
+    start = len("+1 ")
+    result = _select_accepted_detections(
+        text, [_det_oib(start, start + 11)], _STD, oib_phone_window=30
+    )
+    assert result == []
+
+
+def test_oib_rejected_with_phone_keyword() -> None:
+    text = f"phone: {_PHONE_COLLISION_OIB}"
+    start = len("phone: ")
+    result = _select_accepted_detections(
+        text, [_det_oib(start, start + 11)], _STD, oib_phone_window=30
+    )
+    assert result == []
+
+
+def test_oib_accepted_with_oib_context_word() -> None:
+    # "OIB" keyword overrides the phone-context rejection.
+    text = f"Moj OIB je {_PHONE_COLLISION_OIB}"
+    start = len("Moj OIB je ")
+    result = _select_accepted_detections(
+        text, [_det_oib(start, start + 11)], _STD, oib_phone_window=30
+    )
+    assert len(result) == 1
+    assert result[0].entity_type == "HR_OIB"
+
+
+def test_oib_accepted_in_neutral_text() -> None:
+    # No phone or OIB keyword in window → detection is kept.
+    valid_oib = _make_oib("1234567890")
+    text = f"Broj {valid_oib}"
+    start = len("Broj ")
+    result = _select_accepted_detections(
+        text, [_det_oib(start, start + 11)], _STD, oib_phone_window=30
+    )
+    assert len(result) == 1
+    assert result[0].entity_type == "HR_OIB"
+
+
+def test_oib_phone_collision_15551234567_rejected_with_phone_context() -> None:
+    # Spec Q1 / AC 3.9: 15551234567 passes the OIB mod-11,10 checksum (collision).
+    # The "mob: " prefix (mobile phone context) must reject it as a phone number.
+    # Patterns require the phone keyword to appear IMMEDIATELY before the number
+    # ($ anchor), so "mob: 15551234567" is the canonical rejection case here.
+    text = f"mob: {_PHONE_COLLISION_OIB}"
+    start = len("mob: ")
+    result = _select_accepted_detections(
+        text, [_det_oib(start, start + 11)], _STD, oib_phone_window=30
+    )
+    assert result == []
+
+
+def test_oib_context_window_disabled_at_zero() -> None:
+    # oib_phone_window=0 disables the check entirely; phone context is ignored.
+    text = f"phone: {_PHONE_COLLISION_OIB}"
+    start = len("phone: ")
+    result = _select_accepted_detections(
+        text, [_det_oib(start, start + 11)], _STD, oib_phone_window=0
+    )
+    assert len(result) == 1
+
+
+# -- Post-review additions (Q1 + Q3) ----------------------------------------
+
+
+def test_select_accepted_detections_drops_denied_keyword_via_unit_call() -> None:
+    # Q1: hard guarantee that the deny-list drop works at the function level,
+    # independent of spaCy. Constructs a RecognizerResult directly and asserts
+    # it is suppressed — no analyzer, no model load.
+    text = "Task"
+    det = RecognizerResult(entity_type="PERSON", start=0, end=4, score=0.85)
+    result = _select_accepted_detections(text, [det], _STD, deny_list=frozenset(["task"]))
+    assert result == [], f"Expected deny-list to drop 'Task' PERSON, got {result!r}"
+
+
+def test_oib_rejected_with_croatian_mobitel_keyword() -> None:
+    # Q3: "mobitel" (Croatian for mobile phone) must reject an OIB-checksum-
+    # passing 11-digit number when it appears immediately before the number.
+    text = f"mobitel: {_PHONE_COLLISION_OIB}"
+    start = len("mobitel: ")
+    result = _select_accepted_detections(
+        text, [_det_oib(start, start + 11)], _STD, oib_phone_window=30
+    )
+    assert result == []
+
+
+def test_oib_rejected_with_croatian_telefon_keyword() -> None:
+    # Q3: "telefon" (Croatian for telephone) must reject the same collision OIB.
+    text = f"telefon: {_PHONE_COLLISION_OIB}"
+    start = len("telefon: ")
+    result = _select_accepted_detections(
+        text, [_det_oib(start, start + 11)], _STD, oib_phone_window=30
+    )
+    assert result == []
+
+
+# -- Post-smoke-test prefix-match tests (2026-05-11) --------------------------
+
+
+def test_deny_list_matches_prefix_with_trailing_word() -> None:
+    # Smoke test §8 Scenarij C: spaCy detects "emojis that enhance understanding of"
+    # (5 words) but the deny-list only has "emojis that enhance understanding" (4 words).
+    # Prefix rule: drop when entity starts with a denied entry followed by a space.
+    text = "emojis that enhance understanding of"
+    det = RecognizerResult(entity_type="PERSON", start=0, end=len(text), score=0.85)
+    deny = frozenset(["emojis that enhance understanding"])
+    result = _select_accepted_detections(text, [det], _STD, deny_list=deny)
+    assert (
+        result == []
+    ), "Expected prefix rule to drop PERSON whose text starts with a denied entry + space"
+
+
+def test_deny_list_prefix_match_does_not_drop_internal_substring() -> None:
+    # Guard: "tasksmith" must NOT match deny-list "task" — the space boundary
+    # ensures only whole-word prefixes are dropped, not embedded substrings.
+    for entity_text, denied in [("tasksmith", "task"), ("rawdata", "raw")]:
+        det = RecognizerResult(entity_type="PERSON", start=0, end=len(entity_text), score=0.85)
+        result = _select_accepted_detections(
+            entity_text, [det], _STD, deny_list=frozenset([denied])
+        )
+        assert len(result) == 1, (
+            f"'{entity_text}' must NOT be dropped by deny-list entry '{denied}' "
+            f"(no space boundary)"
+        )
+
+
+def test_deny_list_prefix_match_does_not_drop_real_name_starting_with_keyword() -> None:
+    # "Task Manager John" starts with "task " — prefix rule drops it.
+    # Per spec: prefer false negatives on PII over false positives on common keywords.
+    text = "Task Manager John"
+    det = RecognizerResult(entity_type="PERSON", start=0, end=len(text), score=0.85)
+    result = _select_accepted_detections(text, [det], _STD, deny_list=frozenset(["task"]))
+    assert (
+        result == []
+    ), "Expected 'Task Manager John' to be dropped — entity starts with denied 'task' + space"
