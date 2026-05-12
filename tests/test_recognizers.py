@@ -30,6 +30,7 @@ from pii_filter import (
     UKUTRRecognizer,
     USEINRecognizer,
     USSSNRecognizer,
+    _classify_window_language,
     _merge_dedupe_detections,
     _nlp_engine_cache,
     _select_accepted_detections,
@@ -970,44 +971,55 @@ def test_deny_list_prefix_match_does_not_drop_real_name_starting_with_keyword() 
 
 
 def test_merge_dedupe_drops_duplicate_lower_score() -> None:
-    hr = [RecognizerResult("PERSON", 0, 5, 0.8)]
-    en = [RecognizerResult("PERSON", 0, 5, 0.9)]
-    merged = _merge_dedupe_detections(hr, en)
-    assert len(merged) == 1
-    assert merged[0].score == 0.9
+    # Uses HR_OIB (regex entity) so the Task 3.3 NER window filter never applies;
+    # this test is purely about dedupe — EN wins on higher score.
+    hr = [RecognizerResult("HR_OIB", 0, 11, 0.8)]
+    en = [RecognizerResult("HR_OIB", 0, 11, 0.9)]
+    merged_list, dropped = _merge_dedupe_detections(hr, en, "12345678903")
+    assert len(merged_list) == 1
+    assert merged_list[0].score == 0.9
+    assert dropped == 0
 
 
 def test_merge_dedupe_keeps_disjoint_spans() -> None:
-    hr = [RecognizerResult("PERSON", 0, 5, 0.8)]
-    en = [RecognizerResult("EMAIL_ADDRESS", 10, 25, 0.9)]
-    merged = _merge_dedupe_detections(hr, en)
-    assert len(merged) == 2
-    assert {r.entity_type for r in merged} == {"PERSON", "EMAIL_ADDRESS"}
+    # HR_OIB and EMAIL_ADDRESS are both regex entities — window filter skips them.
+    hr = [RecognizerResult("HR_OIB", 0, 11, 0.8)]
+    en = [RecognizerResult("EMAIL_ADDRESS", 15, 30, 0.9)]
+    merged_list, dropped = _merge_dedupe_detections(hr, en, "12345678903 foo a@b.com")
+    assert len(merged_list) == 2
+    assert {r.entity_type for r in merged_list} == {"HR_OIB", "EMAIL_ADDRESS"}
+    assert dropped == 0
 
 
 def test_merge_dedupe_hr_stable_on_tie() -> None:
-    hr_det = RecognizerResult("PERSON", 0, 5, 0.85)
-    en_det = RecognizerResult("PERSON", 0, 5, 0.85)
-    merged = _merge_dedupe_detections([hr_det], [en_det])
-    assert len(merged) == 1
-    assert merged[0] is hr_det, "HR result must win on equal score (stable-first order)"
+    # HR_OIB: regex entity, no window filter. HR wins on equal score.
+    hr_det = RecognizerResult("HR_OIB", 0, 11, 0.85)
+    en_det = RecognizerResult("HR_OIB", 0, 11, 0.85)
+    merged_list, dropped = _merge_dedupe_detections([hr_det], [en_det], "12345678903")
+    assert len(merged_list) == 1
+    assert merged_list[0] is hr_det, "HR result must win on equal score (stable-first order)"
+    assert dropped == 0
 
 
 def test_merge_dedupe_different_entity_types_same_span() -> None:
-    hr = [RecognizerResult("PERSON", 0, 10, 0.85)]
-    en = [RecognizerResult("LOCATION", 0, 10, 0.80)]
-    merged = _merge_dedupe_detections(hr, en)
-    assert len(merged) == 2
-    assert {r.entity_type for r in merged} == {"PERSON", "LOCATION"}
+    # HR_OIB and EMAIL_ADDRESS: both regex entities; different types → both survive.
+    hr = [RecognizerResult("HR_OIB", 0, 11, 0.85)]
+    en = [RecognizerResult("EMAIL_ADDRESS", 0, 11, 0.80)]
+    merged_list, dropped = _merge_dedupe_detections(hr, en, "12345678903")
+    assert len(merged_list) == 2
+    assert {r.entity_type for r in merged_list} == {"HR_OIB", "EMAIL_ADDRESS"}
+    assert dropped == 0
 
 
 def test_merge_dedupe_empty_inputs() -> None:
-    hr = [RecognizerResult("PERSON", 0, 5, 0.8)]
-    en = [RecognizerResult("EMAIL_ADDRESS", 10, 25, 0.9)]
-    assert _merge_dedupe_detections([], []) == []
-    result_hr_only = _merge_dedupe_detections(hr, [])
+    hr = [RecognizerResult("HR_OIB", 0, 11, 0.8)]
+    en = [RecognizerResult("EMAIL_ADDRESS", 15, 30, 0.9)]
+    empty_list, dropped = _merge_dedupe_detections([], [], "")
+    assert empty_list == []
+    assert dropped == 0
+    result_hr_only, _ = _merge_dedupe_detections(hr, [], "12345678903")
     assert len(result_hr_only) == 1 and result_hr_only[0] is hr[0]
-    result_en_only = _merge_dedupe_detections([], en)
+    result_en_only, _ = _merge_dedupe_detections([], en, "12345678903 foo a@b.com")
     assert len(result_en_only) == 1 and result_en_only[0] is en[0]
 
 
@@ -1103,3 +1115,128 @@ async def test_nlp_engine_cache_keyed_by_lang_code() -> None:
         await p2.on_shutdown()
     finally:
         await p.on_shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — Unit tests: _classify_window_language
+# ---------------------------------------------------------------------------
+
+
+def test_classify_window_pure_hr_text() -> None:
+    text = "Moj OIB je 12345678903"
+    # span covers "12345678903" at positions 11-22; window includes "Moj OIB je"
+    result = _classify_window_language(text, 11, 22)
+    assert result == "hr", f"Pure HR text should classify as 'hr', got {result!r}"
+
+
+def test_classify_window_pure_en_text() -> None:
+    text = "My SSN is 123-45-6789"
+    # span covers "123-45-6789" at positions 10-21; window includes "My SSN is"
+    result = _classify_window_language(text, 10, 21)
+    assert result == "en", f"Pure EN text should classify as 'en', got {result!r}"
+
+
+def test_classify_window_mixed_hr_dominant() -> None:
+    # "Moj" is a HR marker; "is" is an EN marker; HR > EN → "hr"
+    text = "Moj kolega is named X"
+    result = _classify_window_language(text, 18, 19)
+    assert result == "hr", f"HR-dominant mixed text should classify as 'hr', got {result!r}"
+
+
+def test_classify_window_mixed_en_dominant() -> None:
+    # "My", "is" are EN markers; "Ivan" has no markers near it
+    text = "My friend is Ivan"
+    result = _classify_window_language(text, 13, 17)
+    assert result == "en", f"EN-dominant mixed text should classify as 'en', got {result!r}"
+
+
+def test_classify_window_diacritics_only() -> None:
+    # Diacritics alone count as HR markers
+    text = "Žučno tvrdi: 12345678903"
+    result = _classify_window_language(text, 13, 24)
+    assert result == "hr", f"Diacritics-containing text should classify as 'hr', got {result!r}"
+
+
+def test_classify_window_no_markers_either_side() -> None:
+    # No stopwords, no diacritics → tie → defaults to 'hr' (Q4)
+    text = "X1 Y2 Z3 12345678903"
+    result = _classify_window_language(text, 10, 21)
+    assert result == "hr", f"No-marker text must default to 'hr' (tie-break Q4), got {result!r}"
+
+
+def test_classify_window_clipped_at_text_start() -> None:
+    # Detection at position 0 — window must not underflow (no negative index)
+    text = "Ivan Horvat je student"
+    result = _classify_window_language(text, 0, 11)
+    # "je" is an HR marker in the trailing window → should be "hr"
+    assert result in ("hr", "en"), "Must return a valid language, no index error"
+
+
+def test_classify_window_clipped_at_text_end() -> None:
+    # Detection at end of string — window must not overflow past len(text)
+    text = "SSN is 123-45-6789"
+    end = len(text)
+    result = _classify_window_language(text, end - 11, end)
+    # "is" is an EN marker in the leading window → should be "en"
+    assert result in ("hr", "en"), "Must return a valid language, no index error"
+
+
+def test_classify_window_zero_window_chars_returns_hr_default() -> None:
+    # window_chars=0 → window is exactly the span text only; no surrounding context.
+    # Empty or span-only window → tie → "hr" (Q4 default).
+    text = "ABCDEF"
+    result = _classify_window_language(text, 0, 6, window_chars=0)
+    assert result == "hr", f"Zero-context window must default to 'hr' (Q4 tie), got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — Unit tests: _merge_dedupe_detections NER spillover filter
+# ---------------------------------------------------------------------------
+
+
+def test_merge_drops_en_person_in_hr_text() -> None:
+    # EN analyzer emits PERSON for "Moj OIB" (false positive on HR text).
+    # Window around "Moj OIB" (0-7) in HR text → "hr" → EN PERSON dropped.
+    text = "Moj OIB je 12345678903"
+    en_person = RecognizerResult("PERSON", 0, 7, 0.7)
+    merged_list, dropped = _merge_dedupe_detections([], [en_person], text)
+    assert len(merged_list) == 0, "EN PERSON in HR window must be dropped"
+    assert dropped == 1
+
+
+def test_merge_keeps_hr_person_in_hr_text() -> None:
+    # HR analyzer emits PERSON for "Ivan Horvat" — window is HR → kept.
+    text = "Moj OIB je 12345678903, a zovem se Ivan Horvat."
+    start = text.index("Ivan Horvat")
+    hr_person = RecognizerResult("PERSON", start, start + 11, 0.85)
+    merged_list, dropped = _merge_dedupe_detections([hr_person], [], text)
+    assert len(merged_list) == 1, "HR PERSON in HR window must be kept"
+    assert dropped == 0
+
+
+def test_merge_keeps_regex_entity_regardless_of_language() -> None:
+    # HR_OIB is regex-based — never filtered by window language.
+    text = "Moj OIB je 12345678903"
+    hr_oib = RecognizerResult("HR_OIB", 11, 22, 0.85)
+    en_oib_dup = RecognizerResult("HR_OIB", 11, 22, 0.85)
+    # Both pass filter; dedupe keeps one (HR wins on tie).
+    merged_list, dropped = _merge_dedupe_detections([hr_oib], [en_oib_dup], text)
+    assert len(merged_list) == 1, "Regex entity must always pass NER window filter"
+    assert dropped == 0
+
+
+def test_merge_drops_en_person_in_hr_dominant_mixed_text() -> None:
+    # Mixed text: "Moj prijatelj je John Smith". Window around "John Smith"
+    # includes "je" (HR marker) and no EN markers → "hr" → EN PERSON dropped (Q4 tie-break).
+    text = "Moj prijatelj je John Smith"
+    start = text.index("John Smith")
+    en_person = RecognizerResult("PERSON", start, start + 10, 0.75)
+    merged_list, dropped = _merge_dedupe_detections([], [en_person], text)
+    # Q4: tie or HR-dominant → "hr" → EN source detection dropped.
+    # Document this as acceptable: if HR model also detected "John Smith",
+    # its HR detection would have been passed by the filter.
+    assert dropped == 1, (
+        "EN PERSON in HR-dominant window must be dropped (Q4 tie-break; "
+        "HR model should handle EN names if duplicated into HR registry)"
+    )
+    assert len(merged_list) == 0

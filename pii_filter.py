@@ -2,11 +2,11 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-11
-version: 0.9.0
+date: 2026-05-12
+version: 0.9.1
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path).
-requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl, https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.7.0/en_core_web_lg-3.7.0-py3-none-any.whl
+description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP/DATE_TIME detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections.
+requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
 """
 
 from __future__ import annotations
@@ -523,6 +523,12 @@ def _select_accepted_detections(
             return []
 
     # Step 5: Overlap resolution (unchanged from Task 3 baseline)
+    # TEMP v0.9.2-investigate: log candidates before overlap resolution
+    for _c in candidates:
+        logger.debug(
+            "overlap_candidates entity=%s start=%d end=%d score=%.3f",
+            _c.entity_type, _c.start, _c.end, _c.score,
+        )
     candidates.sort(
         key=lambda d: (
             -d.score,
@@ -666,6 +672,57 @@ _OIB_CONTEXT_PATTERN: re.Pattern[str] = re.compile(
     r"\boib\b|osobni identifikacijski broj|osobni broj",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — Cross-lingual NER spillover filter constants
+# ---------------------------------------------------------------------------
+
+# HR markers: diacritics (any hit = strong HR signal) + common HR stopwords/verb forms.
+# Case-insensitive. ≥ 12 markers required by AC 3.3.1.
+_HR_MARKERS: re.Pattern[str] = re.compile(
+    r"\b(?:je|su|sam|ću|nije|ima|nema|moj|moja|moje|mojeg|mojim|"
+    r"tvoj|naš|naša|ovaj|ova|ovo|taj|ta|to|ali|nego|gdje|"
+    r"kako|što|kao|samo|već|još|biti|bio|bila|bilo)\b|[čšžđćČŠŽĐĆ]",
+    re.IGNORECASE,
+)
+
+# EN markers: common EN stopwords and function words. ≥ 12 markers required by AC 3.3.1.
+_EN_MARKERS: re.Pattern[str] = re.compile(
+    r"\b(?:the|is|are|was|were|am|been|being|have|has|had|"
+    r"my|your|our|his|her|its|their|this|that|these|those|"
+    r"and|but|where|how|what|with|from|about|please|thank|"
+    r"not|for|into|onto|upon|after|before|during)\b",
+    re.IGNORECASE,
+)
+
+# NER entity types subject to the cross-lingual window filter.
+# Regex-based entity types (HR_OIB, US_SSN, EMAIL_ADDRESS, …) are excluded — they are
+# language-agnostic and must never be filtered by window language.
+_NER_ENTITY_TYPES: frozenset[str] = frozenset({"PERSON", "LOCATION", "NRP", "DATE_TIME"})
+
+
+def _classify_window_language(
+    text: str,
+    start: int,
+    end: int,
+    window_chars: int = 30,
+) -> Literal["hr", "en"]:
+    """Classify the language of the local text window surrounding a detection span.
+
+    Counts HR vs EN marker matches in text[start-window_chars : end+window_chars].
+    On tie (equal counts or no markers at all), returns 'hr' — deployment region
+    default per Task 3.3 pre-locked decision Q4.
+
+    Window is clipped to text boundaries to avoid index underflow/overflow.
+    """
+    window_start = max(0, start - window_chars)
+    window_end = min(len(text), end + window_chars)
+    window = text[window_start:window_end]
+
+    hr_count = len(_HR_MARKERS.findall(window))
+    en_count = len(_EN_MARKERS.findall(window))
+
+    return "en" if en_count > hr_count else "hr"
 
 
 def restore_text(
@@ -1354,27 +1411,58 @@ def _get_message_text_for_precheck(msg: dict[str, Any]) -> str:
 def _merge_dedupe_detections(
     hr_results: list[RecognizerResult],
     en_results: list[RecognizerResult],
-) -> list[RecognizerResult]:
-    """Concatenate HR + EN detections, deduplicate by (start, end, entity_type).
+    text: str,
+) -> tuple[list[RecognizerResult], int]:
+    """Concatenate HR + EN detections; filter NER detections by window language; deduplicate.
 
-    Dedupe rule: when two RecognizerResults share the same span and entity
-    type, keep the one with the higher score. On tie, keep the HR one
-    (stable order: HR results come first in the concatenation).
+    Filter step (Task 3.3): for each detection whose entity_type is in
+    _NER_ENTITY_TYPES (PERSON, LOCATION, NRP, DATE_TIME), the ±30-char window
+    around the span is classified as 'hr' or 'en'. If the window language does
+    not match the detection's source analyzer, the detection is dropped and its
+    count is added to the returned spillover_dropped counter. Regex-based entity
+    types are never filtered — they are language-agnostic.
 
-    This is purely the merge step — cross-entity-type overlap resolution
-    (different spans or different entity types at the same position) is
-    handled downstream by _select_accepted_detections.
+    Dedupe rule (Task 3.2, unchanged): when two RecognizerResults share the same
+    span and entity type, keep the one with the higher score. On tie, keep the HR
+    one (stable order: HR results come first in the concatenation).
+
+    Returns:
+        (merged_list, ner_spillover_dropped_count) — the count is logged by
+        inlet as ner_spillover_dropped=%d (AC 3.3.13).
     """
-    merged: dict[tuple[int, int, str], RecognizerResult] = {}
+    spillover_dropped = 0
+
+    hr_filtered: list[RecognizerResult] = []
     for det in hr_results:
+        if (
+            det.entity_type in _NER_ENTITY_TYPES
+            and _classify_window_language(text, det.start, det.end) != "hr"
+        ):
+            spillover_dropped += 1
+            continue
+        hr_filtered.append(det)
+
+    en_filtered: list[RecognizerResult] = []
+    for det in en_results:
+        if (
+            det.entity_type in _NER_ENTITY_TYPES
+            and _classify_window_language(text, det.start, det.end) != "en"
+        ):
+            spillover_dropped += 1
+            continue
+        en_filtered.append(det)
+
+    merged: dict[tuple[int, int, str], RecognizerResult] = {}
+    for det in hr_filtered:
         key = (det.start, det.end, det.entity_type)
         merged[key] = det
-    for det in en_results:
+    for det in en_filtered:
         key = (det.start, det.end, det.entity_type)
         existing = merged.get(key)
         if existing is None or det.score > existing.score:
             merged[key] = det
-    return list(merged.values())
+
+    return list(merged.values()), spillover_dropped
 
 
 class Pipeline:
@@ -1537,11 +1625,38 @@ class Pipeline:
                 "success",
                 "failed",
                 "pending",
+                # Task 3.3: Croatian label words and pronoun phrases.
+                # Window filter drops most EN-sourced spillover; deny-list
+                # catches residual HR-NER noise (HR model detects these in
+                # HR-dominant text, so they pass the window filter but should
+                # never enter the vault as PII spans).
+                "moj oib",
+                "moja oib",
+                "moj jmbg",
+                "moja jmbg",
+                "moj iban",
+                "moja iban",
+                "moj email",
+                "moja email",
+                "moja mail",
+                "moj telefon",
+                "moj mobitel",
+                "moja adresa",
+                "moj broj",
+                "email",
+                "mail",
+                "adresa",
+                "broj",
+                "oib",
+                "jmbg",
+                "iban",
+                "ime",
+                "prezime",
             ],
             description=(
                 "Lowercase, exact-match denylist for PERSON entities. "
                 "Useful for suppressing spaCy false positives on common "
-                "English/code keywords. Configurable via "
+                "English/code keywords and Croatian label words. Configurable via "
                 "PII_FILTER_NER_DENY_LIST env var."
             ),
         )
@@ -1995,6 +2110,33 @@ class Pipeline:
         if not self.valves.enabled:
             return body
 
+        # Task 3.2/3.3 OpenWebUI integration: skip background tasks.
+        # OpenWebUI sends embedded chat history as user content for
+        # title/tags/follow-up generation, which would produce false-positive
+        # PII detections on assistant content inside the embedded history.
+        # Background tasks are identified by metadata["task"] key
+        # (e.g., "title_generation", "tags_generation", "follow_up_generation").
+        # The original user message has already been processed by the primary
+        # inlet call; outlet will still restore placeholders in task responses.
+        metadata = body.get("metadata")
+        if isinstance(metadata, dict):
+            task = metadata.get("task")
+            if task:
+                logger.info(
+                    "inlet: skipping OpenWebUI background task '%s' "
+                    "(chat_id=%s, body_size=%d chars)",
+                    task,
+                    metadata.get("chat_id"),
+                    sum(
+                        len(str(m.get("content", "")))
+                        for m in body.get("messages", [])
+                        if isinstance(m, dict)
+                    )
+                    if isinstance(body.get("messages"), list)
+                    else 0,
+                )
+                return body
+
         if self.analyzer_hr is None and self.analyzer_en is None:
             logger.warning("inlet called before on_startup completed; returning body unchanged")
             return body
@@ -2066,6 +2208,7 @@ class Pipeline:
         forward_map: dict[str, str] = {}
         reverse_map: dict[str, str] = {}
         all_enriched: list[dict[str, Any]] = []
+        total_spillover_dropped: int = 0
 
         if use_vault:
             assert self.vault is not None  # for mypy
@@ -2125,7 +2268,10 @@ class Pipeline:
                         if self.analyzer_en is not None
                         else []
                     )
-                    results = _merge_dedupe_detections(hr_results, en_results)
+                    results, spillover_count = _merge_dedupe_detections(
+                        hr_results, en_results, text
+                    )
+                    total_spillover_dropped += spillover_count
                     accepted = _select_accepted_detections(
                         text,
                         results,
@@ -2236,7 +2382,8 @@ class Pipeline:
         logger.info(
             "pii_filter inlet processed: chat_id=%s thread_id=%s "
             "messages_processed=%d messages_skipped_already_masked=%d "
-            "detections=%d masked=%d vault=%s backend=%s languages_active=%s",
+            "detections=%d masked=%d vault=%s backend=%s languages_active=%s "
+            "ner_spillover_dropped=%d",
             raw_chat_id,
             thread_id,
             messages_processed,
@@ -2246,6 +2393,7 @@ class Pipeline:
             vault_state,
             self.valves.vault_backend,
             languages_active,
+            total_spillover_dropped,
         )
 
         return body

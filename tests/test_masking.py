@@ -2112,3 +2112,198 @@ async def test_inlet_dual_analyzer_latency_within_budget(started_pipeline: Pipel
     latencies_ms.sort()
     p95_ms = latencies_ms[18]
     assert p95_ms < 1000.0, f"Dual-analyzer P95 latency {p95_ms:.1f}ms exceeds 1000ms budget"
+
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — Integration tests: NER spillover filter + deny-list expansion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inlet_hr_baseline_no_label_word_false_positives(
+    started_pipeline: Pipeline,
+) -> None:
+    """HR text: deny-list catches PERSON false positives on Croatian label words."""
+    oib = _make_oib("1234567890")
+    body: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Moj OIB je {oib}, a zovem se Ivan Horvat. Email mi je ivan@firma.hr.",
+            }
+        ],
+        "metadata": {"chat_id": "task3.3-hr-baseline"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+
+    detections = result.get("metadata", {}).get("pii_detections", [])
+    detected_originals = {d.get("original_value", "") for d in detections}
+
+    assert (
+        "Moj OIB" not in detected_originals
+    ), f"'Moj OIB' must not enter vault — caught by deny-list; detections={detected_originals}"
+    assert (
+        "Email" not in detected_originals
+    ), f"'Email' must not enter vault — caught by deny-list; detections={detected_originals}"
+    assert "[HR_OIB_1]" in content, f"HR_OIB must be detected: {content!r}"
+
+
+@pytest.mark.asyncio
+async def test_inlet_en_baseline_person_detected(started_pipeline: Pipeline) -> None:
+    """EN text: PERSON and US_SSN must both be detected when EN analyzer is active."""
+    if started_pipeline.analyzer_en is None:
+        pytest.skip("en_core_web_lg not installed — skipping EN baseline integration test")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": "My name is John Smith and my SSN is 123-45-6789."}
+        ],
+        "metadata": {"chat_id": "task3.3-en-baseline"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+    detections = result.get("metadata", {}).get("pii_detections", [])
+    entity_types = {d.get("entity_type") for d in detections}
+    assert "PERSON" in entity_types, f"PERSON must be detected in EN text; content={content!r}"
+    assert "US_SSN" in entity_types, f"US_SSN must be detected in EN text; content={content!r}"
+
+
+@pytest.mark.asyncio
+async def test_inlet_cross_language_oib_in_english_sentence(
+    started_pipeline: Pipeline,
+) -> None:
+    """Cross-language: HR_OIB (regex entity) detected regardless of window language."""
+    oib = _make_oib("9876543210")
+    body: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": f"My Croatian colleague's OIB is {oib}.",
+            }
+        ],
+        "metadata": {"chat_id": "task3.3-cross-lang"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result.get("metadata", {}).get("pii_detections", [])
+    entity_types = {d.get("entity_type") for d in detections}
+    assert "HR_OIB" in entity_types, (
+        f"HR_OIB (regex entity) must be detected even in EN-dominant text; "
+        f"detections={detections}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inlet_logger_includes_ner_spillover_count(
+    started_pipeline: Pipeline,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Logger line must include ner_spillover_dropped field (AC 3.3.13)."""
+    import logging
+
+    oib = _make_oib("1111122222")
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}."}],
+        "metadata": {"chat_id": "task3.3-logger"},
+    }
+    with caplog.at_level(logging.INFO, logger="pii_filter"):
+        await started_pipeline.inlet(body)
+
+    log_text = "\n".join(caplog.messages)
+    assert (
+        "ner_spillover_dropped=" in log_text
+    ), f"Logger must include ner_spillover_dropped field (AC 3.3.13); log={log_text!r}"
+
+
+@pytest.mark.asyncio
+async def test_inlet_skips_openwebui_background_task_title_generation(
+    started_pipeline: Pipeline,
+) -> None:
+    """OpenWebUI background tasks must skip inlet to avoid false positives
+    on embedded chat history."""
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "### Task: Generate title for: USER: My OIB is 12345678903",
+            }
+        ],
+        "metadata": {
+            "chat_id": "test-bg-task",
+            "task": "title_generation",
+        },
+    }
+    result = await started_pipeline.inlet(body)
+    # Body returned unchanged — no metadata.pii_detections added
+    assert "pii_detections" not in result.get("metadata", {})
+    # Content unchanged (no masking applied)
+    assert "12345678903" in result["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_inlet_processes_normal_user_message_without_task_field(
+    started_pipeline: Pipeline,
+) -> None:
+    """Normal user messages (no metadata.task) must be processed normally."""
+    body = {
+        "messages": [{"role": "user", "content": "Moj OIB je 12345678903"}],
+        "metadata": {
+            "chat_id": "test-normal",
+            # No "task" key
+        },
+    }
+    result = await started_pipeline.inlet(body)
+    # PII detected and masked
+    assert "12345678903" not in result["messages"][0]["content"]
+    assert "[HR_OIB_1]" in result["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_inlet_no_date_detection_in_credit_card_substring(
+    started_pipeline: Pipeline,
+) -> None:
+    """DATE_TIME should NOT be detected as substring of CREDIT_CARD
+    or PHONE entities. v0.9.2 removed DATE_TIME from PRESIDIO_TO_STANDARD."""
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "My card is 4111-1111-1111-1111 expiring 12/27.",
+            }
+        ],
+        "metadata": {"chat_id": "test-no-date"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result["metadata"]["pii_detections"]
+    entity_types = {d["entity_type"] for d in detections}
+    # CREDIT_CARD detected; DATE absolutely not
+    assert "CREDIT_CARD" in entity_types
+    assert "DATE" not in entity_types
+    assert "DATE_TIME" not in entity_types
+
+
+@pytest.mark.asyncio
+async def test_inlet_phone_detected_alongside_credit_card(
+    started_pipeline: Pipeline,
+) -> None:
+    """PHONE detection must work even when text contains CREDIT_CARD
+    sharing digit sequences. v0.9.2 fix."""
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "My card is 4111-1111-1111-1111 and "
+                    "call me at +1 202 456 1111 anytime."
+                ),
+            }
+        ],
+        "metadata": {"chat_id": "test-phone-cc-overlap"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result["metadata"]["pii_detections"]
+    entity_types_with_values = {
+        (d["entity_type"], d["original"])
+        for d in detections
+    }
+    assert ("CREDIT_CARD", "4111-1111-1111-1111") in entity_types_with_values
+    assert ("PHONE", "+1 202 456 1111") in entity_types_with_values
