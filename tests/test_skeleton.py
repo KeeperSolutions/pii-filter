@@ -35,7 +35,7 @@ def test_valves_have_defaults(pipeline: Pipeline) -> None:
     assert valves.pipelines == ["*"]
     assert valves.priority == 0
     assert valves.enabled is True
-    assert valves.languages == ["hr"]
+    assert valves.languages == ["hr", "en"]
     assert valves.degradation_mode == "block"
 
 
@@ -117,5 +117,6 @@ async def test_lifecycle_hooks_dont_throw(pipeline: Pipeline) -> None:
     # redis (fakeredis via the autouse conftest fixture) so this lifecycle
     # smoke test stays infrastructure-free.
     pipeline.valves.vault_backend = "redis"
+    pipeline.valves.languages = ["hr"]  # HR-only to avoid EN model load
     await pipeline.on_startup()
     await pipeline.on_shutdown()

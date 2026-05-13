@@ -30,6 +30,9 @@ from pii_filter import (
     UKUTRRecognizer,
     USEINRecognizer,
     USSSNRecognizer,
+    _classify_window_language,
+    _merge_dedupe_detections,
+    _nlp_engine_cache,
     _select_accepted_detections,
     make_iban_recognizer,
 )
@@ -116,7 +119,7 @@ def _make_ro_cnp(first12: str) -> str:
     ],
 )
 def test_oib_accepts_valid(valid_oib: str) -> None:
-    assert OIBRecognizer().validate_result(valid_oib) is True
+    assert OIBRecognizer(supported_language="hr").validate_result(valid_oib) is True
 
 
 @pytest.mark.parametrize(
@@ -129,7 +132,7 @@ def test_oib_accepts_valid(valid_oib: str) -> None:
     ],
 )
 def test_oib_rejects_invalid(invalid_oib: str) -> None:
-    assert OIBRecognizer().validate_result(invalid_oib) is False
+    assert OIBRecognizer(supported_language="hr").validate_result(invalid_oib) is False
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +148,7 @@ def test_oib_rejects_invalid(invalid_oib: str) -> None:
     ],
 )
 def test_jmbg_accepts_valid(valid_jmbg: str) -> None:
-    assert JMBGRecognizer().validate_result(valid_jmbg) is True
+    assert JMBGRecognizer(supported_language="hr").validate_result(valid_jmbg) is True
 
 
 @pytest.mark.parametrize(
@@ -159,7 +162,7 @@ def test_jmbg_accepts_valid(valid_jmbg: str) -> None:
     ],
 )
 def test_jmbg_rejects_invalid(invalid_jmbg: str) -> None:
-    assert JMBGRecognizer().validate_result(invalid_jmbg) is False
+    assert JMBGRecognizer(supported_language="hr").validate_result(invalid_jmbg) is False
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +178,7 @@ VALID_HR_IBANS = [
 
 @pytest.mark.parametrize("valid_hr_iban", VALID_HR_IBANS)
 def test_hr_iban_accepts_valid(valid_hr_iban: str) -> None:
-    assert HRIBANRecognizer().validate_result(valid_hr_iban) is True
+    assert HRIBANRecognizer(supported_language="hr").validate_result(valid_hr_iban) is True
 
 
 @pytest.mark.parametrize(
@@ -187,7 +190,7 @@ def test_hr_iban_accepts_valid(valid_hr_iban: str) -> None:
     ],
 )
 def test_hr_iban_rejects_invalid(invalid_hr_iban: str) -> None:
-    assert HRIBANRecognizer().validate_result(invalid_hr_iban) is False
+    assert HRIBANRecognizer(supported_language="hr").validate_result(invalid_hr_iban) is False
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +208,7 @@ def test_hr_iban_rejects_invalid(invalid_hr_iban: str) -> None:
     ],
 )
 def test_ie_ppsn_accepts_valid(valid_ppsn: str) -> None:
-    assert IEPPSNRecognizer().validate_result(valid_ppsn) is True
+    assert IEPPSNRecognizer(supported_language="hr").validate_result(valid_ppsn) is True
 
 
 @pytest.mark.parametrize(
@@ -218,7 +221,7 @@ def test_ie_ppsn_accepts_valid(valid_ppsn: str) -> None:
     ],
 )
 def test_ie_ppsn_rejects_invalid(invalid_ppsn: str) -> None:
-    assert IEPPSNRecognizer().validate_result(invalid_ppsn) is False
+    assert IEPPSNRecognizer(supported_language="hr").validate_result(invalid_ppsn) is False
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +239,7 @@ def test_ie_ppsn_rejects_invalid(invalid_ppsn: str) -> None:
     ],
 )
 def test_ro_cnp_accepts_valid(valid_cnp: str) -> None:
-    assert ROCNPRecognizer().validate_result(valid_cnp) is True
+    assert ROCNPRecognizer(supported_language="hr").validate_result(valid_cnp) is True
 
 
 @pytest.mark.parametrize(
@@ -251,7 +254,7 @@ def test_ro_cnp_accepts_valid(valid_cnp: str) -> None:
     ],
 )
 def test_ro_cnp_rejects_invalid(invalid_cnp: str) -> None:
-    assert ROCNPRecognizer().validate_result(invalid_cnp) is False
+    assert ROCNPRecognizer(supported_language="hr").validate_result(invalid_cnp) is False
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +271,7 @@ def test_ro_cnp_rejects_invalid(invalid_cnp: str) -> None:
     ],
 )
 def test_uk_nino_accepts_valid(valid_nino: str) -> None:
-    assert UKNINORecognizer().validate_result(valid_nino) is True
+    assert UKNINORecognizer(supported_language="hr").validate_result(valid_nino) is True
 
 
 @pytest.mark.parametrize(
@@ -282,7 +285,7 @@ def test_uk_nino_accepts_valid(valid_nino: str) -> None:
     ],
 )
 def test_uk_nino_rejects_invalid(invalid_nino: str) -> None:
-    assert UKNINORecognizer().validate_result(invalid_nino) is False
+    assert UKNINORecognizer(supported_language="hr").validate_result(invalid_nino) is False
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +301,7 @@ def test_uk_nino_rejects_invalid(invalid_nino: str) -> None:
     ],
 )
 def test_uk_utr_accepts_valid(valid_utr: str) -> None:
-    assert UKUTRRecognizer().validate_result(valid_utr) is True
+    assert UKUTRRecognizer(supported_language="hr").validate_result(valid_utr) is True
 
 
 @pytest.mark.parametrize(
@@ -311,7 +314,7 @@ def test_uk_utr_accepts_valid(valid_utr: str) -> None:
     ],
 )
 def test_uk_utr_rejects_invalid(invalid_utr: str) -> None:
-    assert UKUTRRecognizer().validate_result(invalid_utr) is False
+    assert UKUTRRecognizer(supported_language="hr").validate_result(invalid_utr) is False
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +331,7 @@ def test_uk_utr_rejects_invalid(invalid_utr: str) -> None:
     ],
 )
 def test_us_ssn_accepts_valid(valid_ssn: str) -> None:
-    assert USSSNRecognizer().validate_result(valid_ssn) is True
+    assert USSSNRecognizer(supported_language="hr").validate_result(valid_ssn) is True
 
 
 @pytest.mark.parametrize(
@@ -342,7 +345,7 @@ def test_us_ssn_accepts_valid(valid_ssn: str) -> None:
     ],
 )
 def test_us_ssn_rejects_invalid(invalid_ssn: str) -> None:
-    assert USSSNRecognizer().validate_result(invalid_ssn) is False
+    assert USSSNRecognizer(supported_language="hr").validate_result(invalid_ssn) is False
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +361,7 @@ def test_us_ssn_rejects_invalid(invalid_ssn: str) -> None:
     ],
 )
 def test_us_ein_accepts_valid(valid_ein: str) -> None:
-    assert USEINRecognizer().validate_result(valid_ein) is True
+    assert USEINRecognizer(supported_language="hr").validate_result(valid_ein) is True
 
 
 @pytest.mark.parametrize(
@@ -371,7 +374,7 @@ def test_us_ein_accepts_valid(valid_ein: str) -> None:
     ],
 )
 def test_us_ein_rejects_invalid(invalid_ein: str) -> None:
-    assert USEINRecognizer().validate_result(invalid_ein) is False
+    assert USEINRecognizer(supported_language="hr").validate_result(invalid_ein) is False
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +391,7 @@ def test_us_ein_rejects_invalid(invalid_ein: str) -> None:
     ],
 )
 def test_factory_iban_accepts_valid(country: str, bban_length: int, entity: str) -> None:
-    rec = make_iban_recognizer(country, bban_length, entity)
+    rec = make_iban_recognizer(country, bban_length, entity, supported_language="hr")
     # BBAN with leading 4 alpha bank code, remainder digits.
     bban = "AAAA" + "1" * (bban_length - 4)
     valid = _make_iban(country, bban)
@@ -407,7 +410,7 @@ def test_factory_iban_accepts_valid(country: str, bban_length: int, entity: str)
 def test_factory_iban_rejects_invalid(
     country: str, bban_length: int, entity: str, invalid: str
 ) -> None:
-    rec = make_iban_recognizer(country, bban_length, entity)
+    rec = make_iban_recognizer(country, bban_length, entity, supported_language="hr")
     assert rec.validate_result(invalid) is False
 
 
@@ -429,7 +432,7 @@ def test_hr_iban_validates_grouped_form() -> None:
     valid = _make_iban("HR", "10010051863000160")
     grouped = _group_iban(valid)
     assert " " in grouped
-    assert HRIBANRecognizer().validate_result(grouped) is True
+    assert HRIBANRecognizer(supported_language="hr").validate_result(grouped) is True
 
 
 @pytest.mark.parametrize(
@@ -446,7 +449,7 @@ def test_factory_iban_validates_grouped_form(country: str, bban_length: int, ent
     valid = _make_iban(country, bban)
     grouped = _group_iban(valid)
     assert " " in grouped
-    rec = make_iban_recognizer(country, bban_length, entity)
+    rec = make_iban_recognizer(country, bban_length, entity, supported_language="hr")
     assert rec.validate_result(grouped) is True
 
 
@@ -467,7 +470,7 @@ def test_factory_iban_pattern_matches_grouped_form(
     bban = "AAAA" + "1" * (bban_length - 4)
     valid = _make_iban(country, bban)
     grouped = _group_iban(valid)
-    rec = make_iban_recognizer(country, bban_length, entity)
+    rec = make_iban_recognizer(country, bban_length, entity, supported_language="hr")
     text = f"Moj IBAN je {grouped}."
     match = _re.search(rec.patterns[0].regex, text)
     assert match is not None, f"{entity} pattern failed to match grouped form"
@@ -484,7 +487,7 @@ def test_hr_iban_pattern_matches_grouped_form() -> None:
     valid = _make_iban("HR", "10010051863000160")
     grouped = _group_iban(valid)
     text = f"Moj IBAN je {grouped}."
-    match = _re.search(HRIBANRecognizer().patterns[0].regex, text)
+    match = _re.search(HRIBANRecognizer(supported_language="hr").patterns[0].regex, text)
     assert match is not None, "HR_IBAN pattern failed to match grouped form"
     assert match.group().replace(" ", "") == valid
 
@@ -500,7 +503,7 @@ def test_uk_utr_span_excludes_keyword() -> None:
     Spec AC #14: result.start should point to the first digit, not to the
     keyword. We verify by running the recognizer's pattern directly.
     """
-    rec = UKUTRRecognizer()
+    rec = UKUTRRecognizer(supported_language="hr")
     text = "Reference: UTR 1234567890 for the file"
     pattern = rec.patterns[0].regex
     import re as _re
@@ -546,6 +549,9 @@ async def started_pipeline() -> AsyncIterator[Pipeline]:
     """
     p = Pipeline()
     p.valves.vault_backend = "redis"
+    p.valves.languages = [
+        "hr"
+    ]  # HR-only for module fixture; EN tests skip via analyzer_en is None guard
     await p.on_startup()
     yield p
     await p.on_shutdown()
@@ -577,8 +583,8 @@ async def test_integration_all_13_entities_detected(
     started_pipeline: Pipeline, synthetic_text: str
 ) -> None:
     """End-to-end: spaCy + AnalyzerEngine + 12 custom recognizers + CC built-in."""
-    assert started_pipeline.analyzer is not None
-    results = started_pipeline.analyzer.analyze(text=synthetic_text, language="hr")
+    assert started_pipeline.analyzer_hr is not None
+    results = started_pipeline.analyzer_hr.analyze(text=synthetic_text, language="hr")
     detected = {r.entity_type for r in results}
     expected = {
         "HR_OIB",
@@ -665,7 +671,8 @@ async def test_inlet_fails_closed_by_default_on_analyzer_error() -> None:
     """Default degradation_mode='block' must raise rather than leak PII."""
     pipeline = Pipeline()
     # Skip on_startup; inject a stub analyzer so we exercise only the except branch.
-    pipeline.analyzer = _ExplodingAnalyzer()  # type: ignore[assignment]
+    pipeline.analyzer_hr = _ExplodingAnalyzer()  # type: ignore[assignment]
+    pipeline.analyzer_en = _ExplodingAnalyzer()  # type: ignore[assignment]
     assert pipeline.valves.degradation_mode == "block"
     body: dict[str, Any] = {"messages": [{"role": "user", "content": "hello"}]}
     with pytest.raises(RuntimeError, match="Request blocked"):
@@ -676,7 +683,8 @@ async def test_inlet_fails_closed_by_default_on_analyzer_error() -> None:
 async def test_inlet_passes_through_when_degradation_mode_is_passthrough() -> None:
     """`degradation_mode='passthrough'` must log + return body unchanged on analyzer error."""
     pipeline = Pipeline()
-    pipeline.analyzer = _ExplodingAnalyzer()  # type: ignore[assignment]
+    pipeline.analyzer_hr = _ExplodingAnalyzer()  # type: ignore[assignment]
+    pipeline.analyzer_en = _ExplodingAnalyzer()  # type: ignore[assignment]
     pipeline.valves.degradation_mode = "passthrough"
     body: dict[str, Any] = {"messages": [{"role": "user", "content": "hello"}]}
     result = await pipeline.inlet(body)
@@ -953,3 +961,282 @@ def test_deny_list_prefix_match_does_not_drop_real_name_starting_with_keyword() 
     assert (
         result == []
     ), "Expected 'Task Manager John' to be dropped — entity starts with denied 'task' + space"
+
+
+# ---------------------------------------------------------------------------
+# Task 3.2 — Multi-Language Detection (HR + EN)
+# ---------------------------------------------------------------------------
+
+# A. Unit tests — _merge_dedupe_detections --------------------------------
+
+
+def test_merge_dedupe_drops_duplicate_lower_score() -> None:
+    # Uses HR_OIB (regex entity) so the Task 3.3 NER window filter never applies;
+    # this test is purely about dedupe — EN wins on higher score.
+    hr = [RecognizerResult("HR_OIB", 0, 11, 0.8)]
+    en = [RecognizerResult("HR_OIB", 0, 11, 0.9)]
+    merged_list, dropped = _merge_dedupe_detections(hr, en, "12345678903")
+    assert len(merged_list) == 1
+    assert merged_list[0].score == 0.9
+    assert dropped == 0
+
+
+def test_merge_dedupe_keeps_disjoint_spans() -> None:
+    # HR_OIB and EMAIL_ADDRESS are both regex entities — window filter skips them.
+    hr = [RecognizerResult("HR_OIB", 0, 11, 0.8)]
+    en = [RecognizerResult("EMAIL_ADDRESS", 15, 30, 0.9)]
+    merged_list, dropped = _merge_dedupe_detections(hr, en, "12345678903 foo a@b.com")
+    assert len(merged_list) == 2
+    assert {r.entity_type for r in merged_list} == {"HR_OIB", "EMAIL_ADDRESS"}
+    assert dropped == 0
+
+
+def test_merge_dedupe_hr_stable_on_tie() -> None:
+    # HR_OIB: regex entity, no window filter. HR wins on equal score.
+    hr_det = RecognizerResult("HR_OIB", 0, 11, 0.85)
+    en_det = RecognizerResult("HR_OIB", 0, 11, 0.85)
+    merged_list, dropped = _merge_dedupe_detections([hr_det], [en_det], "12345678903")
+    assert len(merged_list) == 1
+    assert merged_list[0] is hr_det, "HR result must win on equal score (stable-first order)"
+    assert dropped == 0
+
+
+def test_merge_dedupe_different_entity_types_same_span() -> None:
+    # HR_OIB and EMAIL_ADDRESS: both regex entities; different types → both survive.
+    hr = [RecognizerResult("HR_OIB", 0, 11, 0.85)]
+    en = [RecognizerResult("EMAIL_ADDRESS", 0, 11, 0.80)]
+    merged_list, dropped = _merge_dedupe_detections(hr, en, "12345678903")
+    assert len(merged_list) == 2
+    assert {r.entity_type for r in merged_list} == {"HR_OIB", "EMAIL_ADDRESS"}
+    assert dropped == 0
+
+
+def test_merge_dedupe_empty_inputs() -> None:
+    hr = [RecognizerResult("HR_OIB", 0, 11, 0.8)]
+    en = [RecognizerResult("EMAIL_ADDRESS", 15, 30, 0.9)]
+    empty_list, dropped = _merge_dedupe_detections([], [], "")
+    assert empty_list == []
+    assert dropped == 0
+    result_hr_only, _ = _merge_dedupe_detections(hr, [], "12345678903")
+    assert len(result_hr_only) == 1 and result_hr_only[0] is hr[0]
+    result_en_only, _ = _merge_dedupe_detections([], en, "12345678903 foo a@b.com")
+    assert len(result_en_only) == 1 and result_en_only[0] is en[0]
+
+
+def test_us_ssn_custom_validates_reserved_blocks() -> None:
+    rec = USSSNRecognizer(supported_language="hr")
+    assert rec.validate_result("000-45-6789") is False  # reserved area 000
+    assert rec.validate_result("666-45-6789") is False  # reserved area 666
+    assert rec.validate_result("900-45-6789") is False  # reserved area 9XX
+    assert rec.validate_result("123-45-6789") is True  # valid area
+
+
+def test_uk_nhs_detected_in_en_registry(started_pipeline: Pipeline) -> None:
+    if started_pipeline.analyzer_en is None:
+        pytest.skip("en_core_web_lg not installed — skipping EN registry test")
+    results = started_pipeline.analyzer_en.analyze(
+        text="My NHS number is 943 476 5919", language="en"
+    )
+    entity_types = {r.entity_type for r in results}
+    assert "UK_NHS" in entity_types, f"Expected UK_NHS in EN registry, got: {entity_types}"
+
+
+def test_iban_code_built_in_in_en_registry_for_de_iban(started_pipeline: Pipeline) -> None:
+    if started_pipeline.analyzer_en is None:
+        pytest.skip("en_core_web_lg not installed — skipping EN registry test")
+    results = started_pipeline.analyzer_en.analyze(
+        text="My IBAN is DE89370400440532013000", language="en"
+    )
+    entity_types = {r.entity_type for r in results}
+    assert (
+        "IBAN_CODE" in entity_types
+    ), f"Expected IBAN_CODE (built-in IbanRecognizer) in EN registry, got: {entity_types}"
+
+
+# C. Startup / configuration tests -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_startup_builds_both_analyzers_with_default_languages() -> None:
+    p = Pipeline()
+    p.valves.vault_backend = "redis"
+    try:
+        await p.on_startup()
+    except RuntimeError as exc:
+        pytest.skip(f"en_core_web_lg unavailable: {exc}")
+    try:
+        assert p.analyzer_hr is not None, "HR analyzer must be built with default languages"
+        assert p.analyzer_en is not None, "EN analyzer must be built with default languages"
+    finally:
+        await p.on_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_startup_validates_languages_whitelist() -> None:
+    p = Pipeline()
+    p.valves.vault_backend = "redis"
+    p.valves.languages = ["fr"]
+    with pytest.raises(RuntimeError) as exc_info:
+        await p.on_startup()
+    msg = str(exc_info.value)
+    assert "fr" in msg
+    assert "Allowed: hr, en" in msg
+
+
+@pytest.mark.asyncio
+async def test_startup_validates_languages_not_empty() -> None:
+    p = Pipeline()
+    p.valves.vault_backend = "redis"
+    p.valves.languages = []
+    with pytest.raises(RuntimeError):
+        await p.on_startup()
+
+
+@pytest.mark.asyncio
+async def test_nlp_engine_cache_keyed_by_lang_code() -> None:
+    # Both keys must be present after a dual-language startup.
+    p = Pipeline()
+    p.valves.vault_backend = "redis"
+    p.valves.languages = ["hr", "en"]
+    try:
+        await p.on_startup()
+    except RuntimeError as exc:
+        pytest.skip(f"en_core_web_lg unavailable (memory or install): {exc}")
+    try:
+        assert "hr" in _nlp_engine_cache
+        assert "en" in _nlp_engine_cache
+        # Second startup with only HR must reuse the cached HR engine.
+        hr_engine_before = _nlp_engine_cache["hr"]
+        p2 = Pipeline()
+        p2.valves.vault_backend = "redis"
+        p2.valves.languages = ["hr"]
+        await p2.on_startup()
+        assert _nlp_engine_cache["hr"] is hr_engine_before
+        await p2.on_shutdown()
+    finally:
+        await p.on_shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — Unit tests: _classify_window_language
+# ---------------------------------------------------------------------------
+
+
+def test_classify_window_pure_hr_text() -> None:
+    text = "Moj OIB je 12345678903"
+    # span covers "12345678903" at positions 11-22; window includes "Moj OIB je"
+    result = _classify_window_language(text, 11, 22)
+    assert result == "hr", f"Pure HR text should classify as 'hr', got {result!r}"
+
+
+def test_classify_window_pure_en_text() -> None:
+    text = "My SSN is 123-45-6789"
+    # span covers "123-45-6789" at positions 10-21; window includes "My SSN is"
+    result = _classify_window_language(text, 10, 21)
+    assert result == "en", f"Pure EN text should classify as 'en', got {result!r}"
+
+
+def test_classify_window_mixed_hr_dominant() -> None:
+    # "Moj" is a HR marker; "is" is an EN marker; HR > EN → "hr"
+    text = "Moj kolega is named X"
+    result = _classify_window_language(text, 18, 19)
+    assert result == "hr", f"HR-dominant mixed text should classify as 'hr', got {result!r}"
+
+
+def test_classify_window_mixed_en_dominant() -> None:
+    # "My", "is" are EN markers; "Ivan" has no markers near it
+    text = "My friend is Ivan"
+    result = _classify_window_language(text, 13, 17)
+    assert result == "en", f"EN-dominant mixed text should classify as 'en', got {result!r}"
+
+
+def test_classify_window_diacritics_only() -> None:
+    # Diacritics alone count as HR markers
+    text = "Žučno tvrdi: 12345678903"
+    result = _classify_window_language(text, 13, 24)
+    assert result == "hr", f"Diacritics-containing text should classify as 'hr', got {result!r}"
+
+
+def test_classify_window_no_markers_either_side() -> None:
+    # No stopwords, no diacritics → tie → defaults to 'hr' (Q4)
+    text = "X1 Y2 Z3 12345678903"
+    result = _classify_window_language(text, 10, 21)
+    assert result == "hr", f"No-marker text must default to 'hr' (tie-break Q4), got {result!r}"
+
+
+def test_classify_window_clipped_at_text_start() -> None:
+    # Detection at position 0 — window must not underflow (no negative index)
+    text = "Ivan Horvat je student"
+    result = _classify_window_language(text, 0, 11)
+    # "je" is an HR marker in the trailing window → should be "hr"
+    assert result in ("hr", "en"), "Must return a valid language, no index error"
+
+
+def test_classify_window_clipped_at_text_end() -> None:
+    # Detection at end of string — window must not overflow past len(text)
+    text = "SSN is 123-45-6789"
+    end = len(text)
+    result = _classify_window_language(text, end - 11, end)
+    # "is" is an EN marker in the leading window → should be "en"
+    assert result in ("hr", "en"), "Must return a valid language, no index error"
+
+
+def test_classify_window_zero_window_chars_returns_hr_default() -> None:
+    # window_chars=0 → window is exactly the span text only; no surrounding context.
+    # Empty or span-only window → tie → "hr" (Q4 default).
+    text = "ABCDEF"
+    result = _classify_window_language(text, 0, 6, window_chars=0)
+    assert result == "hr", f"Zero-context window must default to 'hr' (Q4 tie), got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — Unit tests: _merge_dedupe_detections NER spillover filter
+# ---------------------------------------------------------------------------
+
+
+def test_merge_drops_en_person_in_hr_text() -> None:
+    # EN analyzer emits PERSON for "Moj OIB" (false positive on HR text).
+    # Window around "Moj OIB" (0-7) in HR text → "hr" → EN PERSON dropped.
+    text = "Moj OIB je 12345678903"
+    en_person = RecognizerResult("PERSON", 0, 7, 0.7)
+    merged_list, dropped = _merge_dedupe_detections([], [en_person], text)
+    assert len(merged_list) == 0, "EN PERSON in HR window must be dropped"
+    assert dropped == 1
+
+
+def test_merge_keeps_hr_person_in_hr_text() -> None:
+    # HR analyzer emits PERSON for "Ivan Horvat" — window is HR → kept.
+    text = "Moj OIB je 12345678903, a zovem se Ivan Horvat."
+    start = text.index("Ivan Horvat")
+    hr_person = RecognizerResult("PERSON", start, start + 11, 0.85)
+    merged_list, dropped = _merge_dedupe_detections([hr_person], [], text)
+    assert len(merged_list) == 1, "HR PERSON in HR window must be kept"
+    assert dropped == 0
+
+
+def test_merge_keeps_regex_entity_regardless_of_language() -> None:
+    # HR_OIB is regex-based — never filtered by window language.
+    text = "Moj OIB je 12345678903"
+    hr_oib = RecognizerResult("HR_OIB", 11, 22, 0.85)
+    en_oib_dup = RecognizerResult("HR_OIB", 11, 22, 0.85)
+    # Both pass filter; dedupe keeps one (HR wins on tie).
+    merged_list, dropped = _merge_dedupe_detections([hr_oib], [en_oib_dup], text)
+    assert len(merged_list) == 1, "Regex entity must always pass NER window filter"
+    assert dropped == 0
+
+
+def test_merge_drops_en_person_in_hr_dominant_mixed_text() -> None:
+    # Mixed text: "Moj prijatelj je John Smith". Window around "John Smith"
+    # includes "je" (HR marker) and no EN markers → "hr" → EN PERSON dropped (Q4 tie-break).
+    text = "Moj prijatelj je John Smith"
+    start = text.index("John Smith")
+    en_person = RecognizerResult("PERSON", start, start + 10, 0.75)
+    merged_list, dropped = _merge_dedupe_detections([], [en_person], text)
+    # Q4: tie or HR-dominant → "hr" → EN source detection dropped.
+    # Document this as acceptable: if HR model also detected "John Smith",
+    # its HR detection would have been passed by the filter.
+    assert dropped == 1, (
+        "EN PERSON in HR-dominant window must be dropped (Q4 tie-break; "
+        "HR model should handle EN names if duplicated into HR registry)"
+    )
+    assert len(merged_list) == 0

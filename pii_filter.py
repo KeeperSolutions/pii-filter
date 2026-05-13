@@ -2,11 +2,11 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-11
-version: 0.8.0
+date: 2026-05-13
+version: 0.9.2
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). Both backends expose the same async public API; inlet writes the same `body["metadata"]` snapshot regardless of backend so Task 6 outlet runs unchanged. Postgres backend uses `INSERT ... ON CONFLICT` for atomic get-or-mint, lazy expiry filtering on every read, and per-thread TTL renewal on every public method.
-requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
+description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives.
+requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
 """
 
 from __future__ import annotations
@@ -31,16 +31,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Module-level language constant. Recognizers default to this language; tests
-# can override by passing `supported_language` explicitly.
-LANG = "hr"
-
-# Cached spaCy NLP engine. The model loads ~240 MB of contiguous word
-# vectors; on memory-constrained hosts a second load can fail with a
-# fragmented-heap allocation error. We cache the engine per-process so
-# repeated `on_startup` calls (test reruns, multiple Pipeline instances)
-# reuse the same load. AnalyzerEngine itself is still rebuilt per startup.
-_nlp_engine_cache: Any = None
+# Per-process spaCy NLP engine cache keyed by lang_code ("hr", "en").
+# Models load ~240–800 MB of word vectors; caching prevents re-allocation
+# across repeated on_startup calls (test reruns, multiple Pipeline instances).
+# AnalyzerEngine instances are still rebuilt per startup.
+_nlp_engine_cache: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +73,7 @@ class OIBRecognizer(PatternRecognizer):
 
     PATTERNS: ClassVar[list[Pattern]] = [Pattern("OIB", r"\b\d{11}\b", 0.4)]
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="HR_OIB",
             patterns=self.PATTERNS,
@@ -103,7 +98,7 @@ class JMBGRecognizer(PatternRecognizer):
 
     PATTERNS: ClassVar[list[Pattern]] = [Pattern("JMBG", r"\b\d{13}\b", 0.4)]
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="HR_JMBG",
             patterns=self.PATTERNS,
@@ -134,7 +129,7 @@ class HRIBANRecognizer(PatternRecognizer):
         Pattern("HR IBAN", r"\bHR\d{2}(?:\s?\d{4}){4}\s?\d\b", 0.5)
     ]
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="HR_IBAN",
             patterns=self.PATTERNS,
@@ -155,7 +150,7 @@ class IEPPSNRecognizer(PatternRecognizer):
 
     PATTERNS: ClassVar[list[Pattern]] = [Pattern("IE PPSN", r"\b\d{7}[A-W][AB]?\b", 0.4)]
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="IE_PPSN",
             patterns=self.PATTERNS,
@@ -190,7 +185,7 @@ class ROCNPRecognizer(PatternRecognizer):
 
     PATTERNS: ClassVar[list[Pattern]] = [Pattern("RO CNP", r"\b\d{13}\b", 0.4)]
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="RO_CNP",
             patterns=self.PATTERNS,
@@ -242,7 +237,7 @@ class UKNINORecognizer(PatternRecognizer):
     INVALID_FIRST: ClassVar[frozenset[str]] = frozenset({"D", "F", "I", "Q", "U", "V"})
     INVALID_SECOND: ClassVar[frozenset[str]] = frozenset({"D", "F", "I", "O", "Q", "U", "V"})
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="UK_NINO",
             patterns=self.PATTERNS,
@@ -272,7 +267,7 @@ class UKUTRRecognizer(PatternRecognizer):
 
     PATTERNS: ClassVar[list[Pattern]] = [Pattern("UK UTR", r"(?<=\b(?:UTR|utr)\s)\d{10}\b", 0.5)]
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="UK_UTR",
             patterns=self.PATTERNS,
@@ -293,7 +288,7 @@ class USSSNRecognizer(PatternRecognizer):
 
     PATTERNS: ClassVar[list[Pattern]] = [Pattern("US SSN", r"\b\d{3}-\d{2}-\d{4}\b", 0.7)]
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="US_SSN",
             patterns=self.PATTERNS,
@@ -320,7 +315,7 @@ class USEINRecognizer(PatternRecognizer):
     PATTERNS: ClassVar[list[Pattern]] = [Pattern("US EIN", r"\b\d{2}-\d{7}\b", 0.6)]
     CONTEXT: ClassVar[list[str]] = ["EIN", "Employer Identification", "Federal Tax ID", "Tax ID"]
 
-    def __init__(self, supported_language: str = LANG) -> None:
+    def __init__(self, supported_language: str) -> None:
         super().__init__(
             supported_entity="US_EIN",
             patterns=self.PATTERNS,
@@ -344,7 +339,7 @@ def make_iban_recognizer(
     country_code: str,
     bban_length: int,
     entity_name: str,
-    supported_language: str = LANG,
+    supported_language: str,
 ) -> PatternRecognizer:
     """Build a generic IBAN PatternRecognizer for a country.
 
@@ -671,6 +666,57 @@ _OIB_CONTEXT_PATTERN: re.Pattern[str] = re.compile(
     r"\boib\b|osobni identifikacijski broj|osobni broj",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — Cross-lingual NER spillover filter constants
+# ---------------------------------------------------------------------------
+
+# HR markers: diacritics (any hit = strong HR signal) + common HR stopwords/verb forms.
+# Case-insensitive. ≥ 12 markers required by AC 3.3.1.
+_HR_MARKERS: re.Pattern[str] = re.compile(
+    r"\b(?:je|su|sam|ću|nije|ima|nema|moj|moja|moje|mojeg|mojim|"
+    r"tvoj|naš|naša|ovaj|ova|ovo|taj|ta|to|ali|nego|gdje|"
+    r"kako|što|kao|samo|već|još|biti|bio|bila|bilo)\b|[čšžđćČŠŽĐĆ]",
+    re.IGNORECASE,
+)
+
+# EN markers: common EN stopwords and function words. ≥ 12 markers required by AC 3.3.1.
+_EN_MARKERS: re.Pattern[str] = re.compile(
+    r"\b(?:the|is|are|was|were|am|been|being|have|has|had|"
+    r"my|your|our|his|her|its|their|this|that|these|those|"
+    r"and|but|where|how|what|with|from|about|please|thank|"
+    r"not|for|into|onto|upon|after|before|during)\b",
+    re.IGNORECASE,
+)
+
+# NER entity types subject to the cross-lingual window filter.
+# Regex-based entity types (HR_OIB, US_SSN, EMAIL_ADDRESS, …) are excluded — they are
+# language-agnostic and must never be filtered by window language.
+_NER_ENTITY_TYPES: frozenset[str] = frozenset({"PERSON", "LOCATION", "NRP"})
+
+
+def _classify_window_language(
+    text: str,
+    start: int,
+    end: int,
+    window_chars: int = 30,
+) -> Literal["hr", "en"]:
+    """Classify the language of the local text window surrounding a detection span.
+
+    Counts HR vs EN marker matches in text[start-window_chars : end+window_chars].
+    On tie (equal counts or no markers at all), returns 'hr' — deployment region
+    default per Task 3.3 pre-locked decision Q4.
+
+    Window is clipped to text boundaries to avoid index underflow/overflow.
+    """
+    window_start = max(0, start - window_chars)
+    window_end = min(len(text), end + window_chars)
+    window = text[window_start:window_end]
+
+    hr_count = len(_HR_MARKERS.findall(window))
+    en_count = len(_EN_MARKERS.findall(window))
+
+    return "en" if en_count > hr_count else "hr"
 
 
 def restore_text(
@@ -1303,10 +1349,20 @@ class PostgresThreadVault:
 # ---------------------------------------------------------------------------
 
 
-# Built-in Presidio recognizers that conflict with our custom HR set or
-# generate false positives on Croatian text. Removed at startup.
-_DISABLED_BUILTIN_RECOGNIZERS: tuple[str, ...] = (
+# Built-in Presidio recognizers disabled per language registry.
+# HR: IbanRecognizer conflicts with our HRIBANRecognizer; the others produce
+#     noisy false positives on Croatian text.
+# EN: IbanRecognizer is intentionally kept active — covers DE/FR/ES/IT IBANs
+#     that our country-specific custom recognizers do not handle. Our custom
+#     IE/RO/GB IBAN recognizers (duplicated in EN registry) have checksum
+#     validation and win overlap resolution on their own spans.
+_DISABLED_BUILTIN_RECOGNIZERS_HR: tuple[str, ...] = (
     "IbanRecognizer",
+    "UrlRecognizer",
+    "OrganizationRecognizer",
+    "MedicalLicenseRecognizer",
+)
+_DISABLED_BUILTIN_RECOGNIZERS_EN: tuple[str, ...] = (
     "UrlRecognizer",
     "OrganizationRecognizer",
     "MedicalLicenseRecognizer",
@@ -1346,6 +1402,63 @@ def _get_message_text_for_precheck(msg: dict[str, Any]) -> str:
     return ""
 
 
+def _merge_dedupe_detections(
+    hr_results: list[RecognizerResult],
+    en_results: list[RecognizerResult],
+    text: str,
+) -> tuple[list[RecognizerResult], int]:
+    """Concatenate HR + EN detections; filter NER detections by window language; deduplicate.
+
+    Filter step (Task 3.3): for each detection whose entity_type is in
+    _NER_ENTITY_TYPES (PERSON, LOCATION, NRP, DATE_TIME), the ±30-char window
+    around the span is classified as 'hr' or 'en'. If the window language does
+    not match the detection's source analyzer, the detection is dropped and its
+    count is added to the returned spillover_dropped counter. Regex-based entity
+    types are never filtered — they are language-agnostic.
+
+    Dedupe rule (Task 3.2, unchanged): when two RecognizerResults share the same
+    span and entity type, keep the one with the higher score. On tie, keep the HR
+    one (stable order: HR results come first in the concatenation).
+
+    Returns:
+        (merged_list, ner_spillover_dropped_count) — the count is logged by
+        inlet as ner_spillover_dropped=%d (AC 3.3.13).
+    """
+    spillover_dropped = 0
+
+    hr_filtered: list[RecognizerResult] = []
+    for det in hr_results:
+        if (
+            det.entity_type in _NER_ENTITY_TYPES
+            and _classify_window_language(text, det.start, det.end) != "hr"
+        ):
+            spillover_dropped += 1
+            continue
+        hr_filtered.append(det)
+
+    en_filtered: list[RecognizerResult] = []
+    for det in en_results:
+        if (
+            det.entity_type in _NER_ENTITY_TYPES
+            and _classify_window_language(text, det.start, det.end) != "en"
+        ):
+            spillover_dropped += 1
+            continue
+        en_filtered.append(det)
+
+    merged: dict[tuple[int, int, str], RecognizerResult] = {}
+    for det in hr_filtered:
+        key = (det.start, det.end, det.entity_type)
+        merged[key] = det
+    for det in en_filtered:
+        key = (det.start, det.end, det.entity_type)
+        existing = merged.get(key)
+        if existing is None or det.score > existing.score:
+            merged[key] = det
+
+    return list(merged.values()), spillover_dropped
+
+
 class Pipeline:
     """PII Filter pipeline — Keeper AI Gateway.
 
@@ -1380,7 +1493,15 @@ class Pipeline:
         pipelines: list[str] = ["*"]
         priority: int = 0
         enabled: bool = True
-        languages: list[str] = ["hr"]
+        languages: list[str] = Field(
+            default_factory=lambda: ["hr", "en"],
+            description=(
+                "Active detection languages. Allowed values: 'hr', 'en'. "
+                "Configurable via PII_FILTER_LANGUAGES env var "
+                '(JSON array: \'["hr","en"]\' or comma-separated: "hr,en"). '
+                "Validation occurs at on_startup; unsupported codes raise RuntimeError."
+            ),
+        )
         # Behavior when the analyzer (or the Redis vault) fails mid-request.
         #   "block" (default) — fail-closed: raise so the request never
         #     reaches the LLM unfiltered. GDPR-safe; recommended for prod.
@@ -1498,11 +1619,38 @@ class Pipeline:
                 "success",
                 "failed",
                 "pending",
+                # Task 3.3: Croatian label words and pronoun phrases.
+                # Window filter drops most EN-sourced spillover; deny-list
+                # catches residual HR-NER noise (HR model detects these in
+                # HR-dominant text, so they pass the window filter but should
+                # never enter the vault as PII spans).
+                "moj oib",
+                "moja oib",
+                "moj jmbg",
+                "moja jmbg",
+                "moj iban",
+                "moja iban",
+                "moj email",
+                "moja email",
+                "moja mail",
+                "moj telefon",
+                "moj mobitel",
+                "moja adresa",
+                "moj broj",
+                "email",
+                "mail",
+                "adresa",
+                "broj",
+                "oib",
+                "jmbg",
+                "iban",
+                "ime",
+                "prezime",
             ],
             description=(
                 "Lowercase, exact-match denylist for PERSON entities. "
                 "Useful for suppressing spaCy false positives on common "
-                "English/code keywords. Configurable via "
+                "English/code keywords and Croatian label words. Configurable via "
                 "PII_FILTER_NER_DENY_LIST env var."
             ),
         )
@@ -1626,7 +1774,6 @@ class Pipeline:
         "PERSON": "PERSON",
         "EMAIL_ADDRESS": "EMAIL",
         "PHONE_NUMBER": "PHONE",
-        "DATE_TIME": "DATE",
         "CREDIT_CARD": "CREDIT_CARD",
         "HR_OIB": "HR_OIB",
         "HR_JMBG": "HR_JMBG",
@@ -1640,6 +1787,8 @@ class Pipeline:
         "GB_IBAN": "GB_IBAN",
         "US_SSN": "US_SSN",
         "US_EIN": "US_EIN",
+        "UK_NHS": "UK_NHS",
+        "IBAN_CODE": "IBAN_CODE",
     }
 
     def __init__(self) -> None:
@@ -1657,7 +1806,8 @@ class Pipeline:
         # on `vault_backend`). No manual env-var plumbing needed here.
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
-        self.analyzer: AnalyzerEngine | None = None
+        self.analyzer_hr: AnalyzerEngine | None = None
+        self.analyzer_en: AnalyzerEngine | None = None
         # The vault is built in `on_startup` from the current valves so
         # admin-edited backend settings take effect on Pipelines restart.
         # The selector logic in `on_startup` picks `ThreadVault` (Redis) or
@@ -1668,80 +1818,120 @@ class Pipeline:
 
         logger.info("PII Filter pipeline initialized (analyzer not loaded yet)")
 
-    async def on_startup(self) -> None:
-        """Load spaCy HR model, build AnalyzerEngine, register recognizers, warm up."""
-        logger.info("PII Filter on_startup: loading spaCy HR model + Presidio analyzer")
+    def _build_analyzer(self, lang_code: str) -> AnalyzerEngine:
+        """Build a single-language AnalyzerEngine with all relevant recognizers.
 
-        # Hard requirement: hr_core_news_lg. No EN fallback (spec AC #4).
-        # Use the per-process cache so a second startup in the same interpreter
-        # (test reruns, fixture teardown + new Pipeline) doesn't re-allocate
-        # the ~240 MB word vector block.
+        Custom recognizers are registered for both 'hr' and 'en' (duplicated
+        per spec §2 Q5) so that cross-language entities (e.g. a Croatian OIB
+        mentioned in an English sentence) are caught regardless of which
+        analyzer runs first.
+
+        EN-only built-ins (NhsRecognizer, UsSsnRecognizer, EmailRecognizer,
+        PhoneRecognizer, IbanRecognizer) are auto-registered by Presidio for
+        'en' and remain active. For 'hr', only language-neutral built-ins
+        (Email, Phone, Crypto, Date, etc.) are auto-registered; IbanRecognizer
+        is disabled there to prevent conflicts with our custom HRIBANRecognizer.
+        """
+        model_name = {"hr": "hr_core_news_lg", "en": "en_core_web_lg"}[lang_code]
         global _nlp_engine_cache
-        try:
-            if _nlp_engine_cache is None:
-                # `labels_to_ignore` drops MISC and the catch-all "O" tag at
-                # the spaCy NER stage so they never reach Presidio's mapper.
-                # This silences the noisy "MISC is not registered with the
-                # Presidio entity mapping" warnings on Croatian text and
-                # keeps detections to the entity types we actually mask.
-                _nlp_engine_cache = NlpEngineProvider(
+        if lang_code not in _nlp_engine_cache:
+            try:
+                _nlp_engine_cache[lang_code] = NlpEngineProvider(
                     nlp_configuration={
                         "nlp_engine_name": "spacy",
-                        "models": [{"lang_code": "hr", "model_name": "hr_core_news_lg"}],
+                        "models": [{"lang_code": lang_code, "model_name": model_name}],
                         "ner_model_configuration": {
+                            # Drop MISC and catch-all "O" at the spaCy NER stage
+                            # so they never reach Presidio's entity mapper.
                             "labels_to_ignore": ["MISC", "O"],
                         },
                     }
                 ).create_engine()
-            nlp_engine = _nlp_engine_cache
-        except Exception as exc:
-            logger.error(
-                "Failed to load spaCy 'hr_core_news_lg' NLP engine: %s. "
-                "If the model is not installed, install it via the wheel URL in "
-                "requirements.txt or run: python -m spacy download hr_core_news_lg. "
-                "Other causes can include insufficient memory (the model loads "
-                "~240 MB of word vectors as a contiguous block), a broken install, "
-                "or a spaCy major-version mismatch. "
-                "This pipeline requires the Croatian language model and will not "
-                "start without it.",
-                exc,
-            )
-            raise RuntimeError("Required spaCy model 'hr_core_news_lg' is unavailable") from exc
+            except Exception as exc:
+                logger.error(
+                    "Failed to load spaCy %r NLP engine: %s. "
+                    "Install via the wheel URL in requirements or run: "
+                    "python -m spacy download %s",
+                    model_name,
+                    exc,
+                    model_name,
+                )
+                raise RuntimeError(f"Required spaCy model {model_name!r} is unavailable") from exc
+
+        nlp_engine = _nlp_engine_cache[lang_code]
 
         analyzer = AnalyzerEngine(
             nlp_engine=nlp_engine,
-            supported_languages=[LANG],
+            supported_languages=[lang_code],
         )
 
-        # Disable built-in recognizers that conflict with our HR custom set
-        # or produce noisy FPs on Croatian text. Tolerate missing names —
-        # Presidio defaults vary across versions.
-        for rec_name in _DISABLED_BUILTIN_RECOGNIZERS:
+        disabled = (
+            _DISABLED_BUILTIN_RECOGNIZERS_HR
+            if lang_code == "hr"
+            else _DISABLED_BUILTIN_RECOGNIZERS_EN
+        )
+        for rec_name in disabled:
             try:
                 analyzer.registry.remove_recognizer(rec_name)
             except Exception as exc:
-                logger.warning("Could not remove built-in recognizer %r: %s", rec_name, exc)
+                logger.warning(
+                    "Could not remove built-in recognizer %r from %s registry: %s",
+                    rec_name,
+                    lang_code,
+                    exc,
+                )
 
-        # Register the 12 custom recognizers + built-in CreditCardRecognizer
-        # under HR. CreditCardRecognizer is built-in but defaults to "en" only.
-        analyzer.registry.add_recognizer(OIBRecognizer())
-        analyzer.registry.add_recognizer(JMBGRecognizer())
-        analyzer.registry.add_recognizer(HRIBANRecognizer())
-        analyzer.registry.add_recognizer(IEPPSNRecognizer())
-        analyzer.registry.add_recognizer(ROCNPRecognizer())
-        analyzer.registry.add_recognizer(UKNINORecognizer())
-        analyzer.registry.add_recognizer(UKUTRRecognizer())
-        analyzer.registry.add_recognizer(USSSNRecognizer())
-        analyzer.registry.add_recognizer(USEINRecognizer())
-        analyzer.registry.add_recognizer(make_iban_recognizer("IE", 18, "IE_IBAN"))
-        analyzer.registry.add_recognizer(make_iban_recognizer("RO", 20, "RO_IBAN"))
-        analyzer.registry.add_recognizer(make_iban_recognizer("GB", 18, "GB_IBAN"))
-        analyzer.registry.add_recognizer(CreditCardRecognizer(supported_language=LANG))
+        # All 12 custom recognizers duplicated in both registries (spec §2 Q5).
+        analyzer.registry.add_recognizer(OIBRecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(JMBGRecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(HRIBANRecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(IEPPSNRecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(ROCNPRecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(UKNINORecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(UKUTRRecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(USSSNRecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(USEINRecognizer(supported_language=lang_code))
+        analyzer.registry.add_recognizer(
+            make_iban_recognizer("IE", 18, "IE_IBAN", supported_language=lang_code)
+        )
+        analyzer.registry.add_recognizer(
+            make_iban_recognizer("RO", 20, "RO_IBAN", supported_language=lang_code)
+        )
+        analyzer.registry.add_recognizer(
+            make_iban_recognizer("GB", 18, "GB_IBAN", supported_language=lang_code)
+        )
+        # CreditCardRecognizer is auto-registered only for 'en'; add it
+        # explicitly for 'hr' so credit card detection works in HR-only mode.
+        if lang_code == "hr":
+            analyzer.registry.add_recognizer(CreditCardRecognizer(supported_language=lang_code))
 
-        # Warmup: force lazy spaCy + recognizer init now, not on first request.
-        analyzer.analyze(text="warmup", language=LANG, entities=None)
+        analyzer.analyze(text="warmup", language=lang_code, entities=None)
+        return analyzer
 
-        self.analyzer = analyzer
+    async def on_startup(self) -> None:
+        """Validate language config, build per-language AnalyzerEngines, wire vault."""
+        languages = self.valves.languages
+        if not languages:
+            raise RuntimeError(
+                "valves.languages is empty; at least one of 'hr' or 'en' is required."
+            )
+        invalid = [lang for lang in languages if lang not in {"hr", "en"}]
+        if invalid:
+            raise RuntimeError(
+                f"Unsupported language(s): {invalid}. Allowed: hr, en. "
+                "Multi-language detection in Task 3.2 supports only Croatian and English."
+            )
+
+        logger.info("PII Filter on_startup: building analyzers for languages=%s", languages)
+
+        self.analyzer_hr = self._build_analyzer("hr") if "hr" in languages else None
+        self.analyzer_en = self._build_analyzer("en") if "en" in languages else None
+
+        logger.info(
+            "PII Filter on_startup: analyzers ready (hr=%s, en=%s)",
+            self.analyzer_hr is not None,
+            self.analyzer_en is not None,
+        )
 
         # Build the vault from the current valves. Backend is selected by
         # `valves.vault_backend`. For Postgres, `initialize()` opens the
@@ -1768,8 +1958,7 @@ class Pipeline:
             )
             await self.vault.initialize()
             logger.info(
-                "PII Filter on_startup complete: 12 custom + CreditCard recognizers "
-                "registered; PostgresThreadVault wired "
+                "PII Filter on_startup complete: PostgresThreadVault wired "
                 "(pool_min=%d, pool_max=%d, command_timeout_ms=%d)",
                 self.valves.postgres_pool_min,
                 self.valves.postgres_pool_max,
@@ -1798,8 +1987,7 @@ class Pipeline:
                 ephemeral_ttl_seconds=self.valves.ephemeral_ttl_seconds,
             )
             logger.info(
-                "PII Filter on_startup complete: 12 custom + CreditCard recognizers "
-                "registered; ThreadVault wired (redis_enabled=%s, url=%s)",
+                "PII Filter on_startup complete: ThreadVault wired (redis_enabled=%s, url=%s)",
                 self.valves.redis_enabled,
                 self.valves.redis_url,
             )
@@ -1824,7 +2012,8 @@ class Pipeline:
     async def on_shutdown(self) -> None:
         """Called when Pipelines container stops."""
         logger.info("PII Filter on_shutdown")
-        self.analyzer = None
+        self.analyzer_hr = None
+        self.analyzer_en = None
         if self.vault is not None:
             await self.vault.aclose()
             self.vault = None
@@ -1914,7 +2103,34 @@ class Pipeline:
         if not self.valves.enabled:
             return body
 
-        if self.analyzer is None:
+        # Task 3.2/3.3 OpenWebUI integration: skip background tasks.
+        # OpenWebUI sends embedded chat history as user content for
+        # title/tags/follow-up generation, which would produce false-positive
+        # PII detections on assistant content inside the embedded history.
+        # Background tasks are identified by metadata["task"] key
+        # (e.g., "title_generation", "tags_generation", "follow_up_generation").
+        # The original user message has already been processed by the primary
+        # inlet call; outlet will still restore placeholders in task responses.
+        metadata = body.get("metadata")
+        if isinstance(metadata, dict):
+            task = metadata.get("task")
+            if task:
+                logger.info(
+                    "inlet: skipping OpenWebUI background task '%s' "
+                    "(chat_id=%s, body_size=%d chars)",
+                    task,
+                    metadata.get("chat_id"),
+                    sum(
+                        len(str(m.get("content", "")))
+                        for m in body.get("messages", [])
+                        if isinstance(m, dict)
+                    )
+                    if isinstance(body.get("messages"), list)
+                    else 0,
+                )
+                return body
+
+        if self.analyzer_hr is None and self.analyzer_en is None:
             logger.warning("inlet called before on_startup completed; returning body unchanged")
             return body
 
@@ -1985,6 +2201,7 @@ class Pipeline:
         forward_map: dict[str, str] = {}
         reverse_map: dict[str, str] = {}
         all_enriched: list[dict[str, Any]] = []
+        total_spillover_dropped: int = 0
 
         if use_vault:
             assert self.vault is not None  # for mypy
@@ -2034,7 +2251,20 @@ class Pipeline:
                     continue
 
                 for text, write_back in parts:
-                    results = self.analyzer.analyze(text=text, language=LANG)
+                    hr_results: list[RecognizerResult] = (
+                        self.analyzer_hr.analyze(text=text, language="hr")
+                        if self.analyzer_hr is not None
+                        else []
+                    )
+                    en_results: list[RecognizerResult] = (
+                        self.analyzer_en.analyze(text=text, language="en")
+                        if self.analyzer_en is not None
+                        else []
+                    )
+                    results, spillover_count = _merge_dedupe_detections(
+                        hr_results, en_results, text
+                    )
+                    total_spillover_dropped += spillover_count
                     accepted = _select_accepted_detections(
                         text,
                         results,
@@ -2137,10 +2367,16 @@ class Pipeline:
         metadata["pii_reverse_map"] = reverse_map
 
         vault_state = ("ephemeral" if raw_chat_id is None else "on") if use_vault else "off"
+        languages_active = ",".join(
+            lang
+            for lang, an in (("hr", self.analyzer_hr), ("en", self.analyzer_en))
+            if an is not None
+        )
         logger.info(
             "pii_filter inlet processed: chat_id=%s thread_id=%s "
             "messages_processed=%d messages_skipped_already_masked=%d "
-            "detections=%d masked=%d vault=%s backend=%s",
+            "detections=%d masked=%d vault=%s backend=%s languages_active=%s "
+            "ner_spillover_dropped=%d",
             raw_chat_id,
             thread_id,
             messages_processed,
@@ -2149,6 +2385,8 @@ class Pipeline:
             len(forward_map),
             vault_state,
             self.valves.vault_backend,
+            languages_active,
+            total_spillover_dropped,
         )
 
         return body

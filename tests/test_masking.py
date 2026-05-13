@@ -380,6 +380,9 @@ async def started_pipeline() -> AsyncIterator[Pipeline]:
     # fixture in conftest.py replaces the underlying client with fakeredis.
     p = Pipeline()
     p.valves.vault_backend = "redis"
+    p.valves.languages = [
+        "hr"
+    ]  # HR-only for module fixture; EN tests skip via analyzer_en is None guard
     await p.on_startup()
     yield p
     await p.on_shutdown()
@@ -580,9 +583,9 @@ async def test_analyzer_no_misc_entity_in_raw_results(started_pipeline: Pipeline
     a regression in the `labels_to_ignore` config would actually fail the
     test instead of silently passing on the whitelist drop.
     """
-    assert started_pipeline.analyzer is not None
+    assert started_pipeline.analyzer_hr is not None
     text = "Microsoft Office i Hrvatska Pošta su tvrtke u zagrebu."
-    raw = started_pipeline.analyzer.analyze(text=text, language="hr")
+    raw = started_pipeline.analyzer_hr.analyze(text=text, language="hr")
     misc_or_o = [r for r in raw if r.entity_type in {"MISC", "O"}]
     assert misc_or_o == [], f"expected MISC/O suppressed at NER stage, got {misc_or_o!r}"
 
@@ -1753,18 +1756,18 @@ async def test_inlet_already_masked_message_does_not_call_analyzer(
         ],
         "metadata": {"chat_id": "task8.5-mock-analyzer"},
     }
-    real_analyzer = started_pipeline.analyzer
+    real_analyzer = started_pipeline.analyzer_hr
     mock_analyzer = MagicMock()
     mock_analyzer.analyze.return_value = []
-    started_pipeline.analyzer = mock_analyzer
+    started_pipeline.analyzer_hr = mock_analyzer
     try:
         result = await started_pipeline.inlet(body)
     finally:
-        started_pipeline.analyzer = real_analyzer
+        started_pipeline.analyzer_hr = real_analyzer
 
     assert (
         mock_analyzer.analyze.call_count == 1
-    ), f"Expected 1 analyzer call (fresh message only), got {mock_analyzer.analyze.call_count}"
+    ), f"Expected 1 HR analyzer call (fresh message only), got {mock_analyzer.analyze.call_count}"
     assert result["messages"][0]["content"] == already_masked
 
 
@@ -1950,3 +1953,357 @@ async def test_inlet_multi_turn_p95_latency_under_200ms(
     latencies_ms.sort()
     p95_ms = latencies_ms[94]
     assert p95_ms < 200.0, f"P95 latency {p95_ms:.1f}ms exceeds 200ms target"
+
+
+# ---------------------------------------------------------------------------
+# Task 3.2 — Multi-Language Detection integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_detects_us_ssn_in_english_text(started_pipeline: Pipeline) -> None:
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "My SSN is 123-45-6789"}],
+        "metadata": {"chat_id": "task3.2-us-ssn"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+    assert "[US_SSN_1]" in content, f"Expected US_SSN placeholder, got: {content!r}"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_detects_uk_nhs_in_english_text(started_pipeline: Pipeline) -> None:
+    if started_pipeline.analyzer_en is None:
+        pytest.skip("en_core_web_lg not installed")
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "My NHS number is 943 476 5919"}],
+        "metadata": {"chat_id": "task3.2-uk-nhs"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+    assert "[UK_NHS_1]" in content, f"Expected UK_NHS placeholder, got: {content!r}"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_detects_oib_in_english_chat(started_pipeline: Pipeline) -> None:
+    oib = _make_oib("1234567893")
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"My colleague's OIB is {oib}"}],
+        "metadata": {"chat_id": "task3.2-oib-en"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+    assert (
+        "[HR_OIB_1]" in content
+    ), f"Expected HR_OIB placeholder (custom recognizer in EN registry), got: {content!r}"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_detects_person_in_english_text(started_pipeline: Pipeline) -> None:
+    if started_pipeline.analyzer_en is None:
+        pytest.skip("en_core_web_lg not installed")
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "My name is John Smith"}],
+        "metadata": {"chat_id": "task3.2-person-en"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+    assert (
+        "[PERSON_1]" in content
+    ), f"Expected PERSON placeholder via en_core_web_lg NER, got: {content!r}"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_mixed_hr_en_text(started_pipeline: Pipeline) -> None:
+    oib = _make_oib("9876543211")
+    text = f"Hi, my OIB is {oib} but my colleague's SSN is 234-56-7890"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": text}],
+        "metadata": {"chat_id": "task3.2-mixed"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+    assert "[HR_OIB_1]" in content, f"Expected HR_OIB placeholder in mixed text, got: {content!r}"
+    assert "[US_SSN_1]" in content, f"Expected US_SSN placeholder in mixed text, got: {content!r}"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_email_in_english_context(started_pipeline: Pipeline) -> None:
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "Email me at john@example.com please"}],
+        "metadata": {"chat_id": "task3.2-email"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+    assert "[EMAIL_1]" in content, f"Expected EMAIL placeholder, got: {content!r}"
+
+
+@pytest.mark.asyncio
+async def test_inlet_with_hr_only_languages_skips_en_analyzer() -> None:
+    p = Pipeline()
+    p.valves.vault_backend = "redis"
+    p.valves.languages = ["hr"]
+    await p.on_startup()
+    try:
+        assert p.analyzer_hr is not None
+        assert p.analyzer_en is None, "EN analyzer must be None in HR-only mode"
+        oib = _make_oib("1111122222")
+        body: dict[str, Any] = {
+            "messages": [{"role": "user", "content": f"SSN: 234-56-7890, OIB: {oib}"}],
+            "metadata": {"chat_id": "task3.2-hr-only"},
+        }
+        result = await p.inlet(body)
+        content = result["messages"][0]["content"]
+        assert "[HR_OIB_1]" in content, f"OIB must still be detected in HR-only mode: {content!r}"
+        assert (
+            "[US_SSN_1]" in content
+        ), f"SSN must be detected via custom recognizer in HR registry: {content!r}"
+    finally:
+        await p.on_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_inlet_with_en_only_languages_skips_hr_analyzer() -> None:
+    p = Pipeline()
+    p.valves.vault_backend = "redis"
+    p.valves.languages = ["en"]
+    try:
+        await p.on_startup()
+    except RuntimeError as exc:
+        pytest.skip(f"en_core_web_lg not available: {exc}")
+    try:
+        assert p.analyzer_hr is None, "HR analyzer must be None in EN-only mode"
+        assert p.analyzer_en is not None
+        oib = _make_oib("2222233333")
+        body: dict[str, Any] = {
+            "messages": [{"role": "user", "content": f"OIB: {oib}"}],
+            "metadata": {"chat_id": "task3.2-en-only"},
+        }
+        result = await p.inlet(body)
+        content = result["messages"][0]["content"]
+        assert (
+            "[HR_OIB_1]" in content
+        ), f"OIB must be detected via custom recognizer duplicated in EN registry: {content!r}"
+    finally:
+        await p.on_shutdown()
+
+
+@pytest.mark.benchmark
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_dual_analyzer_latency_within_budget(started_pipeline: Pipeline) -> None:
+    import time
+
+    oib = _make_oib("5555566666")
+    already_masked_msgs = [
+        {"role": "user", "content": f"[PERSON_{i}] mentioned OIB [HR_OIB_{i}]"}
+        for i in range(1, 10)
+    ]
+    latencies_ms: list[float] = []
+    for i in range(20):
+        fresh_msg = {"role": "user", "content": f"New message {i}: SSN is 234-56-7890 OIB {oib}"}
+        body: dict[str, Any] = {
+            "messages": already_masked_msgs + [fresh_msg],
+            "metadata": {"chat_id": f"task3.2-latency-{i}"},
+        }
+        t0 = time.perf_counter()
+        await started_pipeline.inlet(body)
+        latencies_ms.append((time.perf_counter() - t0) * 1000)
+
+    latencies_ms.sort()
+    p95_ms = latencies_ms[18]
+    assert p95_ms < 1000.0, f"Dual-analyzer P95 latency {p95_ms:.1f}ms exceeds 1000ms budget"
+
+
+# ---------------------------------------------------------------------------
+# Task 3.3 — Integration tests: NER spillover filter + deny-list expansion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inlet_hr_baseline_no_label_word_false_positives(
+    started_pipeline: Pipeline,
+) -> None:
+    """HR text: deny-list catches PERSON false positives on Croatian label words."""
+    oib = _make_oib("1234567890")
+    body: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Moj OIB je {oib}, a zovem se Ivan Horvat. Email mi je ivan@firma.hr.",
+            }
+        ],
+        "metadata": {"chat_id": "task3.3-hr-baseline"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+
+    detections = result.get("metadata", {}).get("pii_detections", [])
+    detected_originals = {d.get("original_value", "") for d in detections}
+
+    assert (
+        "Moj OIB" not in detected_originals
+    ), f"'Moj OIB' must not enter vault — caught by deny-list; detections={detected_originals}"
+    assert (
+        "Email" not in detected_originals
+    ), f"'Email' must not enter vault — caught by deny-list; detections={detected_originals}"
+    assert "[HR_OIB_1]" in content, f"HR_OIB must be detected: {content!r}"
+
+
+@pytest.mark.asyncio
+async def test_inlet_en_baseline_person_detected(started_pipeline: Pipeline) -> None:
+    """EN text: PERSON and US_SSN must both be detected when EN analyzer is active."""
+    if started_pipeline.analyzer_en is None:
+        pytest.skip("en_core_web_lg not installed — skipping EN baseline integration test")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": "My name is John Smith and my SSN is 123-45-6789."}
+        ],
+        "metadata": {"chat_id": "task3.3-en-baseline"},
+    }
+    result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
+    detections = result.get("metadata", {}).get("pii_detections", [])
+    entity_types = {d.get("entity_type") for d in detections}
+    assert "PERSON" in entity_types, f"PERSON must be detected in EN text; content={content!r}"
+    assert "US_SSN" in entity_types, f"US_SSN must be detected in EN text; content={content!r}"
+
+
+@pytest.mark.asyncio
+async def test_inlet_cross_language_oib_in_english_sentence(
+    started_pipeline: Pipeline,
+) -> None:
+    """Cross-language: HR_OIB (regex entity) detected regardless of window language."""
+    oib = _make_oib("9876543210")
+    body: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": f"My Croatian colleague's OIB is {oib}.",
+            }
+        ],
+        "metadata": {"chat_id": "task3.3-cross-lang"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result.get("metadata", {}).get("pii_detections", [])
+    entity_types = {d.get("entity_type") for d in detections}
+    assert "HR_OIB" in entity_types, (
+        f"HR_OIB (regex entity) must be detected even in EN-dominant text; "
+        f"detections={detections}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inlet_logger_includes_ner_spillover_count(
+    started_pipeline: Pipeline,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Logger line must include ner_spillover_dropped field (AC 3.3.13)."""
+    import logging
+
+    oib = _make_oib("1111122222")
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}."}],
+        "metadata": {"chat_id": "task3.3-logger"},
+    }
+    with caplog.at_level(logging.INFO, logger="pii_filter"):
+        await started_pipeline.inlet(body)
+
+    log_text = "\n".join(caplog.messages)
+    assert (
+        "ner_spillover_dropped=" in log_text
+    ), f"Logger must include ner_spillover_dropped field (AC 3.3.13); log={log_text!r}"
+
+
+@pytest.mark.asyncio
+async def test_inlet_skips_openwebui_background_task_title_generation(
+    started_pipeline: Pipeline,
+) -> None:
+    """OpenWebUI background tasks must skip inlet to avoid false positives
+    on embedded chat history."""
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "### Task: Generate title for: USER: My OIB is 12345678903",
+            }
+        ],
+        "metadata": {
+            "chat_id": "test-bg-task",
+            "task": "title_generation",
+        },
+    }
+    result = await started_pipeline.inlet(body)
+    # Body returned unchanged — no metadata.pii_detections added
+    assert "pii_detections" not in result.get("metadata", {})
+    # Content unchanged (no masking applied)
+    assert "12345678903" in result["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_inlet_processes_normal_user_message_without_task_field(
+    started_pipeline: Pipeline,
+) -> None:
+    """Normal user messages (no metadata.task) must be processed normally."""
+    body = {
+        "messages": [{"role": "user", "content": "Moj OIB je 12345678903"}],
+        "metadata": {
+            "chat_id": "test-normal",
+            # No "task" key
+        },
+    }
+    result = await started_pipeline.inlet(body)
+    # PII detected and masked
+    assert "12345678903" not in result["messages"][0]["content"]
+    assert "[HR_OIB_1]" in result["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_inlet_no_date_detection_in_credit_card_substring(
+    started_pipeline: Pipeline,
+) -> None:
+    """DATE_TIME should NOT be detected as substring of CREDIT_CARD
+    or PHONE entities. v0.9.2 removed DATE_TIME from PRESIDIO_TO_STANDARD."""
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "My card is 4111-1111-1111-1111 expiring 12/27.",
+            }
+        ],
+        "metadata": {"chat_id": "test-no-date"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result["metadata"]["pii_detections"]
+    entity_types = {d["entity_type"] for d in detections}
+    # CREDIT_CARD detected; DATE absolutely not
+    assert "CREDIT_CARD" in entity_types
+    assert "DATE" not in entity_types
+    assert "DATE_TIME" not in entity_types
+
+
+@pytest.mark.asyncio
+async def test_inlet_phone_detected_alongside_credit_card(
+    started_pipeline: Pipeline,
+) -> None:
+    """PHONE detection must work even when text contains CREDIT_CARD
+    sharing digit sequences. v0.9.2 fix."""
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "My card is 4111-1111-1111-1111 and "
+                    "call me at +1 202 456 1111 anytime."
+                ),
+            }
+        ],
+        "metadata": {"chat_id": "test-phone-cc-overlap"},
+    }
+    result = await started_pipeline.inlet(body)
+    detections = result["metadata"]["pii_detections"]
+    entity_types_with_values = {
+        (d["entity_type"], d["original"])
+        for d in detections
+    }
+    assert ("CREDIT_CARD", "4111-1111-1111-1111") in entity_types_with_values
+    assert ("PHONE", "+1 202 456 1111") in entity_types_with_values

@@ -299,6 +299,7 @@ async def started_pipeline_postgres(
     p = Pipeline()
     p.valves.vault_backend = "postgres"
     p.valves.postgres_url = dsn
+    p.valves.languages = ["hr"]  # HR-only for postgres fixture; avoids EN model load
     await p.on_startup()
     try:
         yield p

@@ -63,7 +63,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-v --tb=short -m 'not benchmark'"
+addopts = "-v --tb=short"
 markers = [
     "benchmark: opt-in latency/performance tests (run with -m benchmark)",
 ]
