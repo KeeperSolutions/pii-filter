@@ -2,10 +2,10 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-12
-version: 0.9.1
+date: 2026-05-13
+version: 0.9.2
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP/DATE_TIME detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections.
+description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives.
 requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
 """
 
@@ -523,12 +523,6 @@ def _select_accepted_detections(
             return []
 
     # Step 5: Overlap resolution (unchanged from Task 3 baseline)
-    # TEMP v0.9.2-investigate: log candidates before overlap resolution
-    for _c in candidates:
-        logger.debug(
-            "overlap_candidates entity=%s start=%d end=%d score=%.3f",
-            _c.entity_type, _c.start, _c.end, _c.score,
-        )
     candidates.sort(
         key=lambda d: (
             -d.score,
@@ -698,7 +692,7 @@ _EN_MARKERS: re.Pattern[str] = re.compile(
 # NER entity types subject to the cross-lingual window filter.
 # Regex-based entity types (HR_OIB, US_SSN, EMAIL_ADDRESS, …) are excluded — they are
 # language-agnostic and must never be filtered by window language.
-_NER_ENTITY_TYPES: frozenset[str] = frozenset({"PERSON", "LOCATION", "NRP", "DATE_TIME"})
+_NER_ENTITY_TYPES: frozenset[str] = frozenset({"PERSON", "LOCATION", "NRP"})
 
 
 def _classify_window_language(
@@ -1780,7 +1774,6 @@ class Pipeline:
         "PERSON": "PERSON",
         "EMAIL_ADDRESS": "EMAIL",
         "PHONE_NUMBER": "PHONE",
-        "DATE_TIME": "DATE",
         "CREDIT_CARD": "CREDIT_CARD",
         "HR_OIB": "HR_OIB",
         "HR_JMBG": "HR_JMBG",
