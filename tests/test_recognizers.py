@@ -549,9 +549,10 @@ async def started_pipeline() -> AsyncIterator[Pipeline]:
     """
     p = Pipeline()
     p.valves.vault_backend = "redis"
-    p.valves.languages = [
-        "hr"
-    ]  # HR-only for module fixture; EN tests skip via analyzer_en is None guard
+    # Use default languages (["hr", "en"]) so EN registry tests exercise the
+    # English analyzer path when en_core_web_lg is available.
+    # Tests that require the EN model guard with `if p.analyzer_en is None:
+    # pytest.skip(...)` — that guard still handles environments without the model.
     await p.on_startup()
     yield p
     await p.on_shutdown()

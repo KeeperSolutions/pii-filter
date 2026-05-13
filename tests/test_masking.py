@@ -380,9 +380,11 @@ async def started_pipeline() -> AsyncIterator[Pipeline]:
     # fixture in conftest.py replaces the underlying client with fakeredis.
     p = Pipeline()
     p.valves.vault_backend = "redis"
-    p.valves.languages = [
-        "hr"
-    ]  # HR-only for module fixture; EN tests skip via analyzer_en is None guard
+    # Use default languages (["hr", "en"]) so EN integration tests in this
+    # module exercise the English analyzer path when en_core_web_lg is available.
+    # Tests that require the EN model guard with `if p.analyzer_en is None:
+    # pytest.skip(...)` — that guard still handles environments where the
+    # model is not installed.
     await p.on_startup()
     yield p
     await p.on_shutdown()
@@ -2138,7 +2140,7 @@ async def test_inlet_hr_baseline_no_label_word_false_positives(
     content = result["messages"][0]["content"]
 
     detections = result.get("metadata", {}).get("pii_detections", [])
-    detected_originals = {d.get("original_value", "") for d in detections}
+    detected_originals = {d.get("original", "") for d in detections}
 
     assert (
         "Moj OIB" not in detected_originals
@@ -2292,8 +2294,7 @@ async def test_inlet_phone_detected_alongside_credit_card(
             {
                 "role": "user",
                 "content": (
-                    "My card is 4111-1111-1111-1111 and "
-                    "call me at +1 202 456 1111 anytime."
+                    "My card is 4111-1111-1111-1111 and " "call me at +1 202 456 1111 anytime."
                 ),
             }
         ],
@@ -2301,9 +2302,6 @@ async def test_inlet_phone_detected_alongside_credit_card(
     }
     result = await started_pipeline.inlet(body)
     detections = result["metadata"]["pii_detections"]
-    entity_types_with_values = {
-        (d["entity_type"], d["original"])
-        for d in detections
-    }
+    entity_types_with_values = {(d["entity_type"], d["original"]) for d in detections}
     assert ("CREDIT_CARD", "4111-1111-1111-1111") in entity_types_with_values
     assert ("PHONE", "+1 202 456 1111") in entity_types_with_values

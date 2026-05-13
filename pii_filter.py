@@ -1410,7 +1410,7 @@ def _merge_dedupe_detections(
     """Concatenate HR + EN detections; filter NER detections by window language; deduplicate.
 
     Filter step (Task 3.3): for each detection whose entity_type is in
-    _NER_ENTITY_TYPES (PERSON, LOCATION, NRP, DATE_TIME), the ±30-char window
+    _NER_ENTITY_TYPES (PERSON, LOCATION, NRP), the ±30-char window
     around the span is classified as 'hr' or 'en'. If the window language does
     not match the detection's source analyzer, the detection is dropped and its
     count is added to the returned spillover_dropped counter. Regex-based entity
