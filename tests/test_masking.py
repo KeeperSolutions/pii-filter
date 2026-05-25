@@ -8,6 +8,7 @@ fixture defined below.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -2305,3 +2306,152 @@ async def test_inlet_phone_detected_alongside_credit_card(
     entity_types_with_values = {(d["entity_type"], d["original"]) for d in detections}
     assert ("CREDIT_CARD", "4111-1111-1111-1111") in entity_types_with_values
     assert ("PHONE", "+1 202 456 1111") in entity_types_with_values
+
+
+# ---------------------------------------------------------------------------
+# Task 8 — UserValves wiring + Valves.presidio_enabled (integration)
+# ---------------------------------------------------------------------------
+#
+# These tests share the module-scoped `started_pipeline`, so each one is
+# careful to restore the toggles to their defaults in a `try/finally` block.
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_user_disabled_full_path(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """End-to-end: user opt-out → raw PII delivered to LLM, no metadata
+    written, no vault entries created for this chat_id (AC 8.2, 8.3).
+    """
+    oib = _make_oib("1234567890")
+    chat_id = "ch_user_disabled_full"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}"}],
+        "metadata": {"chat_id": chat_id},
+    }
+    try:
+        started_pipeline.user_valves = Pipeline.UserValves(pii_masking_enabled=False)
+        with caplog.at_level(logging.INFO, logger="pii_filter"):
+            result = await started_pipeline.inlet(body, user={"id": "user_42"})
+
+        # Raw OIB still in the body — analyzer did not run.
+        assert oib in result["messages"][-1]["content"]
+        # No detection metadata added.
+        assert "pii_placeholder_map" not in result["metadata"]
+        assert "pii_reverse_map" not in result["metadata"]
+        assert "pii_detections" not in result["metadata"]
+        # Vault not touched — no entries exist for this chat_id.
+        assert started_pipeline.vault is not None
+        forward, reverse = await started_pipeline.vault.snapshot_for_request(chat_id)
+        assert forward == {}
+        assert reverse == {}
+        # Audit log emitted.
+        user_disabled_logs = [r for r in caplog.records if "user_disabled" in r.getMessage()]
+        assert len(user_disabled_logs) == 1
+        assert f"chat_id={chat_id}" in user_disabled_logs[0].getMessage()
+    finally:
+        started_pipeline.user_valves = Pipeline.UserValves()
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_presidio_disabled_full_path(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """End-to-end: admin presidio kill → raw PII delivered to LLM, but
+    metadata keys are present (empty when no prior vault state) and the
+    `presidio_disabled` audit line is emitted (AC 8.8).
+    """
+    oib = _make_oib("2223334440")
+    chat_id = "ch_presidio_disabled_full"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}"}],
+        "metadata": {"chat_id": chat_id},
+    }
+    try:
+        started_pipeline.valves.presidio_enabled = False
+        with caplog.at_level(logging.INFO, logger="pii_filter"):
+            result = await started_pipeline.inlet(body, user={"id": "user_42"})
+
+        # Raw OIB still in the body — analyzer skipped.
+        assert oib in result["messages"][-1]["content"]
+        # Metadata keys present for outlet symmetry, but empty (no prior state).
+        assert result["metadata"]["pii_placeholder_map"] == {}
+        assert result["metadata"]["pii_reverse_map"] == {}
+        # presidio_disabled audit + summary lines emitted.
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(f"presidio_disabled: chat_id={chat_id}" in m for m in messages)
+        assert any("presidio_disabled=True" in m for m in messages)
+    finally:
+        started_pipeline.valves.presidio_enabled = True
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_presidio_disabled_still_writes_vault_snapshot(
+    started_pipeline: Pipeline,
+) -> None:
+    """Pre-existing vault entries (from an earlier normal-path turn) must
+    surface in metadata when `presidio_enabled` is later flipped off, so
+    outlet can restore history placeholders (decision #4 / §2.1, AC 8.8).
+    """
+    oib = _make_oib("3334445550")
+    chat_id = "ch_presidio_snapshot_carry"
+
+    # Turn 1: normal path populates vault.
+    body_turn1: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}"}],
+        "metadata": {"chat_id": chat_id},
+    }
+    result_turn1 = await started_pipeline.inlet(body_turn1)
+    assert "[HR_OIB_1]" in result_turn1["messages"][-1]["content"]
+    snapshot_after_t1 = result_turn1["metadata"]["pii_placeholder_map"]
+    assert snapshot_after_t1[oib] == "[HR_OIB_1]"
+
+    # Turn 2: presidio_disabled — must still surface the same forward/reverse maps.
+    try:
+        started_pipeline.valves.presidio_enabled = False
+        body_turn2: dict[str, Any] = {
+            "messages": [{"role": "user", "content": "Followup question."}],
+            "metadata": {"chat_id": chat_id},
+        }
+        result_turn2 = await started_pipeline.inlet(body_turn2)
+
+        assert result_turn2["metadata"]["pii_placeholder_map"][oib] == "[HR_OIB_1]"
+        assert result_turn2["metadata"]["pii_reverse_map"]["[HR_OIB_1]"] == oib
+        # Followup not masked (analyzer never ran).
+        assert result_turn2["messages"][-1]["content"] == "Followup question."
+    finally:
+        started_pipeline.valves.presidio_enabled = True
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_user_disabled_takes_precedence_over_presidio_disabled(
+    started_pipeline: Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When both toggles are off, the user toggle wins (it is first in
+    the early-return chain). No vault snapshot is pulled and no
+    `presidio_disabled` log is emitted (AC 8.9, decision #8).
+    """
+    oib = _make_oib("4445556660")
+    chat_id = "ch_user_wins_over_presidio"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"Moj OIB je {oib}"}],
+        "metadata": {"chat_id": chat_id},
+    }
+    try:
+        started_pipeline.user_valves = Pipeline.UserValves(pii_masking_enabled=False)
+        started_pipeline.valves.presidio_enabled = False
+        with caplog.at_level(logging.INFO, logger="pii_filter"):
+            result = await started_pipeline.inlet(body, user={"id": "user_42"})
+
+        # Body untouched — user opt-out won.
+        assert oib in result["messages"][-1]["content"]
+        # No metadata written (the user-disabled branch returns before the
+        # presidio_disabled branch would have written empty maps).
+        assert "pii_placeholder_map" not in result["metadata"]
+        # Only the user_disabled log line — no presidio_disabled line.
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("user_disabled" in m for m in messages)
+        assert not any("presidio_disabled: chat_id" in m for m in messages)
+    finally:
+        started_pipeline.user_valves = Pipeline.UserValves()
+        started_pipeline.valves.presidio_enabled = True

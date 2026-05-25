@@ -2,10 +2,10 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-13
-version: 0.9.2
+date: 2026-05-25
+version: 0.9.3
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives.
+description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives. v0.9.3 (Task 8) wires the previously-stubbed `UserValves.pii_masking_enabled` per-user toggle into `inlet` (early return on opt-out, no vault touch, audit INFO log) and adds the admin-level `Valves.presidio_enabled` kill switch (runtime guard: skips analyzer/masking but still pulls vault snapshot for outlet restoration symmetry). `outlet` and `on_startup` are unchanged.
 requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
 """
 
@@ -1493,6 +1493,19 @@ class Pipeline:
         pipelines: list[str] = ["*"]
         priority: int = 0
         enabled: bool = True
+        # ---- Task 8: Presidio detection kill switch ------------------------
+        # Admin-level kill switch for the Presidio detection layer. When
+        # False, `inlet` skips the analyzer + masking loop but still pulls
+        # the vault snapshot so already-vaulted history placeholders remain
+        # restorable by `outlet` (decision #4 / §2.1). Analyzers are still
+        # instantiated by `on_startup` regardless of this flag (decision
+        # #2 — runtime guard, not on_startup skip — so toggling does not
+        # require a container restart). Use cases: incident response when
+        # Presidio is crashing; "audit-only mode" where requests reach the
+        # LLM unmodified while existing vault snapshots can still be
+        # surfaced for `outlet` restoration symmetry. Configurable via the
+        # `PII_FILTER_PRESIDIO_ENABLED` env var.
+        presidio_enabled: bool = True
         languages: list[str] = Field(
             default_factory=lambda: ["hr", "en"],
             description=(
@@ -2103,6 +2116,80 @@ class Pipeline:
         if not self.valves.enabled:
             return body
 
+        # ---- Task 8: UserValves per-user toggle (early return) ------------
+        # If the user has opted out via `UserValves.pii_masking_enabled=False`,
+        # short-circuit the entire inlet pipeline: no vault snapshot, no
+        # analyzer, no metadata writes. `outlet` stays ungated (decision #3),
+        # so any pre-existing vault placeholders from prior turns are still
+        # restored if/when the user re-enables the toggle. Audit emitted as
+        # a single INFO line per request (decision #5).
+        if not self.user_valves.pii_masking_enabled:
+            user_id = (user or {}).get("id", "unknown")
+            raw_chat_id_user, _ = self._resolve_chat_id(body)
+            logger.info(
+                "pii_filter inlet user_disabled: user_id=%s chat_id=%s",
+                user_id,
+                raw_chat_id_user,
+            )
+            return body
+
+        # ---- Task 8: Admin Presidio kill switch (audit-only mode) ---------
+        # If the admin has disabled Presidio via `Valves.presidio_enabled=False`,
+        # skip the analyzer + masking loop but still pull the vault snapshot
+        # so `outlet` can restore history placeholders that were vaulted
+        # before the flip (decision #4 / §2.1). Body mutation is limited to
+        # `metadata.pii_placeholder_map` / `pii_reverse_map`, mirroring the
+        # normal path's outlet contract. Vault snapshot failure is logged
+        # and swallowed — the request still reaches the LLM (we are already
+        # in a degraded mode; blocking here would defeat the purpose of an
+        # admin kill switch).
+        if not self.valves.presidio_enabled:
+            raw_chat_id_pd, thread_id_pd = self._resolve_chat_id(body)
+            logger.info(
+                "pii_filter inlet presidio_disabled: chat_id=%s",
+                raw_chat_id_pd,
+            )
+            forward_map_pd: dict[str, str] = {}
+            reverse_map_pd: dict[str, str] = {}
+            vault_state_pd = "off"
+            if self.vault is not None and self.valves.vault_enabled:
+                try:
+                    forward_map_pd, reverse_map_pd = await self.vault.snapshot_for_request(
+                        thread_id_pd
+                    )
+                    vault_state_pd = "ephemeral" if raw_chat_id_pd is None else "on"
+                except Exception:
+                    logger.exception(
+                        "pii_filter inlet presidio_disabled: vault snapshot "
+                        "failed for thread_id=%s chat_id=%s — proceeding with empty maps",
+                        thread_id_pd,
+                        raw_chat_id_pd,
+                    )
+            metadata_pd = body.get("metadata")
+            if not isinstance(metadata_pd, dict):
+                metadata_pd = {}
+                body["metadata"] = metadata_pd
+            metadata_pd["pii_placeholder_map"] = forward_map_pd
+            metadata_pd["pii_reverse_map"] = reverse_map_pd
+            languages_active_pd = ",".join(
+                lang
+                for lang, an in (("hr", self.analyzer_hr), ("en", self.analyzer_en))
+                if an is not None
+            )
+            logger.info(
+                "pii_filter inlet processed: chat_id=%s thread_id=%s "
+                "messages_processed=0 messages_skipped_already_masked=0 "
+                "detections=0 masked=0 vault=%s backend=%s languages_active=%s "
+                "ner_spillover_dropped=0 user_masking_disabled=False "
+                "presidio_disabled=True",
+                raw_chat_id_pd,
+                thread_id_pd,
+                vault_state_pd,
+                self.valves.vault_backend,
+                languages_active_pd,
+            )
+            return body
+
         # Task 3.2/3.3 OpenWebUI integration: skip background tasks.
         # OpenWebUI sends embedded chat history as user content for
         # title/tags/follow-up generation, which would produce false-positive
@@ -2376,7 +2463,8 @@ class Pipeline:
             "pii_filter inlet processed: chat_id=%s thread_id=%s "
             "messages_processed=%d messages_skipped_already_masked=%d "
             "detections=%d masked=%d vault=%s backend=%s languages_active=%s "
-            "ner_spillover_dropped=%d",
+            "ner_spillover_dropped=%d user_masking_disabled=False "
+            "presidio_disabled=False",
             raw_chat_id,
             thread_id,
             messages_processed,
@@ -2517,9 +2605,14 @@ class Pipeline:
         restorations — we never substitute a placeholder we cannot prove
         originated from inlet).
         """
-        # Task 8 toggle insertion point: when `UserValves.pii_masking_enabled`
-        # is wired, gate the entire restoration path behind it. Task 6 leaves
-        # the per-user toggle defined-but-unread, same as inlet.
+        # Task 8 (v0.9.3) deliberately leaves `outlet` ungated by
+        # `UserValves.pii_masking_enabled` (decision #3, AC 8.5). Rationale:
+        # outlet is a pure restoration utility — a user who flips masking
+        # off mid-conversation still expects previously-vaulted PII to be
+        # restored in their history view. Gating outlet would also break
+        # the "audit-only mode" semantics of `Valves.presidio_enabled=False`
+        # (decision #4), which relies on outlet restoring snapshots that
+        # inlet pulled despite skipping detection.
 
         if not self.valves.enabled:
             return body
