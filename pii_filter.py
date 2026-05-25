@@ -1502,8 +1502,9 @@ class Pipeline:
         # #2 — runtime guard, not on_startup skip — so toggling does not
         # require a container restart). Use cases: incident response when
         # Presidio is crashing; "audit-only mode" where requests reach the
-        # LLM unmodified while vault infra continues populating. Configurable
-        # via the `PII_FILTER_PRESIDIO_ENABLED` env var.
+        # LLM unmodified while existing vault snapshots can still be
+        # surfaced for `outlet` restoration symmetry. Configurable via the
+        # `PII_FILTER_PRESIDIO_ENABLED` env var.
         presidio_enabled: bool = True
         languages: list[str] = Field(
             default_factory=lambda: ["hr", "en"],
@@ -2151,7 +2152,7 @@ class Pipeline:
             forward_map_pd: dict[str, str] = {}
             reverse_map_pd: dict[str, str] = {}
             vault_state_pd = "off"
-            if self.vault is not None:
+            if self.vault is not None and self.valves.vault_enabled:
                 try:
                     forward_map_pd, reverse_map_pd = await self.vault.snapshot_for_request(
                         thread_id_pd
@@ -2160,7 +2161,8 @@ class Pipeline:
                 except Exception:
                     logger.exception(
                         "pii_filter inlet presidio_disabled: vault snapshot "
-                        "failed for chat_id=%s — proceeding with empty maps",
+                        "failed for thread_id=%s chat_id=%s — proceeding with empty maps",
+                        thread_id_pd,
                         raw_chat_id_pd,
                     )
             metadata_pd = body.get("metadata")

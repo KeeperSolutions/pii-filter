@@ -267,3 +267,28 @@ async def test_presidio_enabled_disabled_skips_analyzer_but_writes_metadata(
     # Metadata keys present with empty maps (vault is None in unit scope).
     assert result["metadata"]["pii_placeholder_map"] == {}
     assert result["metadata"]["pii_reverse_map"] == {}
+
+
+async def test_presidio_disabled_respects_vault_enabled_kill_switch(
+    pipeline: Pipeline,
+) -> None:
+    """When `vault_enabled=False`, the presidio-disabled branch must NOT
+    call `snapshot_for_request` — the admin vault kill switch overrides
+    the outlet-symmetry snapshot pull. Mirrors the gating used by the
+    normal inlet path and outlet (regression for Copilot review feedback).
+    """
+    pipeline.valves.presidio_enabled = False
+    pipeline.valves.vault_enabled = False
+    spy = AsyncMock()
+    pipeline.vault = spy  # type: ignore[assignment]
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "OIB je 12345678901"}],
+        "metadata": {"chat_id": "ch_vault_disabled"},
+    }
+
+    result = await pipeline.inlet(body, user={"id": "user_42"})
+
+    spy.snapshot_for_request.assert_not_awaited()
+    # Metadata keys still written for outlet symmetry, but empty.
+    assert result["metadata"]["pii_placeholder_map"] == {}
+    assert result["metadata"]["pii_reverse_map"] == {}
