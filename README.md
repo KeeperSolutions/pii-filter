@@ -152,7 +152,7 @@ Result: only [EMAIL_1] and [PHONE_1] are masked, no spurious [PERSON_1]
                    │    │    ├─ OIB/phone context check │
                    │    │    └─ overlap resolution      │
                    │    ├─ replace spans → placeholders │
-                   │    └─ write to PostgresThreadVault │
+                   │    └─ write to ThreadVault         │
                    │                                   │
                    │  outlet(body)                     │
                    │    ├─ read reverse map (metadata) │
@@ -175,7 +175,6 @@ Result: only [EMAIL_1] and [PHONE_1] are masked, no spurious [PERSON_1]
 | spaCy `hr_core_news_lg` | 3.7.0 | Croatian NER |
 | spaCy `en_core_web_lg` | 3.7.0 | English NER |
 | asyncpg | ≥ 0.29.0 | PostgreSQL vault (async connection pool) |
-| redis-py | ≥ 5.0.1 | Legacy Redis vault (fallback) |
 | pydantic-settings | ≥ 2.0 | Valve env-var loading |
 
 ---
@@ -188,9 +187,7 @@ All valves are visible in OpenWebUI Admin → Pipelines and can be overridden vi
 |---|---|---|---|
 | `enabled` | `true` | `PII_FILTER_ENABLED` | Master on/off switch |
 | `languages` | `["hr","en"]` | `PII_FILTER_LANGUAGES` | Active analyzers — `"hr"`, `"en"`, or both |
-| `vault_backend` | `"postgres"` | `PII_FILTER_VAULT_BACKEND` | `"postgres"` or `"redis"` |
-| `postgres_url` | `""` | `PII_FILTER_POSTGRES_URL` | Full DSN — required when `vault_backend=postgres` |
-| `redis_url` | `redis://localhost:6379/0` | `PII_FILTER_REDIS_URL` | Redis DSN — used when `vault_backend=redis` |
+| `postgres_url` | `""` | `PII_FILTER_POSTGRES_URL` | Full DSN — required when `vault_enabled=true` |
 | `vault_enabled` | `true` | `PII_FILTER_VAULT_ENABLED` | Disable vault (use per-request maps only) |
 | `degradation_mode` | `"block"` | `PII_FILTER_DEGRADATION_MODE` | `"block"` (fail-closed, GDPR-safe) or `"passthrough"` |
 | `multi_turn_history_scope` | `true` | `PII_FILTER_MULTI_TURN_HISTORY_SCOPE` | Mask all user messages in history, not just the latest |
@@ -207,7 +204,7 @@ All valves are visible in OpenWebUI Admin → Pipelines and can be overridden vi
 ### Prerequisites
 
 - Python 3.11 (NOT 3.12 — the Pipelines container is locked to 3.11)
-- Docker (for local Postgres / Redis)
+- Docker (for local Postgres)
 
 ### Setup
 
@@ -235,13 +232,6 @@ Export the DSN before running tests or the pipeline locally:
 export PII_FILTER_POSTGRES_URL="postgresql://keeper:keeper@localhost:5432/keeper"
 ```
 
-### Local Redis (legacy backend)
-
-```bash
-docker run -d --name keeper-redis -p 6379:6379 redis:7-alpine
-export PII_FILTER_VAULT_BACKEND=redis
-```
-
 ### Tests
 
 ```bash
@@ -249,7 +239,7 @@ pytest                     # full suite — 288 passed, 5 skipped
 pytest -k "test_inlet"     # run a subset
 ```
 
-The test suite uses `pytest-postgresql` (real Postgres spun up per session) and `fakeredis` (in-process) — no external services required.
+The test suite uses `pytest-postgresql` (real Postgres spun up per session) for vault integration tests, and `MockThreadVault` (in-memory) for analyzer/inlet tests — no external services required.
 
 ### Lint, format, type check
 
@@ -275,7 +265,6 @@ All three gates must pass before merging. Current status: ✅ `ruff check` ✅ `
 
 ```
 PII_FILTER_POSTGRES_URL=postgresql://user:pass@/db?host=/cloudsql/<INSTANCE_CONN_NAME>
-PII_FILTER_VAULT_BACKEND=postgres
 ```
 
 ---
@@ -287,13 +276,15 @@ PII_FILTER_VAULT_BACKEND=postgres
 | Task 1 | TRAU-400 | Repo skeleton, tooling (ruff, mypy, pytest), Pipeline class stub |
 | Task 3 | TRAU-401 | Presidio engine + 12 custom recognizers (OIB, JMBG, IBAN ×4, IE PPSN, RO CNP, UK NINO, UK UTR, US SSN, US EIN) |
 | Task 4 | TRAU-410 | Inlet masking — PII → typed placeholders, forward/reverse maps, MISC entity suppression |
-| Task 5 | TRAU-414 | Redis ThreadVault — thread-scoped placeholder consistency, 24h TTL, fakeredis test support |
+| Task 5 *(historical)* | TRAU-414 | Redis ThreadVault — thread-scoped placeholder consistency, 24h TTL. **Removed in Task 9 (v0.9.5).** |
 | Task 6 | TRAU-416 | Outlet restoration — placeholder → original in LLM responses, hallucination handling |
-| Task 5.1 | TRAU-422 | PostgreSQL ThreadVault — asyncpg pool, idempotent DDL, replaces Redis as default backend |
+| Task 5.1 | TRAU-422 | PostgreSQL ThreadVault — asyncpg pool, idempotent DDL; default backend since v0.6.0 |
 | Task 3.1 | TRAU-424 | Recognizer accuracy — deny-list, trailing-token strip, OIB/phone context window |
 | Task 8.5 | TRAU-425 | Multi-turn history — masks all user messages in history, already-masked skip optimisation |
 | Task 3.2 | TRAU-426 | Dual-analyzer architecture (HR + EN), result merge and deduplication |
 | Task 3.3 | TRAU-426 | NER spillover guard — window language classifier eliminates cross-language false positives |
+| Task 8 | TRAU-451 | UserValves `pii_masking_enabled` per-user toggle wired into inlet; Valves `presidio_enabled` admin kill switch |
+| Task 9 | — | Redis backend removal — `PostgresThreadVault` renamed to `ThreadVault`; `vault_backend` / `redis_*` valves dropped; `redis` / `fakeredis` / `lupa` deps gone (v0.9.5) |
 
 ---
 

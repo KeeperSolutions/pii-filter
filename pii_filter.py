@@ -2,11 +2,11 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-25
-version: 0.9.3
+date: 2026-05-26
+version: 0.9.5
 license: MIT
-description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. Task 5.1 — PostgreSQL ThreadVault backend coexists with the Task 5 Redis backend. The `vault_backend` valve selects which backend to use (`postgres` is the default in v0.6.0; `redis` remains available as a manual rollback path). v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives. v0.9.3 (Task 8) wires the previously-stubbed `UserValves.pii_masking_enabled` per-user toggle into `inlet` (early return on opt-out, no vault touch, audit INFO log) and adds the admin-level `Valves.presidio_enabled` kill switch (runtime guard: skips analyzer/masking but still pulls vault snapshot for outlet restoration symmetry). `outlet` and `on_startup` are unchanged.
-requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, redis>=5.0.1, asyncpg>=0.29.0, pydantic-settings>=2.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
+description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. The thread vault is PostgreSQL-backed (asyncpg pool, idempotent DDL, lazy expiry), keyed by chat_id, gated by `vault_enabled`. v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives. v0.9.3 (Task 8) wires the `UserValves.pii_masking_enabled` per-user toggle into `inlet` (early return on opt-out, no vault touch, audit INFO log) and adds the admin-level `Valves.presidio_enabled` kill switch (runtime guard: skips analyzer/masking but still pulls vault snapshot for outlet restoration symmetry). v0.9.5 (Task 9) consolidates the vault to a single PostgreSQL backend: the legacy backend-selector valve and the legacy alternate-backend valves are removed, the alternate-backend class is dropped, the kept `ThreadVault` class is the sole vault implementation, and the alternate-backend Python dependencies are gone from `requirements.txt`. `outlet` is unchanged; `on_startup` is collapsed to a single Postgres-only init path gated by `vault_enabled`.
+requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, asyncpg>=0.29.0, pydantic-settings>=2.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
@@ -26,8 +26,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
     import asyncpg
-    from redis.asyncio import Redis as RedisAsync
-    from redis.commands.core import AsyncScript
 
 logger = logging.getLogger(__name__)
 
@@ -597,7 +595,7 @@ def mask_text(
         number of detections, which is fine for the typical n < 50 case.
 
     Note:
-        Selection logic is shared with the Task 5 Redis-vault inlet path via
+        Selection logic is shared with the inlet vault path via
         `_select_accepted_detections`. Only the placeholder *source* differs.
     """
     accepted = _select_accepted_detections(text, detections, presidio_to_standard)
@@ -606,7 +604,7 @@ def mask_text(
 
     # Build masked text in a single left-to-right pass and enrich detections.
     # The placeholder *source* here is the local `forward_map` / `counter_state`
-    # passed in by the caller; the Task 5 Redis-vault inlet path uses the same
+    # passed in by the caller; the inlet vault path uses the same
     # selection logic but sources placeholders from `ThreadVault`.
     pieces: list[str] = []
     enriched: list[dict[str, Any]] = []
@@ -771,42 +769,6 @@ def restore_text(
     return restored_text, sorted(restored_set), sorted(hallucinated_set)
 
 
-# ---------------------------------------------------------------------------
-# Thread vault (Task 5 — Redis-backed, thread-scoped placeholder storage)
-# ---------------------------------------------------------------------------
-
-
-# Atomic get-or-mint executed server-side by Redis. Eliminates the read-then-
-# mint race that would otherwise let two concurrent inlet calls in the same
-# thread allocate two placeholders for the same original.
-#
-# KEYS[1]   pii:thread:{chat_id}:forward             HASH  original -> placeholder
-# KEYS[2]   pii:thread:{chat_id}:counter:{TYPE}      INT
-# KEYS[3]   pii:thread:{chat_id}:reverse             HASH  placeholder -> original
-# ARGV[1]   original value
-# ARGV[2]   standardized entity_type (used in the placeholder string)
-# ARGV[3]   TTL seconds for all three keys
-#
-# Returns the placeholder string (existing or freshly minted).
-_LUA_GET_OR_MINT = """
-local existing = redis.call('HGET', KEYS[1], ARGV[1])
-if existing then
-  redis.call('EXPIRE', KEYS[1], ARGV[3])
-  redis.call('EXPIRE', KEYS[2], ARGV[3])
-  redis.call('EXPIRE', KEYS[3], ARGV[3])
-  return existing
-end
-local n = redis.call('INCR', KEYS[2])
-local placeholder = '[' .. ARGV[2] .. '_' .. n .. ']'
-redis.call('HSET', KEYS[1], ARGV[1], placeholder)
-redis.call('HSET', KEYS[3], placeholder, ARGV[1])
-redis.call('EXPIRE', KEYS[1], ARGV[3])
-redis.call('EXPIRE', KEYS[2], ARGV[3])
-redis.call('EXPIRE', KEYS[3], ARGV[3])
-return placeholder
-"""
-
-
 _EPHEMERAL_PREFIX = "ephemeral:"
 
 
@@ -821,196 +783,8 @@ def make_ephemeral_thread_id() -> str:
     return f"{_EPHEMERAL_PREFIX}{uuid.uuid4()}"
 
 
-class ThreadVault:
-    """Thread-scoped placeholder vault backed by Redis.
-
-    Replaces Task 4's per-request dicts with a `chat_id`-keyed Redis store
-    so the same original PII value gets the same placeholder across every
-    message in one OpenWebUI conversation. Cross-thread isolation is
-    automatic via the `pii:thread:{chat_id}:*` key prefix.
-
-    The Redis client is created lazily on first use so test substitution
-    is clean and pytest collection does not open sockets. Atomic
-    get-or-mint is enforced server-side by `_LUA_GET_OR_MINT`. TTL is
-    renewed on every public method that touches a thread's keys
-    (spec §3.5).
-
-    Schema (verbatim from Dokument 3 §8.4):
-        pii:thread:{chat_id}:forward          HASH   original -> placeholder
-        pii:thread:{chat_id}:reverse          HASH   placeholder -> original
-        pii:thread:{chat_id}:counter:{TYPE}   INT
-    """
-
-    def __init__(
-        self,
-        url: str = "redis://localhost:6379/0",
-        *,
-        connect_timeout_ms: int = 200,
-        socket_timeout_ms: int = 500,
-        thread_ttl_seconds: int = 86400,
-        ephemeral_ttl_seconds: int = 600,
-        client: RedisAsync | None = None,
-    ) -> None:
-        self._url = url
-        self._connect_timeout = connect_timeout_ms / 1000.0
-        self._socket_timeout = socket_timeout_ms / 1000.0
-        self._thread_ttl = thread_ttl_seconds
-        self._ephemeral_ttl = ephemeral_ttl_seconds
-        # `client` lets tests inject `fakeredis.aioredis.FakeRedis`. When
-        # None, a real `redis.asyncio.Redis` is built lazily on first use.
-        self._client: RedisAsync | None = client
-        self._lua: AsyncScript | None = None
-
-    # -- key building --------------------------------------------------------
-
-    @staticmethod
-    def _key_forward(chat_id: str) -> str:
-        return f"pii:thread:{chat_id}:forward"
-
-    @staticmethod
-    def _key_reverse(chat_id: str) -> str:
-        return f"pii:thread:{chat_id}:reverse"
-
-    @staticmethod
-    def _key_counter(chat_id: str, entity_type: str) -> str:
-        return f"pii:thread:{chat_id}:counter:{entity_type}"
-
-    @staticmethod
-    def _counter_pattern(chat_id: str) -> str:
-        return f"pii:thread:{chat_id}:counter:*"
-
-    def _ttl_for(self, chat_id: str) -> int:
-        return self._ephemeral_ttl if chat_id.startswith(_EPHEMERAL_PREFIX) else self._thread_ttl
-
-    # -- client lifecycle ----------------------------------------------------
-
-    async def _get_client(self) -> RedisAsync:
-        """Lazily build the Redis client and register the Lua script."""
-        if self._client is None:
-            from redis.asyncio import Redis as _Redis
-
-            self._client = _Redis.from_url(
-                self._url,
-                socket_connect_timeout=self._connect_timeout,
-                socket_timeout=self._socket_timeout,
-                decode_responses=True,
-            )
-        if self._lua is None:
-            self._lua = self._client.register_script(_LUA_GET_OR_MINT)
-        return self._client
-
-    async def aclose(self) -> None:
-        """Close the underlying Redis client if one was instantiated."""
-        if self._client is not None:
-            try:
-                await self._client.aclose()
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("ThreadVault aclose() raised: %s", exc)
-            finally:
-                self._client = None
-                self._lua = None
-
-    # -- TTL renewal ---------------------------------------------------------
-
-    async def _renew_ttl(self, chat_id: str) -> None:
-        """Push EXPIRE on the primary keys plus all per-type counters.
-
-        EXPIRE on a missing key is a no-op so this is safe before any data
-        exists. Counter keys are discovered incrementally with SCAN to avoid
-        blocking Redis with a full-keyspace KEYS lookup on shared instances.
-        """
-        client = await self._get_client()
-        ttl = self._ttl_for(chat_id)
-        await client.expire(self._key_forward(chat_id), ttl)
-        await client.expire(self._key_reverse(chat_id), ttl)
-        cursor: int = 0
-        pattern = self._counter_pattern(chat_id)
-        while True:
-            cursor, cnt_keys = await cast(
-                "Awaitable[tuple[int, list[bytes | str]]]",
-                client.scan(cursor=cursor, match=pattern, count=16),
-            )
-            for cnt_key in cnt_keys:
-                await client.expire(cnt_key, ttl)
-            if cursor == 0:
-                break
-
-    # -- public API ----------------------------------------------------------
-
-    async def healthcheck(self) -> bool:
-        """Return True if Redis answers PING within the connect timeout."""
-        try:
-            client = await self._get_client()
-            pong = await cast("Awaitable[Any]", client.ping())
-            healthy = bool(pong)
-            logger.debug("ThreadVault healthcheck: redis=%s", healthy)
-            return healthy
-        except Exception as exc:
-            logger.error("ThreadVault healthcheck failed: %s", exc, exc_info=True)
-            return False
-
-    async def get_or_create_thread(self, chat_id: str) -> None:
-        """Refresh TTL on every key belonging to this thread.
-
-        Renewal-on-read prevents stale threads from being garbage-collected
-        mid-conversation if the user pauses for several hours.
-        """
-        await self._renew_ttl(chat_id)
-
-    async def get_placeholder(self, chat_id: str, original: str, entity_type: str) -> str:
-        """Atomic get-or-mint of a placeholder for `original` in this thread.
-
-        Returns the existing placeholder if `original` was already minted
-        in this thread; otherwise INCRs the per-type counter and writes
-        both forward and reverse hash entries. Atomicity is enforced
-        server-side by `_LUA_GET_OR_MINT` — concurrent callers in the same
-        thread cannot produce two placeholders for the same original.
-        """
-        await self._get_client()
-        assert self._lua is not None  # _get_client guarantees this
-        ttl = self._ttl_for(chat_id)
-        result = await self._lua(
-            keys=[
-                self._key_forward(chat_id),
-                self._key_counter(chat_id, entity_type),
-                self._key_reverse(chat_id),
-            ],
-            args=[original, entity_type, ttl],
-        )
-        return cast(str, result)
-
-    async def restore(self, chat_id: str, placeholder: str) -> str | None:
-        """Reverse-lookup a placeholder. Returns None if not minted in this thread.
-
-        Task 6 uses None to leave hallucinated placeholders alone.
-        """
-        client = await self._get_client()
-        original = await cast(
-            "Awaitable[str | None]", client.hget(self._key_reverse(chat_id), placeholder)
-        )
-        await self._renew_ttl(chat_id)
-        return original
-
-    async def snapshot_for_request(self, chat_id: str) -> tuple[dict[str, str], dict[str, str]]:
-        """Read the full forward + reverse maps for this thread.
-
-        Used by `inlet` to populate `body["metadata"]["pii_placeholder_map"]`
-        and `pii_reverse_map` so the outlet (Task 6) keeps reading from
-        body.metadata regardless of Redis being the source of truth.
-        """
-        client = await self._get_client()
-        forward = await cast(
-            "Awaitable[dict[str, str]]", client.hgetall(self._key_forward(chat_id))
-        )
-        reverse = await cast(
-            "Awaitable[dict[str, str]]", client.hgetall(self._key_reverse(chat_id))
-        )
-        await self._renew_ttl(chat_id)
-        return forward, reverse
-
-
 # ---------------------------------------------------------------------------
-# PostgreSQL ThreadVault (Task 5.1 — coexists with Redis backend)
+# Thread vault — PostgreSQL-backed, thread-scoped placeholder storage
 # ---------------------------------------------------------------------------
 
 
@@ -1052,12 +826,11 @@ CREATE INDEX IF NOT EXISTS idx_pii_counters_expires
 """
 
 
-class PostgresThreadVault:
+class ThreadVault:
     """Thread-scoped placeholder vault backed by PostgreSQL.
 
-    Mirrors the public async API of `ThreadVault` (Redis backend) so the
-    inlet calls either polymorphically via duck typing — no formal Protocol
-    is declared (spec §9.2). Public methods:
+    Thread-scoped placeholder vault for cross-message PII consistency.
+    Public async API:
 
         get_or_create_thread(chat_id) -> None
         get_placeholder(chat_id, original, entity_type) -> str
@@ -1066,10 +839,10 @@ class PostgresThreadVault:
         healthcheck() -> bool
         aclose() -> None
 
-    NOTE on `get_placeholder` arg order — matches the existing Redis vault
+    NOTE on `get_placeholder` arg order — TASK-05.1 fixed an earlier mismatch
     signature `(chat_id, original, entity_type)` so the inlet's call site
     works against either backend without modification. Spec §2.1.1 / §2.3
-    listed `(chat_id, entity_type, original_value)` but Redis was already
+    listed `(chat_id, entity_type, original_value)` but the earlier vault
     shipped in Task 5 with `(original, entity_type)` order; preserving that
     is mandatory for the duck-typed call to keep working.
 
@@ -1119,9 +892,7 @@ class PostgresThreadVault:
 
     def _require_pool(self) -> asyncpg.Pool[asyncpg.Record]:
         if self._pool is None:
-            raise RuntimeError(
-                "PostgresThreadVault not initialized: call await vault.initialize() first."
-            )
+            raise RuntimeError("ThreadVault not initialized: call await vault.initialize() first.")
         return self._pool
 
     # -- lifecycle -----------------------------------------------------------
@@ -1159,7 +930,7 @@ class PostgresThreadVault:
             try:
                 await self._pool.close()
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("PostgresThreadVault aclose() raised: %s", exc)
+                logger.warning("ThreadVault aclose() raised: %s", exc)
             finally:
                 self._pool = None
 
@@ -1180,13 +951,13 @@ class PostgresThreadVault:
                 value: int | None = await conn.fetchval("SELECT 1", timeout=1.0)
             return value == 1
         except Exception as exc:
-            logger.warning("PostgresThreadVault healthcheck failed: %s", exc)
+            logger.warning("ThreadVault healthcheck failed: %s", exc)
             return False
 
     # -- public API ----------------------------------------------------------
 
     async def get_or_create_thread(self, chat_id: str) -> None:
-        """API-parity no-op with the Redis vault.
+        """API-parity no-op.
 
         The chat_id is the only thread identifier; there is no per-thread
         row to create until the first mapping is written. Returns None to
@@ -1209,8 +980,7 @@ class PostgresThreadVault:
         Expired rows for `chat_id` are deleted at the top of the
         transaction so a stale counter never bumps off an old `next_value`
         and a stale mapping never resurrects an old placeholder via
-        `ON CONFLICT DO UPDATE RETURNING`. This matches the Redis backend,
-        where Redis EXPIRE auto-deletes the keys so a fresh thread always
+        `ON CONFLICT DO UPDATE RETURNING` so that a fresh thread always
         starts at index 1, and is the cleanup hook for GDPR TTLs (PII rows
         get physically purged on the next access against the same chat_id).
         """
@@ -1276,8 +1046,8 @@ class PostgresThreadVault:
 
         Bumps `expires_at` on hit via `UPDATE ... RETURNING` so a single
         round-trip covers both the lookup and the TTL renewal. A miss
-        leaves the table untouched; this matches the Redis backend's
-        renew-on-touch behavior (Redis also renews counters/forward keys
+        leaves the table untouched; this implements renew-on-touch
+        behavior (the bulk UPDATE renews counters/forward rows
         on every read but only for the chat_id, not on a miss against a
         specific placeholder).
         """
@@ -1309,7 +1079,7 @@ class PostgresThreadVault:
         UPDATE non-expired counter rows, then SELECT the snapshot. The
         renewal WHERE clauses include `expires_at > now()` so an
         already-expired row is NOT bumped back to life by a later
-        snapshot call — that would diverge from Redis (where a key past
+        snapshot call — TTL-expired rows must stay invisible (a row past
         TTL is gone) and silently extend PII retention past the GDPR
         deadline. The SELECT applies the same filter so expired rows
         are also invisible to the caller.
@@ -1515,52 +1285,25 @@ class Pipeline:
                 "Validation occurs at on_startup; unsupported codes raise RuntimeError."
             ),
         )
-        # Behavior when the analyzer (or the Redis vault) fails mid-request.
+        # Behavior when the analyzer (or the vault) fails mid-request.
         #   "block" (default) — fail-closed: raise so the request never
         #     reaches the LLM unfiltered. GDPR-safe; recommended for prod.
         #   "passthrough" — fail-open: log and let the request through
         #     without PII filtering. Use only if availability outweighs
         #     leak risk. Any unrecognized value is treated as "block".
         degradation_mode: str = "block"
-        # ---- Vault kill switch (backend-agnostic) --------------------------
+        # ---- Vault configuration -------------------------------------------
         # Global vault kill switch. When False, the inlet always uses
         # Task 4's per-request dicts and never touches the configured
-        # vault backend (Redis or Postgres). Default True.
+        # Postgres-backed vault. Default True.
         vault_enabled: bool = True
-        # ---- Task 5: Redis thread vault ------------------------------------
-        # DEPRECATED legacy Redis-only kill switch. Kept for backward
-        # compatibility with admins who set it before `vault_enabled`
-        # existed. Only honored when `vault_backend == "redis"`; ignored
-        # entirely for the Postgres backend. Use `vault_enabled` instead.
-        redis_enabled: bool = Field(
-            default=True,
-            description=(
-                "DEPRECATED: legacy Redis-only kill switch. Use "
-                "`vault_enabled` instead. Only consulted when "
-                "`vault_backend='redis'`; ignored for the Postgres backend."
-            ),
-        )
-        # Connection string. The Pipelines container default expects a
-        # Redis instance reachable at this URL; override per-environment.
-        redis_url: str = "redis://localhost:6379/0"
-        # Fast-fail timeout on first connect / PING so the inlet doesn't add
-        # hundreds of ms on a dead Redis.
-        redis_connect_timeout_ms: int = 200
-        # Per-operation timeout once connected.
-        redis_socket_timeout_ms: int = 500
         # 24h. Renewed on every read or write touching the thread.
         thread_ttl_seconds: int = 86400
         # 10 min for chat_id-less ephemeral fallback threads.
         ephemeral_ttl_seconds: int = 600
-        # ---- Task 5.1: PostgreSQL backend ----------------------------------
-        # Selects the vault implementation. `postgres` (default in v0.6.0)
-        # uses `PostgresThreadVault`; `redis` falls back to the Task 5
-        # Redis-backed `ThreadVault`. Operators can flip via env var
-        # `PII_FILTER_VAULT_BACKEND` without redeploying code.
-        vault_backend: Literal["redis", "postgres"] = "postgres"
         # Full Postgres DSN. Empty default means the operator must set
         # `PII_FILTER_POSTGRES_URL` for the Postgres backend to start —
-        # `on_startup` raises if `vault_backend='postgres'` and this is "".
+        # `on_startup` raises if `vault_enabled=True` and this is "".
         # Cloud SQL pattern:
         #   "postgresql://user:pass@/db?host=/cloudsql/<INSTANCE_CONN_NAME>"
         postgres_url: str = ""
@@ -1815,19 +1558,15 @@ class Pipeline:
         self.name = "PII Filter"
         # `Valves` is a `pydantic_settings.BaseSettings` subclass with
         # `env_prefix="PII_FILTER_"` — it reads os.environ itself and
-        # coerces to the declared field types (incl. `Literal` validation
-        # on `vault_backend`). No manual env-var plumbing needed here.
+        # coerces to the declared field types. No manual env-var plumbing
+        # needed here.
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
         self.analyzer_hr: AnalyzerEngine | None = None
         self.analyzer_en: AnalyzerEngine | None = None
         # The vault is built in `on_startup` from the current valves so
-        # admin-edited backend settings take effect on Pipelines restart.
-        # The selector logic in `on_startup` picks `ThreadVault` (Redis) or
-        # `PostgresThreadVault` based on `valves.vault_backend`. Inlet calls
-        # vault methods polymorphically via duck typing — both classes
-        # share the same async public API.
-        self.vault: ThreadVault | PostgresThreadVault | None = None
+        # admin-edited vault settings take effect on Pipelines restart.
+        self.vault: ThreadVault | None = None
 
         logger.info("PII Filter pipeline initialized (analyzer not loaded yet)")
 
@@ -1946,22 +1685,19 @@ class Pipeline:
             self.analyzer_en is not None,
         )
 
-        # Build the vault from the current valves. Backend is selected by
-        # `valves.vault_backend`. For Postgres, `initialize()` opens the
+        # Vault initialization (Postgres-only). `initialize()` opens the
         # connection pool and runs idempotent DDL — failure here is fatal
         # and the container fails to start (explicit failure beats silent
-        # fallback per spec §3.7). For Redis, the underlying client is
-        # created lazily on first use so `on_startup` never blocks on a
-        # Redis daemon.
-        backend = self.valves.vault_backend
-        if backend == "postgres":
+        # fallback per spec §3.7). With `vault_enabled=False`, `self.vault`
+        # stays None and the inlet falls back to Task 4's per-request dicts.
+        if self.valves.vault_enabled:
             if not self.valves.postgres_url:
                 raise RuntimeError(
-                    "vault_backend='postgres' but postgres_url is empty. "
-                    "Set the PII_FILTER_POSTGRES_URL env var (or the "
-                    "valves.postgres_url admin setting) to a valid DSN."
+                    "PII_FILTER_POSTGRES_URL must be set when vault_enabled=True. "
+                    "Set the env var (or the valves.postgres_url admin setting) "
+                    "to a valid DSN."
                 )
-            self.vault = PostgresThreadVault(
+            self.vault = ThreadVault(
                 dsn=self.valves.postgres_url,
                 pool_min=self.valves.postgres_pool_min,
                 pool_max=self.valves.postgres_pool_max,
@@ -1970,56 +1706,25 @@ class Pipeline:
                 ephemeral_ttl_seconds=self.valves.ephemeral_ttl_seconds,
             )
             await self.vault.initialize()
+            healthy = await self.vault.healthcheck()
             logger.info(
-                "PII Filter on_startup complete: PostgresThreadVault wired "
-                "(pool_min=%d, pool_max=%d, command_timeout_ms=%d)",
+                "PII Filter on_startup complete: ThreadVault wired "
+                "(pool_min=%d, pool_max=%d, command_timeout_ms=%d, healthy=%s)",
                 self.valves.postgres_pool_min,
                 self.valves.postgres_pool_max,
                 self.valves.postgres_command_timeout_ms,
+                healthy,
             )
-        elif backend == "redis":
-            # Reconcile the deprecated `redis_enabled` kill switch with the
-            # new backend-agnostic `vault_enabled`. Contradictory config
-            # (vault_enabled=True but redis_enabled=False) collapses to
-            # the more conservative interpretation (vault disabled), and
-            # we surface the conflict in the logs so an operator can
-            # remove the stale `redis_enabled=False` from their valves.
-            if not self.valves.redis_enabled and self.valves.vault_enabled:
+            if not healthy:
                 logger.warning(
-                    "Contradictory vault config: redis_enabled=False but "
-                    "vault_enabled=True with vault_backend='redis'. Treating "
-                    "as vault_enabled=False (conservative). Migrate your "
-                    "valves to use `vault_enabled` and remove `redis_enabled`."
+                    "Vault healthcheck failed at startup. The inlet will hit "
+                    "its degradation_mode path on first use."
                 )
-                self.valves.vault_enabled = False
-            self.vault = ThreadVault(
-                url=self.valves.redis_url,
-                connect_timeout_ms=self.valves.redis_connect_timeout_ms,
-                socket_timeout_ms=self.valves.redis_socket_timeout_ms,
-                thread_ttl_seconds=self.valves.thread_ttl_seconds,
-                ephemeral_ttl_seconds=self.valves.ephemeral_ttl_seconds,
-            )
-            logger.info(
-                "PII Filter on_startup complete: ThreadVault wired (redis_enabled=%s, url=%s)",
-                self.valves.redis_enabled,
-                self.valves.redis_url,
-            )
         else:
-            # Pydantic's Literal validation should already block invalid
-            # values; this branch exists as a defensive backstop.
-            raise RuntimeError(f"Unknown vault_backend: {backend!r}")
-
-        # Both branches above assigned `self.vault`; the third raises.
-        # Mypy widens the post-`await` `self.vault` to `object` because
-        # `from __future__ import annotations` defers the declared union
-        # type and the attribute is reassigned across awaits, so cast
-        # back to the union explicitly.
-        vault = cast("ThreadVault | PostgresThreadVault", self.vault)
-        if not await vault.healthcheck():
-            logger.warning(
-                "Vault healthcheck failed at startup; backend=%s. The inlet "
-                "will hit its degradation_mode path on first use.",
-                backend,
+            self.vault = None
+            logger.info(
+                "PII Filter on_startup complete: vault disabled "
+                "(vault_enabled=False; running in per-request mode)"
             )
 
     async def on_shutdown(self) -> None:
@@ -2082,7 +1787,7 @@ class Pipeline:
 
         * `raw_chat_id` is the original `chat_id` from the body, or `None`
           when the request didn't supply one.
-        * `thread_id` is what's used for Redis key building — equal to
+        * `thread_id` is what's used for vault key building — equal to
           `raw_chat_id` when present, otherwise a fresh ephemeral id.
         """
         raw = body.get("chat_id")
@@ -2179,13 +1884,12 @@ class Pipeline:
             logger.info(
                 "pii_filter inlet processed: chat_id=%s thread_id=%s "
                 "messages_processed=0 messages_skipped_already_masked=0 "
-                "detections=0 masked=0 vault=%s backend=%s languages_active=%s "
+                "detections=0 masked=0 vault=%s languages_active=%s "
                 "ner_spillover_dropped=0 user_masking_disabled=False "
                 "presidio_disabled=True",
                 raw_chat_id_pd,
                 thread_id_pd,
                 vault_state_pd,
-                self.valves.vault_backend,
                 languages_active_pd,
             )
             return body
@@ -2255,7 +1959,7 @@ class Pipeline:
 
         # Decide whether to use the vault or fall back to per-request dicts.
         # Vault path requires `vault_enabled=True`, a vault instance, and
-        # a healthy backend (PING for Redis, SELECT 1 for Postgres). On any
+        # a healthy backend (SELECT 1 for Postgres). On any
         # of those failing in `block` mode we raise so the request never
         # reaches the LLM unfiltered.
         use_vault = self.valves.vault_enabled and self.vault is not None
@@ -2269,20 +1973,20 @@ class Pipeline:
             if not healthy:
                 if self.valves.degradation_mode != "passthrough":
                     raise RuntimeError(
-                        "PII filter blocked the request: Redis thread vault is "
+                        "PII filter blocked the request: vault is "
                         "unavailable and degradation_mode='block'. Set "
                         "valves.degradation_mode='passthrough' to fall back to "
-                        "per-request scope on Redis outages (NOT recommended "
+                        "per-request scope on vault outages (NOT recommended "
                         "in production)."
                     )
                 logger.warning(
-                    "Redis unavailable, falling back to per-request scope. "
+                    "Vault unavailable, falling back to per-request scope. "
                     "Thread consistency disabled for chat_id=%s",
                     raw_chat_id,
                 )
                 use_vault = False
 
-        # Per-request mapping state. Used in the fallback path; in the Redis
+        # Per-request mapping state. Used in the fallback path; in the vault
         # path we read the snapshot back from the vault at the end.
         counter_state: dict[str, int] = {}
         forward_map: dict[str, str] = {}
@@ -2298,7 +2002,7 @@ class Pipeline:
                 logger.exception("inlet: vault get_or_create_thread raised")
                 if self.valves.degradation_mode != "passthrough":
                     raise RuntimeError(
-                        "PII filter blocked the request: Redis thread vault is "
+                        "PII filter blocked the request: vault is "
                         "unreachable and degradation_mode='block'."
                     ) from None
                 use_vault = False
@@ -2426,7 +2130,7 @@ class Pipeline:
             return body
 
         # Spec §3.3 step 7 — body-metadata snapshot is the forward-compat hinge
-        # for Task 6: outlet keeps reading from these keys regardless of Redis
+        # for Task 6: outlet keeps reading from these keys regardless of vault
         # being the source of truth.
         if use_vault:
             assert self.vault is not None  # for mypy
@@ -2436,7 +2140,7 @@ class Pipeline:
                 logger.exception("inlet: vault snapshot_for_request raised")
                 if self.valves.degradation_mode != "passthrough":
                     raise RuntimeError(
-                        "PII filter blocked the request: Redis thread vault is "
+                        "PII filter blocked the request: vault is "
                         "unreachable and degradation_mode='block'."
                     ) from None
                 # Passthrough: masking already completed against vault, but we
@@ -2462,7 +2166,7 @@ class Pipeline:
         logger.info(
             "pii_filter inlet processed: chat_id=%s thread_id=%s "
             "messages_processed=%d messages_skipped_already_masked=%d "
-            "detections=%d masked=%d vault=%s backend=%s languages_active=%s "
+            "detections=%d masked=%d vault=%s languages_active=%s "
             "ner_spillover_dropped=%d user_masking_disabled=False "
             "presidio_disabled=False",
             raw_chat_id,
@@ -2472,7 +2176,6 @@ class Pipeline:
             len(all_enriched),
             len(forward_map),
             vault_state,
-            self.valves.vault_backend,
             languages_active,
             total_spillover_dropped,
         )

@@ -9,7 +9,7 @@ fixture defined below.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Generator
 from typing import Any
 
 import pytest
@@ -18,6 +18,24 @@ from presidio_analyzer import RecognizerResult
 
 from pii_filter import CUSTOM_ENTITY_TYPES, Pipeline, mask_text, restore_text
 from tests.conftest import postgres_binary_missing
+from tests.helpers.mock_vault import MockThreadVault
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _swap_vault_to_mock() -> Generator[None, None, None]:
+    """Replace `ThreadVault` with `MockThreadVault` for this module so
+    `Pipeline.on_startup` wires an in-memory vault that does not require a
+    running Postgres process. Real-Postgres integration coverage lives in
+    `test_postgres_vault.py` (and post-Task-9, the renamed `test_thread_vault.py`).
+
+    Also injects a dummy `PII_FILTER_POSTGRES_URL` so the `on_startup`
+    DSN-empty guard doesn't trip — the mock ignores the value.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pii_filter.ThreadVault", MockThreadVault)
+        mp.setenv("PII_FILTER_POSTGRES_URL", "postgresql://mock-vault-dsn")
+        yield
+
 
 # ---------------------------------------------------------------------------
 # mask_text — unit tests
@@ -375,12 +393,10 @@ def test_restore_text_original_contains_placeholder_shape() -> None:
 
 @pytest_asyncio.fixture(loop_scope="module", scope="module")
 async def started_pipeline() -> AsyncIterator[Pipeline]:
-    # Existing Task 5/6 inlet+outlet tests run against the Redis (fakeredis)
-    # backend; v0.6.0 switched the default backend to postgres so we opt
-    # back into redis explicitly here. The autouse `_swap_redis_to_fakeredis`
-    # fixture in conftest.py replaces the underlying client with fakeredis.
+    # Vault construction uses the module-level `_swap_vault_to_mock` autouse
+    # fixture, which substitutes `MockThreadVault` for `ThreadVault`
+    # so the analyzer-heavy tests in this module never need a real Postgres.
     p = Pipeline()
-    p.valves.vault_backend = "redis"
     # Use default languages (["hr", "en"]) so EN integration tests in this
     # module exercise the English analyzer path when en_core_web_lg is available.
     # Tests that require the EN model guard with `if p.analyzer_en is None:
@@ -719,22 +735,25 @@ async def test_inlet_writes_snapshot_to_body_metadata(
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_redis_down_block_mode(
+async def test_inlet_vault_down_block_mode(
     started_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When the vault healthcheck fails and `degradation_mode='block'` the
-    inlet must raise, never letting the request through unmasked."""
-    assert started_pipeline.vault is not None
+    inlet must raise, never letting the request through unmasked.
 
-    async def _unhealthy() -> bool:
-        return False
+    Flips `MockThreadVault.force_unhealthy = True` to simulate a downed
+    vault — backend-agnostic per the post-Task-9 single-backend contract.
+    """
+    vault = started_pipeline.vault
+    assert vault is not None
+    assert isinstance(vault, MockThreadVault)
 
-    monkeypatch.setattr(started_pipeline.vault, "healthcheck", _unhealthy)
+    monkeypatch.setattr(vault, "force_unhealthy", True)
     assert started_pipeline.valves.degradation_mode == "block"
 
     oib = _make_oib("6667778880")
     body: dict[str, Any] = {
-        "chat_id": "task5-block-mode",
+        "chat_id": "task9-block-mode",
         "messages": [{"role": "user", "content": f"OIB: {oib}"}],
     }
     with pytest.raises(RuntimeError, match="degradation_mode='block'"):
@@ -742,23 +761,23 @@ async def test_inlet_redis_down_block_mode(
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_redis_down_passthrough_mode(
+async def test_inlet_vault_down_passthrough_mode(
     started_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With `degradation_mode='passthrough'` and a dead vault the inlet
     falls back to per-request dicts (Task 4 behavior); masking still
-    happens and `body.metadata` snapshots are still populated."""
-    assert started_pipeline.vault is not None
+    happens and `body.metadata` snapshots are still populated.
+    """
+    vault = started_pipeline.vault
+    assert vault is not None
+    assert isinstance(vault, MockThreadVault)
 
-    async def _unhealthy() -> bool:
-        return False
-
-    monkeypatch.setattr(started_pipeline.vault, "healthcheck", _unhealthy)
+    monkeypatch.setattr(vault, "force_unhealthy", True)
     monkeypatch.setattr(started_pipeline.valves, "degradation_mode", "passthrough")
 
     oib = _make_oib("7778889990")
     body: dict[str, Any] = {
-        "chat_id": "task5-passthrough-mode",
+        "chat_id": "task9-passthrough-mode",
         "messages": [{"role": "user", "content": f"OIB: {oib}"}],
     }
     result = await started_pipeline.inlet(body)
@@ -880,7 +899,7 @@ async def test_outlet_empty_reverse_map_is_noop(
     assert result is body
     assert result["choices"][0]["message"]["content"] == snapshot_content
     # Empty body metadata triggers vault fallback (post-merge bugfix #2);
-    # the per-test fakeredis vault has no entry for this chat_id, so the
+    # the per-test mock vault has no entry for this chat_id, so the
     # snapshot returns empty and outlet bails out at the DEBUG no-op path.
     assert any(
         ("vault snapshot empty" in rec.message) or ("pii_reverse_map missing" in rec.message)
@@ -1370,69 +1389,13 @@ async def test_inlet_postgres_backend_writes_snapshot_to_body_metadata(
 
 @_postgres_skip
 @pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_postgres_backend_down_block_mode(
-    started_pipeline_postgres: Pipeline, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """When the vault healthcheck fails and `degradation_mode='block'` the
-    inlet must raise — backend-agnostic per Task 5 contract."""
-    assert started_pipeline_postgres.vault is not None
-
-    async def _unhealthy() -> bool:
-        return False
-
-    monkeypatch.setattr(started_pipeline_postgres.vault, "healthcheck", _unhealthy)
-    assert started_pipeline_postgres.valves.degradation_mode == "block"
-
-    oib = _make_oib("5556667770")
-    body: dict[str, Any] = {
-        "chat_id": "task5.1-pg-block-mode",
-        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
-    }
-    with pytest.raises(RuntimeError, match="degradation_mode='block'"):
-        await started_pipeline_postgres.inlet(body)
-
-
-@_postgres_skip
-@pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_postgres_backend_down_passthrough_mode(
-    started_pipeline_postgres: Pipeline, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With `degradation_mode='passthrough'` and a dead Postgres vault the
-    inlet falls back to per-request dicts (Task 4 behavior); masking still
-    happens and `body.metadata` snapshots are still populated."""
-    assert started_pipeline_postgres.vault is not None
-
-    async def _unhealthy() -> bool:
-        return False
-
-    monkeypatch.setattr(started_pipeline_postgres.vault, "healthcheck", _unhealthy)
-    monkeypatch.setattr(started_pipeline_postgres.valves, "degradation_mode", "passthrough")
-
-    oib = _make_oib("4445556660")
-    body: dict[str, Any] = {
-        "chat_id": "task5.1-pg-passthrough-mode",
-        "messages": [{"role": "user", "content": f"OIB: {oib}"}],
-    }
-    result = await started_pipeline_postgres.inlet(body)
-
-    fwd = result["metadata"]["pii_placeholder_map"]
-    rev = result["metadata"]["pii_reverse_map"]
-    assert oib in fwd
-    placeholder = fwd[oib]
-    assert rev[placeholder] == oib
-    assert placeholder in result["messages"][-1]["content"]
-
-
-@_postgres_skip
-@pytest.mark.asyncio(loop_scope="module")
 async def test_inlet_postgres_backend_with_vault_enabled_false_falls_back_to_per_request(
     started_pipeline_postgres: Pipeline, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Bugfix regression: with the Postgres backend wired up but
+    """Bugfix regression: with the ThreadVault wired up but
     `vault_enabled=False`, the inlet must bypass the vault entirely and
     fall back to per-request dicts (Task 4 behavior). Verifies the global
-    kill switch is backend-agnostic — `redis_enabled` does not (and must
-    not) gate the Postgres path."""
+    `vault_enabled` kill switch is the sole gate on the vault path."""
     assert started_pipeline_postgres.vault is not None
 
     async def _spy_get_placeholder(*args: Any, **kwargs: Any) -> str:
@@ -1462,9 +1425,9 @@ async def test_inlet_postgres_backend_with_vault_enabled_true_uses_vault(
     started_pipeline_postgres: Pipeline, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Bugfix regression (positive case): with `vault_enabled=True` and
-    the Postgres backend wired up, the inlet must call
+    the ThreadVault wired up, the inlet must call
     `vault.get_placeholder` for every detected entity — proving the
-    Postgres path is reached without depending on `redis_enabled`."""
+    vault path is reached."""
     assert started_pipeline_postgres.vault is not None
     assert started_pipeline_postgres.valves.vault_enabled is True
 
@@ -1493,7 +1456,7 @@ async def test_inlet_postgres_backend_with_vault_enabled_true_uses_vault(
 # ---------------------------------------------------------------------------
 # Task 3.1 — Inlet integration tests (deny-list, OIB phone-context)
 #
-# These tests use the module-scoped `started_pipeline` (Redis/fakeredis)
+# These tests use the module-scoped `started_pipeline` (mock vault)
 # fixture so spaCy loads once for the whole module.
 # ---------------------------------------------------------------------------
 
@@ -2044,7 +2007,6 @@ async def test_inlet_email_in_english_context(started_pipeline: Pipeline) -> Non
 @pytest.mark.asyncio
 async def test_inlet_with_hr_only_languages_skips_en_analyzer() -> None:
     p = Pipeline()
-    p.valves.vault_backend = "redis"
     p.valves.languages = ["hr"]
     await p.on_startup()
     try:
@@ -2068,7 +2030,6 @@ async def test_inlet_with_hr_only_languages_skips_en_analyzer() -> None:
 @pytest.mark.asyncio
 async def test_inlet_with_en_only_languages_skips_hr_analyzer() -> None:
     p = Pipeline()
-    p.valves.vault_backend = "redis"
     p.valves.languages = ["en"]
     try:
         await p.on_startup()

@@ -56,29 +56,6 @@ def test_valves_loads_postgres_url_from_env_var(
     assert valves.postgres_url == dsn
 
 
-def test_valves_loads_vault_backend_from_env_var(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`PII_FILTER_VAULT_BACKEND=redis` must override the postgres default."""
-    monkeypatch.setenv("PII_FILTER_VAULT_BACKEND", "redis")
-    valves = Pipeline.Valves()
-    assert valves.vault_backend == "redis"
-
-
-def test_valves_invalid_vault_backend_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A bogus vault backend must fail loud at construction.
-
-    Confirms `Literal["redis", "postgres"]` validation survives the
-    BaseSettings migration so an env-var typo aborts startup instead of
-    silently leaving the wrong backend selected.
-    """
-    monkeypatch.setenv("PII_FILTER_VAULT_BACKEND", "mongodb")
-    with pytest.raises(Exception, match="vault_backend"):
-        Pipeline.Valves()
-
-
 async def test_inlet_returns_body_unchanged(
     pipeline: Pipeline, sample_user_body: dict[str, Any]
 ) -> None:
@@ -114,11 +91,12 @@ async def test_outlet_skips_when_disabled(
 
 
 async def test_lifecycle_hooks_dont_throw(pipeline: Pipeline) -> None:
-    """on_startup() and on_shutdown() must complete without raising."""
-    # v0.6.0 default backend is postgres which requires a DSN; opt back into
-    # redis (fakeredis via the autouse conftest fixture) so this lifecycle
-    # smoke test stays infrastructure-free.
-    pipeline.valves.vault_backend = "redis"
+    """on_startup() and on_shutdown() must complete without raising.
+
+    Runs with `vault_enabled=False` so `on_startup` skips the Postgres
+    pool construction and the test stays infrastructure-free.
+    """
+    pipeline.valves.vault_enabled = False
     pipeline.valves.languages = ["hr"]  # HR-only to avoid EN model load
     await pipeline.on_startup()
     await pipeline.on_shutdown()

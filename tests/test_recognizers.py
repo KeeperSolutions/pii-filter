@@ -12,7 +12,7 @@ type returns all 13 expected entity types from the analyzer.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Generator
 from typing import Any
 
 import pytest
@@ -36,6 +36,23 @@ from pii_filter import (
     _select_accepted_detections,
     make_iban_recognizer,
 )
+from tests.helpers.mock_vault import MockThreadVault
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _swap_vault_to_mock() -> Generator[None, None, None]:
+    """Replace `ThreadVault` with `MockThreadVault` for this module so
+    `Pipeline.on_startup` wires an in-memory vault that does not require a
+    running Postgres process.
+
+    Also injects a dummy `PII_FILTER_POSTGRES_URL` so the `on_startup`
+    DSN-empty guard doesn't trip — the mock ignores the value.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pii_filter.ThreadVault", MockThreadVault)
+        mp.setenv("PII_FILTER_POSTGRES_URL", "postgresql://mock-vault-dsn")
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Helpers — compute valid samples so the checksum derivation is in-source.
@@ -541,14 +558,10 @@ async def started_pipeline() -> AsyncIterator[Pipeline]:
 
     spaCy `hr_core_news_lg` allocates ~240 MB of contiguous vectors per load,
     so loading once per module instead of once per test keeps memory pressure
-    manageable on dev machines.
-
-    v0.6.0 default backend is postgres; opt back into redis (fakeredis via
-    the autouse conftest fixture) so these recognizer-focused tests never
-    require a live postgres process.
+    manageable on dev machines. Vault construction is replaced with
+    `MockThreadVault` via the module-level `_swap_vault_to_mock` autouse fixture.
     """
     p = Pipeline()
-    p.valves.vault_backend = "redis"
     # Use default languages (["hr", "en"]) so EN registry tests exercise the
     # English analyzer path when en_core_web_lg is available.
     # Tests that require the EN model guard with `if p.analyzer_en is None:
@@ -1060,7 +1073,6 @@ def test_iban_code_built_in_in_en_registry_for_de_iban(started_pipeline: Pipelin
 @pytest.mark.asyncio
 async def test_startup_builds_both_analyzers_with_default_languages() -> None:
     p = Pipeline()
-    p.valves.vault_backend = "redis"
     try:
         await p.on_startup()
     except RuntimeError as exc:
@@ -1075,7 +1087,6 @@ async def test_startup_builds_both_analyzers_with_default_languages() -> None:
 @pytest.mark.asyncio
 async def test_startup_validates_languages_whitelist() -> None:
     p = Pipeline()
-    p.valves.vault_backend = "redis"
     p.valves.languages = ["fr"]
     with pytest.raises(RuntimeError) as exc_info:
         await p.on_startup()
@@ -1087,7 +1098,6 @@ async def test_startup_validates_languages_whitelist() -> None:
 @pytest.mark.asyncio
 async def test_startup_validates_languages_not_empty() -> None:
     p = Pipeline()
-    p.valves.vault_backend = "redis"
     p.valves.languages = []
     with pytest.raises(RuntimeError):
         await p.on_startup()
@@ -1097,7 +1107,6 @@ async def test_startup_validates_languages_not_empty() -> None:
 async def test_nlp_engine_cache_keyed_by_lang_code() -> None:
     # Both keys must be present after a dual-language startup.
     p = Pipeline()
-    p.valves.vault_backend = "redis"
     p.valves.languages = ["hr", "en"]
     try:
         await p.on_startup()
@@ -1109,7 +1118,6 @@ async def test_nlp_engine_cache_keyed_by_lang_code() -> None:
         # Second startup with only HR must reuse the cached HR engine.
         hr_engine_before = _nlp_engine_cache["hr"]
         p2 = Pipeline()
-        p2.valves.vault_backend = "redis"
         p2.valves.languages = ["hr"]
         await p2.on_startup()
         assert _nlp_engine_cache["hr"] is hr_engine_before
