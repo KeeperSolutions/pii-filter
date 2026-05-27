@@ -225,6 +225,101 @@ async def test_user_valves_disabled_with_user_id_missing_uses_unknown(
     assert "user_id=unknown" in matches[0].getMessage()
 
 
+async def test_user_valves_payload_disables_masking_per_request(
+    pipeline: Pipeline,
+    sample_user_body: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Per-user toggle resolution: `user["valves"]` from OpenWebUI overrides
+    the instance default. The instance keeps masking enabled, but the
+    request payload opts out — inlet must honour the payload (verified
+    via the `user_disabled` audit log and untouched message content).
+    """
+    assert pipeline.user_valves.pii_masking_enabled is True  # default
+    original = sample_user_body["messages"][-1]["content"]
+
+    with caplog.at_level(logging.INFO, logger="pii_filter"):
+        result = await pipeline.inlet(
+            sample_user_body,
+            user={"id": "u1", "valves": {"pii_masking_enabled": False}},
+        )
+
+    assert result["messages"][-1]["content"] == original
+    assert "pii_placeholder_map" not in result.get("metadata", {})
+    matches = [r for r in caplog.records if "user_disabled" in r.getMessage()]
+    assert len(matches) == 1
+    assert "user_id=u1" in matches[0].getMessage()
+
+
+async def test_user_valves_payload_isolation_between_users(
+    pipeline: Pipeline,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two requests in the same process with opposite per-user payloads
+    must see opposite gate decisions — proves the toggle is per-request,
+    not a shared process-wide flag. Asserted on the audit-log signal so
+    the test works under the unit-scope fixture (no analyzer running).
+    """
+    body_off: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "OIB je 12345678901"}],
+        "metadata": {"chat_id": "ch_off"},
+    }
+    body_on: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "OIB je 12345678901"}],
+        "metadata": {"chat_id": "ch_on"},
+    }
+
+    with caplog.at_level(logging.INFO, logger="pii_filter"):
+        await pipeline.inlet(
+            body_off,
+            user={"id": "u_off", "valves": {"pii_masking_enabled": False}},
+        )
+        await pipeline.inlet(
+            body_on,
+            user={"id": "u_on", "valves": {"pii_masking_enabled": True}},
+        )
+
+    disabled_logs = [r for r in caplog.records if "user_disabled" in r.getMessage()]
+    assert len(disabled_logs) == 1
+    assert "user_id=u_off" in disabled_logs[0].getMessage()
+    assert "user_id=u_on" not in disabled_logs[0].getMessage()
+
+
+async def test_user_valves_payload_falls_back_when_absent(
+    pipeline: Pipeline, sample_user_body: dict[str, Any]
+) -> None:
+    """When `user["valves"]` is missing, resolution falls back to
+    `self.user_valves` — preserves Pipelines #19179 workaround and the
+    existing test contract that mutates the instance attribute.
+    """
+    pipeline.user_valves = Pipeline.UserValves(pii_masking_enabled=False)
+
+    result = await pipeline.inlet(sample_user_body, user={"id": "u1"})
+
+    # Instance default off + no payload → opt-out branch taken.
+    assert "pii_placeholder_map" not in result.get("metadata", {})
+
+
+async def test_user_valves_malformed_payload_falls_back_to_default(
+    pipeline: Pipeline,
+    sample_user_body: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed `user["valves"]` payload must not crash inlet — it
+    falls back to the instance default (masking on) and logs a warning.
+    """
+    with caplog.at_level(logging.WARNING, logger="pii_filter"):
+        await pipeline.inlet(
+            sample_user_body,
+            user={"id": "u1", "valves": {"pii_masking_enabled": "not-a-bool-and-not-coerceable"}},
+        )
+
+    # Fallback default is True → opt-out branch NOT taken (no user_disabled
+    # log) and a malformed-payload warning was emitted.
+    assert not any("user_disabled" in r.getMessage() for r in caplog.records)
+    assert any("malformed user.valves" in r.getMessage() for r in caplog.records)
+
+
 async def test_presidio_enabled_disabled_skips_analyzer_but_writes_metadata(
     pipeline: Pipeline,
 ) -> None:
