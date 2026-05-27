@@ -11,7 +11,7 @@ The skeleton structure of `pii_filter.py` is loosely based on the official Open 
 - It's Apache 2.0 licensed (different from our MIT)
 - It's one-way redaction (no `outlet()` restoration) — we need bidirectional mask + restore
 - It uses generic `[REDACTED]` placeholders — we need numbered, type-specific (`[PERSON_1]`, `[HR_OIB_1]`)
-- It's stateless — we need thread-scoped consistency via Redis (Task 5)
+- It's stateless — we need thread-scoped consistency via the PostgreSQL ThreadVault (Task 5 introduced Redis-backed; Task 9 / v0.9.5 consolidated to Postgres-only)
 - It uses default Presidio recognizers — we add 12 custom HR/IE/RO/UK/US recognizers (Task 3)
 
 **What we borrow:**
