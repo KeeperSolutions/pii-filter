@@ -14,6 +14,9 @@ venv/
 ENV/
 env/
 
+# uv (dev tooling — runtime deps are declared in pii_filter.py frontmatter)
+uv.lock
+
 # Testing
 .pytest_cache/
 .mypy_cache/
