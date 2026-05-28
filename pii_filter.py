@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import CreditCardRecognizer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -1513,6 +1513,10 @@ class Pipeline:
         without a separate schema migration.
         """
 
+        # Ignore unknown keys so a UI/Pipelines version that ships extra
+        # fields cannot break per-request resolution at the inlet boundary.
+        model_config = ConfigDict(extra="ignore")
+
         pii_masking_enabled: bool = True
 
     # Whitelist mapping: only entities in this dict are forwarded downstream;
@@ -1799,6 +1803,30 @@ class Pipeline:
             return raw, raw
         return None, make_ephemeral_thread_id()
 
+    def _resolve_user_valves(self, user: dict[str, Any] | None) -> Pipeline.UserValves:
+        """Build the effective UserValves for this request.
+
+        OpenWebUI injects per-user valve overrides under ``user["valves"]``.
+        When that payload is present we instantiate a fresh ``UserValves``
+        from it so the UI toggle actually takes effect per request. When
+        it's absent (older Pipelines container, issue #19179, or tests
+        that mutate ``self.user_valves`` directly) we fall back to the
+        instance-level default. Malformed payloads are logged and treated
+        as "no override" rather than failing the request — masking-on is
+        the safe default.
+        """
+        raw = (user or {}).get("valves") if user else None
+        if isinstance(raw, dict):
+            try:
+                return self.UserValves(**raw)
+            except ValidationError as exc:
+                logger.warning(
+                    "pii_filter: malformed user.valves payload, "
+                    "falling back to default (err=%s)",
+                    exc,
+                )
+        return self.user_valves
+
     async def inlet(
         self, body: dict[str, Any], user: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -1828,7 +1856,13 @@ class Pipeline:
         # so any pre-existing vault placeholders from prior turns are still
         # restored if/when the user re-enables the toggle. Audit emitted as
         # a single INFO line per request (decision #5).
-        if not self.user_valves.pii_masking_enabled:
+        #
+        # Resolve per-request: OpenWebUI ships the toggle under
+        # `user["valves"]`. Falling back to `self.user_valves` keeps
+        # backwards compatibility with Pipelines container versions that
+        # don't propagate the payload (issue #19179).
+        effective_user_valves = self._resolve_user_valves(user)
+        if not effective_user_valves.pii_masking_enabled:
             user_id = (user or {}).get("id", "unknown")
             raw_chat_id_user, _ = self._resolve_chat_id(body)
             logger.info(
