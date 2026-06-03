@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import platform
 import shutil
 import subprocess
@@ -87,8 +88,15 @@ if platform.system() == "Windows":
 
     _PgExecutor.stop = _stop_windows  # type: ignore[method-assign]
 
-from pii_filter import Pipeline, ThreadVault
+from pii_filter import BlindIndex, Pipeline, ThreadVault, VaultCipher
 from tests.helpers.mock_vault import MockThreadVault
+
+# Task 11: two fixed, independent 32-byte test keys (base64) so the
+# Postgres-backed vault exercises the real AES-256-GCM encrypt/decrypt path and
+# the HMAC blind index. Distinct keys assert the enc-key / blind-key separation
+# (E2). Dev/test only — never used in any deployed environment.
+VAULT_TEST_ENC_KEY = bytes(range(32))  # 0x00..0x1f
+VAULT_TEST_BLIND_KEY = bytes(range(32, 64))  # 0x20..0x3f
 
 if TYPE_CHECKING:
     import psycopg
@@ -188,6 +196,8 @@ async def postgres_vault(postgresql: psycopg.Connection[Any]) -> AsyncIterator[A
     """
     info = postgresql.info
     dsn = f"postgresql://{info.user}@{info.host}:{info.port}/{info.dbname}"
+    # Task 11: encryption ON so the public-API round-trip tests exercise the
+    # real encrypt-on-write / decrypt-on-read path transparently (spec §10).
     vault = ThreadVault(
         dsn=dsn,
         pool_min=1,
@@ -195,6 +205,9 @@ async def postgres_vault(postgresql: psycopg.Connection[Any]) -> AsyncIterator[A
         command_timeout=2.0,
         thread_ttl_seconds=3600,
         ephemeral_ttl_seconds=300,
+        cipher=VaultCipher(VAULT_TEST_ENC_KEY, key_id=1),
+        blind_index=BlindIndex(VAULT_TEST_BLIND_KEY),
+        encryption_strict=False,
     )
     await vault.initialize()
     try:
@@ -242,6 +255,11 @@ async def started_pipeline_postgres(
     p = Pipeline()
     p.valves.postgres_url = dsn
     p.valves.languages = ["hr"]  # HR-only for postgres fixture; avoids EN model load
+    # Task 11: encryption ON so the pipeline integration tests exercise the
+    # full encrypt-on-write / decrypt-on-read path through inlet/outlet.
+    p.valves.vault_encryption_enabled = True
+    p.valves.vault_encryption_key = base64.b64encode(VAULT_TEST_ENC_KEY).decode("ascii")
+    p.valves.vault_blind_index_key = base64.b64encode(VAULT_TEST_BLIND_KEY).decode("ascii")
     await p.on_startup()
     try:
         yield p

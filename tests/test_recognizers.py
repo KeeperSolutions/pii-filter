@@ -12,6 +12,7 @@ type returns all 13 expected entity types from the analyzer.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator, Generator
 from typing import Any
 
@@ -46,11 +47,17 @@ def _swap_vault_to_mock() -> Generator[None, None, None]:
     running Postgres process.
 
     Also injects a dummy `PII_FILTER_POSTGRES_URL` so the `on_startup`
-    DSN-empty guard doesn't trip — the mock ignores the value.
+    DSN-empty guard doesn't trip — the mock ignores the value — and a dummy
+    base64 blind-index key (Task 11) so `on_startup`'s fail-closed crypto
+    validation (spec §6, blind index always required) passes.
     """
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("pii_filter.ThreadVault", MockThreadVault)
         mp.setenv("PII_FILTER_POSTGRES_URL", "postgresql://mock-vault-dsn")
+        mp.setenv(
+            "PII_FILTER_VAULT_BLIND_INDEX_KEY",
+            base64.b64encode(b"\x00" * 32).decode("ascii"),
+        )
         yield
 
 

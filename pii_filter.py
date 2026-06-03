@@ -3,21 +3,27 @@ title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
 date: 2026-05-26
-version: 0.9.5
+version: 0.9.7
 license: MIT
 description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. The thread vault is PostgreSQL-backed (asyncpg pool, idempotent DDL, lazy expiry), keyed by chat_id, gated by `vault_enabled`. v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives. v0.9.3 (Task 8) wires the `UserValves.pii_masking_enabled` per-user toggle into `inlet` (early return on opt-out, no vault touch, audit INFO log) and adds the admin-level `Valves.presidio_enabled` kill switch (runtime guard: skips analyzer/masking but still pulls vault snapshot for outlet restoration symmetry). v0.9.5 (Task 9) consolidates the vault to a single PostgreSQL backend: the legacy backend-selector valve and the legacy alternate-backend valves are removed, the alternate-backend class is dropped, the kept `ThreadVault` class is the sole vault implementation, and the alternate-backend Python dependencies are gone from `requirements.txt`. `outlet` is unchanged; `on_startup` is collapsed to a single Postgres-only init path gated by `vault_enabled`.
-requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, asyncpg>=0.29.0, pydantic-settings>=2.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
+requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, asyncpg>=0.29.0, pydantic-settings>=2.0, cryptography>=42.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import logging
+import os
 import re
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import CreditCardRecognizer
@@ -799,12 +805,13 @@ _POSTGRES_DDL = """
 CREATE TABLE IF NOT EXISTS pii_thread_mappings (
   chat_id        TEXT NOT NULL,
   entity_type    TEXT NOT NULL,
-  original_value TEXT NOT NULL,
+  original_value TEXT NOT NULL,          -- ENC1:<base64...> ciphertext, or plaintext when encryption disabled
+  lookup_hash    BYTEA NOT NULL,         -- HMAC-SHA256(blind_key, framed(chat_id, entity_type, plaintext))
   placeholder    TEXT NOT NULL,
   counter_index  INTEGER NOT NULL,
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at     TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (chat_id, entity_type, original_value)
+  PRIMARY KEY (chat_id, entity_type, lookup_hash)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pii_mappings_reverse
@@ -824,6 +831,213 @@ CREATE TABLE IF NOT EXISTS pii_thread_counters (
 CREATE INDEX IF NOT EXISTS idx_pii_counters_expires
   ON pii_thread_counters (expires_at);
 """
+
+
+# ---------------------------------------------------------------------------
+# Vault encryption-at-rest (Task 11 — Option E: encrypted value + blind index)
+# ---------------------------------------------------------------------------
+#
+# All crypto/KMS logic lives inline here (no sibling top-level `.py` files —
+# the Pipelines loader would try to load them as pipelines and fail). The
+# envelope format is ported from the keeper-openwebui fork's chat encryption
+# (`crypto.py`): `open_webui` cannot be imported in the Pipelines container,
+# so the logic is reimplemented rather than imported.
+
+
+class VaultCipher:
+    """AES-256-GCM envelope cipher for vault values (port of the
+    keeper-openwebui ``crypto.py`` ``ENC1:`` format).
+
+    Envelope layout — packed big-endian, then base64-encoded behind an
+    ``ENC1:`` ASCII prefix::
+
+        ENC1:<base64( [1B version=1][4B key_id BE][12B nonce][ciphertext‖16B GCM tag] )>
+
+    A fresh 12-byte random nonce is drawn per ``encrypt`` call. The
+    (key, nonce) pair must never repeat and the nonce must never be derived
+    from a counter: with random 96-bit nonces and the vault's 24-48 h TTL the
+    per-key encryption count stays far below the 2**32 birthday bound where
+    nonce collisions become a concern. ``key_id`` is packed for a future
+    read-old/write-new rotation; the v1 decrypt path parses past it but always
+    uses the single configured key.
+    """
+
+    _PREFIX = "ENC1:"
+    _VERSION = 1
+    _NONCE_LEN = 12
+    _TAG_LEN = 16
+    _HEADER_LEN = 1 + 4  # version + key_id
+
+    def __init__(self, key: bytes, key_id: int = 1) -> None:
+        if len(key) != 32:
+            raise ValueError("VaultCipher key must be exactly 32 bytes (AES-256).")
+        if not 0 <= key_id <= 0xFFFFFFFF:
+            raise ValueError("VaultCipher key_id must fit in an unsigned 32-bit integer.")
+        self._aesgcm = AESGCM(key)
+        self._key_id = key_id
+
+    @staticmethod
+    def is_encrypted(value: str) -> bool:
+        """True if ``value`` carries the ``ENC1:`` envelope prefix."""
+        return value.startswith(VaultCipher._PREFIX)
+
+    def encrypt(self, plaintext: str) -> str:
+        """Encrypt ``plaintext`` into an ``ENC1:`` envelope string."""
+        nonce = os.urandom(self._NONCE_LEN)
+        ct_and_tag = self._aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
+        header = bytes([self._VERSION]) + self._key_id.to_bytes(4, "big")
+        envelope = header + nonce + ct_and_tag
+        return self._PREFIX + base64.b64encode(envelope).decode("ascii")
+
+    def decrypt(self, value: str) -> str:
+        """Decrypt an ``ENC1:`` envelope back to plaintext.
+
+        Raises ``cryptography.exceptions.InvalidTag`` on a wrong key or a
+        tampered ciphertext/tag, and ``ValueError`` on a structurally
+        malformed envelope. Callers on the read path catch both and treat the
+        row as a miss (spec D3 — never raise out of the outlet).
+        """
+        if not self.is_encrypted(value):
+            raise ValueError("VaultCipher.decrypt called on a non-ENC1 value.")
+        raw = base64.b64decode(value[len(self._PREFIX) :], validate=True)
+        if len(raw) < self._HEADER_LEN + self._NONCE_LEN + self._TAG_LEN:
+            raise ValueError("VaultCipher envelope too short to be a valid ENC1 blob.")
+        version = raw[0]
+        if version != self._VERSION:
+            raise ValueError(f"Unsupported VaultCipher envelope version: {version}.")
+        # key_id (raw[1:5]) is parsed past but ignored for v1 (single key).
+        nonce = raw[self._HEADER_LEN : self._HEADER_LEN + self._NONCE_LEN]
+        ct_and_tag = raw[self._HEADER_LEN + self._NONCE_LEN :]
+        return self._aesgcm.decrypt(nonce, ct_and_tag, None).decode("utf-8")
+
+
+class BlindIndex:
+    """Keyed HMAC-SHA256 blind index for thread-scoped dedup.
+
+    The vault PK includes ``lookup_hash`` instead of the (now-encrypted)
+    ``original_value`` so the ``INSERT ... ON CONFLICT`` UPSERT can still dedup
+    a repeated value within a thread. The token is a keyed HMAC, so an attacker
+    with read access to the table cannot recover the plaintext from the hash
+    without the key. The key is independent from the GCM encryption key — byte
+    material is never shared between the two (spec E2).
+    """
+
+    _DOMAIN = b"pii-vault-blind-index-v1"
+
+    def __init__(self, key: bytes) -> None:
+        if len(key) != 32:
+            raise ValueError("BlindIndex key must be exactly 32 bytes.")
+        self._key = key
+
+    def compute(self, chat_id: str, entity_type: str, plaintext: str) -> bytes:
+        """Return the 32-byte blind-index token for ``(chat_id, entity_type, plaintext)``.
+
+        Deterministic within a thread (same inputs → same token, so dedup
+        works) and isolated across threads (``chat_id`` is part of the framed
+        input, so the same PII in chatA vs chatB hashes differently).
+
+        Framing is collision-resistant: a fixed domain tag followed by each
+        field length-prefixed with its big-endian u32 byte length, so no two
+        distinct ``(chat_id, entity_type, plaintext)`` triples can produce the
+        same byte stream (e.g. ``("a", "bc", v)`` vs ``("ab", "c", v)``).
+        """
+        framed = self._DOMAIN
+        for part in (
+            chat_id.encode("utf-8"),
+            entity_type.encode("utf-8"),
+            plaintext.encode("utf-8"),
+        ):
+            framed += len(part).to_bytes(4, "big") + part
+        return hmac.new(self._key, framed, hashlib.sha256).digest()
+
+
+class KeyManager:
+    """Loads the vault encryption + blind-index keys from the configured
+    backend (mirrors the keeper-openwebui ``kms.py`` dual-backend shape).
+
+    ``local``   — keys are base64 valve fields (dev / self-hosted).
+    ``gcp_kms`` — keys are Google Secret Manager payloads; the heavy
+                  ``google-cloud-secret-manager`` import is deferred to that
+                  branch so the default container never pays for it (§8).
+
+    The enc key and the blind-index key are independent 32-byte keys. Keys are
+    loaded once at ``on_startup`` and held in memory by the constructed
+    ``VaultCipher`` / ``BlindIndex``; there is no per-request fetch. Every
+    failure mode (empty key, bad base64, wrong length, missing backend package)
+    raises ``RuntimeError`` so startup fails closed (spec §6 / E6).
+    """
+
+    def __init__(
+        self,
+        *,
+        backend: str,
+        encryption_key_b64: str = "",
+        blind_index_key_b64: str = "",
+        gcp_enc_secret: str = "",
+        gcp_blind_secret: str = "",
+    ) -> None:
+        self._backend = backend
+        self._encryption_key_b64 = encryption_key_b64
+        self._blind_index_key_b64 = blind_index_key_b64
+        self._gcp_enc_secret = gcp_enc_secret
+        self._gcp_blind_secret = gcp_blind_secret
+
+    def load_blind_index_key(self) -> bytes:
+        """Resolve and validate the 32-byte blind-index HMAC key."""
+        return self._resolve("blind_index", self._blind_index_key_b64, self._gcp_blind_secret)
+
+    def load_encryption_key(self) -> bytes:
+        """Resolve and validate the 32-byte AES-256-GCM encryption key."""
+        return self._resolve("encryption", self._encryption_key_b64, self._gcp_enc_secret)
+
+    def _resolve(self, label: str, local_b64: str, gcp_secret: str) -> bytes:
+        if self._backend == "local":
+            return self._decode_32(local_b64, label, f"valve vault_{label}_key")
+        if self._backend == "gcp_kms":
+            return self._decode_32(
+                self._fetch_gcp_secret(gcp_secret, label), label, f"gcp secret '{gcp_secret}'"
+            )
+        raise RuntimeError(
+            f"Unknown vault_kms_backend '{self._backend}'; expected 'local' or 'gcp_kms'."
+        )
+
+    @staticmethod
+    def _decode_32(raw_b64: str, label: str, source: str) -> bytes:
+        if not raw_b64:
+            raise RuntimeError(
+                f"Vault {label} key is empty ({source}). "
+                "A base64-encoded 32-byte key is required."
+            )
+        try:
+            key = base64.b64decode(raw_b64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f"Vault {label} key ({source}) is not valid base64: {exc}") from exc
+        if len(key) != 32:
+            raise RuntimeError(
+                f"Vault {label} key ({source}) decodes to {len(key)} bytes; exactly 32 required."
+            )
+        return key
+
+    @staticmethod
+    def _fetch_gcp_secret(secret_name: str, label: str) -> str:
+        if not secret_name:
+            raise RuntimeError(
+                f"vault_gcp_{label}_secret is empty but vault_kms_backend='gcp_kms'."
+            )
+        try:
+            # Lazy import (§8): keeps the heavy grpc/protobuf chain out of the
+            # default container, which only needs the `local` backend.
+            from google.cloud import secretmanager
+        except ImportError as exc:
+            raise RuntimeError(
+                "vault_kms_backend='gcp_kms' requires the 'google-cloud-secret-manager' "
+                "package, which is not installed in this container. Add it to the prod "
+                "image / a prod requirements profile (handoff to Senka)."
+            ) from exc
+        client = secretmanager.SecretManagerServiceClient()
+        response = client.access_secret_version(name=secret_name)
+        payload: bytes = response.payload.data
+        return payload.decode("utf-8")
 
 
 class ThreadVault:
@@ -871,6 +1085,9 @@ class ThreadVault:
         command_timeout: float = 5.0,
         thread_ttl_seconds: int = 86400,
         ephemeral_ttl_seconds: int = 600,
+        cipher: VaultCipher | None = None,
+        blind_index: BlindIndex | None = None,
+        encryption_strict: bool = False,
     ) -> None:
         self._dsn = dsn
         self._pool_min = pool_min
@@ -878,9 +1095,56 @@ class ThreadVault:
         self._command_timeout = command_timeout
         self._thread_ttl = thread_ttl_seconds
         self._ephemeral_ttl = ephemeral_ttl_seconds
+        # Task 11 vault encryption-at-rest. `blind_index` is required for any
+        # write (lookup_hash is NOT NULL and part of the PK — spec D1); the
+        # production `on_startup` path always constructs one. `cipher` is None
+        # when encryption is disabled, in which case `original_value` is stored
+        # as plaintext. `encryption_strict` controls whether the read path
+        # refuses an unexpected plaintext row (spec §6/§7.2).
+        self._cipher = cipher
+        self._blind_index = blind_index
+        self._encryption_strict = encryption_strict
         # Pool is created lazily by `initialize()` so `__init__` never opens
         # sockets and remains safe for unit-test instantiation.
         self._pool: asyncpg.Pool[asyncpg.Record] | None = None
+
+    def _decrypt_stored_value(self, stored: str, chat_id: str, placeholder: str) -> str | None:
+        """Decrypt a stored ``original_value`` for the read path.
+
+        Returns the plaintext, or ``None`` when the row must be treated as a
+        miss/skip. Never raises (spec D3 — the outlet must never crash, so a
+        skipped row simply leaves its placeholder in the user-facing text):
+
+          * ENC1 envelope → decrypt; on ``InvalidTag`` / malformed envelope →
+            log WARN and return ``None``.
+          * plaintext while encryption is enabled (cipher present) and
+            ``encryption_strict`` → unexpected; log ERROR and return ``None``.
+          * plaintext otherwise (encryption disabled, or non-strict legacy
+            row) → return as-is.
+        """
+        cipher = self._cipher
+        if cipher is not None and cipher.is_encrypted(stored):
+            try:
+                return cipher.decrypt(stored)
+            except (InvalidTag, ValueError) as exc:
+                logger.warning(
+                    "Vault decrypt failed for chat_id=%s placeholder=%s (%s: %s); "
+                    "skipping row, placeholder left masked.",
+                    chat_id,
+                    placeholder,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None
+        if cipher is not None and self._encryption_strict:
+            logger.error(
+                "Vault strict mode: unexpected plaintext original_value for "
+                "chat_id=%s placeholder=%s; refusing to serve, row skipped.",
+                chat_id,
+                placeholder,
+            )
+            return None
+        return stored
 
     # -- helpers -------------------------------------------------------------
 
@@ -1021,19 +1285,33 @@ class ThreadVault:
             minted_index = int(counter_row["minted_index"])
             candidate = f"[{entity_type}_{minted_index}]"
 
+            # Task 11: the blind index is always computed (lookup_hash is NOT
+            # NULL and part of the PK — spec D1); `original_value` is ciphertext
+            # only when encryption is enabled (cipher present), else the raw
+            # plaintext is stored.
+            blind_index = self._blind_index
+            if blind_index is None:
+                raise RuntimeError(
+                    "ThreadVault.get_placeholder requires a BlindIndex (lookup_hash is "
+                    "NOT NULL); construct the vault with a blind_index (spec D1)."
+                )
+            lookup_hash = blind_index.compute(chat_id, entity_type, original)
+            stored = self._cipher.encrypt(original) if self._cipher is not None else original
+
             mapping_row = await conn.fetchrow(
                 """
                 INSERT INTO pii_thread_mappings
-                  (chat_id, entity_type, original_value, placeholder,
-                   counter_index, expires_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (chat_id, entity_type, original_value) DO UPDATE
+                  (chat_id, entity_type, original_value, lookup_hash,
+                   placeholder, counter_index, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (chat_id, entity_type, lookup_hash) DO UPDATE
                   SET expires_at = EXCLUDED.expires_at
                 RETURNING placeholder
                 """,
                 chat_id,
                 entity_type,
-                original,
+                stored,
+                lookup_hash,
                 candidate,
                 minted_index,
                 expires_at,
@@ -1070,7 +1348,11 @@ class ThreadVault:
             )
         if row is None:
             return None
-        return cast("str | None", row["original_value"])
+        # Task 11: `original_value` is an ENC1 envelope (or plaintext when
+        # encryption is disabled). Decrypt with the never-raise fallback so a
+        # tampered / wrong-key / unexpected-plaintext row reads as a miss.
+        stored = cast(str, row["original_value"])
+        return self._decrypt_stored_value(stored, chat_id, placeholder)
 
     async def snapshot_for_request(self, chat_id: str) -> tuple[dict[str, str], dict[str, str]]:
         """Return forward + reverse maps for this thread.
@@ -1109,8 +1391,23 @@ class ThreadVault:
                 chat_id,
             )
 
-        forward: dict[str, str] = {row["original_value"]: row["placeholder"] for row in rows}
-        reverse: dict[str, str] = {row["placeholder"]: row["original_value"] for row in rows}
+        # Task 11: decrypt each stored `original_value` before building the
+        # plaintext-keyed maps. A row that fails decryption (tampered / wrong
+        # key) or is unexpected plaintext in strict mode is skipped — never
+        # raising preserves the never-crash outlet contract (spec D3 / §7.3).
+        # Both maps stay keyed/valued on plaintext (in-memory only), exactly as
+        # before; the outlet `restore_text` is unchanged.
+        forward: dict[str, str] = {}
+        reverse: dict[str, str] = {}
+        for row in rows:
+            placeholder = cast(str, row["placeholder"])
+            original = self._decrypt_stored_value(
+                cast(str, row["original_value"]), chat_id, placeholder
+            )
+            if original is None:
+                continue
+            forward[original] = placeholder
+            reverse[placeholder] = original
         return forward, reverse
 
 
@@ -1316,6 +1613,41 @@ class Pipeline:
         # Per-query timeout (ms). Caps any single query at 5s — prevents
         # zombie connections from hanging the pool.
         postgres_command_timeout_ms: int = 5000
+        # ---- Task 11: vault encryption-at-rest (Option E) ------------------
+        # Application-layer AES-256-GCM encryption of `original_value` plus a
+        # keyed HMAC blind index (`lookup_hash`) for dedup. The blind index is
+        # ALWAYS computed when the vault runs (lookup_hash is NOT NULL and part
+        # of the PK — spec D1), so the blind-index key is required regardless of
+        # the flags below; `vault_encryption_enabled` only controls whether
+        # `original_value` is stored as ciphertext (True) or plaintext (False).
+        # Keys are validated fail-closed at on_startup (§6); no key material is
+        # ever logged.
+        #
+        # When True, `original_value` is stored as an ENC1 envelope. Default
+        # OFF; greenfield prod sets this (and `vault_encryption_strict`) True.
+        vault_encryption_enabled: bool = False
+        # When True, the read path refuses an unexpected plaintext row (one not
+        # carrying the ENC1 envelope while encryption is enabled): it logs ERROR
+        # and treats the row as a miss rather than serving raw PII. Recommended
+        # True in prod (greenfield prod should never hold plaintext rows).
+        vault_encryption_strict: bool = False
+        # Key backend. "local" reads the base64 keys from the valve fields
+        # below; "gcp_kms" lazy-loads google-cloud-secret-manager and fetches
+        # the named secrets. Prod uses gcp_kms (handoff to Senka).
+        vault_kms_backend: Literal["local", "gcp_kms"] = "local"
+        # base64-encoded 32-byte AES-256 key (local backend). Required when
+        # vault_encryption_enabled=True. Dev-only; prod uses Secret Manager.
+        vault_encryption_key: str = ""
+        # base64-encoded 32-byte HMAC key for the blind index (local backend).
+        # ALWAYS required when the vault runs (spec D1). Dev-only.
+        vault_blind_index_key: str = ""
+        # Envelope key_id (u32), packed into the ENC1 header for a future
+        # read-old/write-new key rotation. v1 ships a single key.
+        vault_encryption_key_id: int = 1
+        # gcp_kms backend: Secret Manager resource names whose payloads are the
+        # base64 32-byte keys. Ignored for the local backend.
+        vault_gcp_enc_secret: str = ""
+        vault_gcp_blind_secret: str = ""
         # ---- Task 3.1: Recognizer accuracy --------------------------------
         # Case-insensitive denylist for PERSON entities. An entity is dropped
         # if its lowercased text exactly matches an entry OR starts with an
@@ -1664,6 +1996,42 @@ class Pipeline:
         analyzer.analyze(text="warmup", language=lang_code, entities=None)
         return analyzer
 
+    def _build_vault_crypto(self) -> tuple[VaultCipher | None, BlindIndex]:
+        """Build the vault's blind index (always) and cipher (when encryption
+        is enabled), validating keys fail-closed per spec §6.
+
+        The blind-index key is required whenever the vault runs (lookup_hash is
+        NOT NULL and part of the PK — spec D1); the encryption key is required
+        only when ``vault_encryption_enabled``. ``extra="ignore"`` on the Valves
+        means a typo'd env var silently stays empty, so an empty / non-base64 /
+        wrong-length key raises ``RuntimeError`` here — analogous to the
+        existing ``postgres_url`` guard. Logs one INFO line (backend, encryption
+        on/off, strict on/off, key_id) with NO key material.
+        """
+        valves = self.valves
+        key_manager = KeyManager(
+            backend=valves.vault_kms_backend,
+            encryption_key_b64=valves.vault_encryption_key,
+            blind_index_key_b64=valves.vault_blind_index_key,
+            gcp_enc_secret=valves.vault_gcp_enc_secret,
+            gcp_blind_secret=valves.vault_gcp_blind_secret,
+        )
+        # Blind index key is always required (spec D1).
+        blind_index = BlindIndex(key_manager.load_blind_index_key())
+        cipher: VaultCipher | None = None
+        if valves.vault_encryption_enabled:
+            cipher = VaultCipher(
+                key_manager.load_encryption_key(), key_id=valves.vault_encryption_key_id
+            )
+        logger.info(
+            "PII Filter vault crypto ready: backend=%s encryption=%s strict=%s key_id=%d",
+            valves.vault_kms_backend,
+            "on" if cipher is not None else "off",
+            "on" if valves.vault_encryption_strict else "off",
+            valves.vault_encryption_key_id,
+        )
+        return cipher, blind_index
+
     async def on_startup(self) -> None:
         """Validate language config, build per-language AnalyzerEngines, wire vault."""
         languages = self.valves.languages
@@ -1701,6 +2069,10 @@ class Pipeline:
                     "Set the env var (or the valves.postgres_url admin setting) "
                     "to a valid DSN."
                 )
+            # Task 11: build + validate vault crypto BEFORE opening the pool so
+            # a missing/short/invalid key fails closed at startup without any
+            # DB I/O (spec §6).
+            cipher, blind_index = self._build_vault_crypto()
             self.vault = ThreadVault(
                 dsn=self.valves.postgres_url,
                 pool_min=self.valves.postgres_pool_min,
@@ -1708,6 +2080,9 @@ class Pipeline:
                 command_timeout=self.valves.postgres_command_timeout_ms / 1000.0,
                 thread_ttl_seconds=self.valves.thread_ttl_seconds,
                 ephemeral_ttl_seconds=self.valves.ephemeral_ttl_seconds,
+                cipher=cipher,
+                blind_index=blind_index,
+                encryption_strict=self.valves.vault_encryption_strict,
             )
             await self.vault.initialize()
             healthy = await self.vault.healthcheck()

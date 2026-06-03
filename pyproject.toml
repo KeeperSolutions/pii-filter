@@ -58,6 +58,15 @@ ignore_missing_imports = true
 module = "pytest_postgresql.*"
 ignore_missing_imports = true
 
+# Task 11: google-cloud-secret-manager is lazy-imported only in the
+# `gcp_kms` KeyManager branch and is deliberately NOT in the default
+# container deps (heavy grpc/protobuf chain — added to the prod image by
+# Senka). Treat the missing import as untyped so mypy --strict passes
+# without the package installed locally.
+[[tool.mypy.overrides]]
+module = "google.cloud.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

@@ -14,6 +14,12 @@ asyncpg>=0.29.0
 # (PII_FILTER_* prefix). Required at Pipelines runtime.
 pydantic-settings>=2.0
 
+# Task 11: application-layer AES-256-GCM encryption-at-rest for the vault
+# (ENC1 envelope) + HMAC-SHA256 blind index. Clean manylinux wheel, no build
+# step. Mirrors the `cryptography>=42.0` entry in the frontmatter requirements
+# line (the Pipelines container reads that line, not this file).
+cryptography>=42.0
+
 # HR spaCy model (hard requirement — no EN fallback per spec).
 # Pipelines container reads this URL line from the frontmatter `requirements:` field.
 https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
