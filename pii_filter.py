@@ -1021,9 +1021,13 @@ class KeyManager:
     @staticmethod
     def _fetch_gcp_secret(secret_name: str, label: str) -> str:
         if not secret_name:
-            raise RuntimeError(
-                f"vault_gcp_{label}_secret is empty but vault_kms_backend='gcp_kms'."
-            )
+            # Map the internal label back to the real valve field name so the
+            # fail-closed message points operators at the right env var.
+            field = {
+                "encryption": "vault_gcp_enc_secret",
+                "blind_index": "vault_gcp_blind_secret",
+            }.get(label, f"vault_gcp_{label}_secret")
+            raise RuntimeError(f"{field} is empty but vault_kms_backend='gcp_kms'.")
         try:
             # Lazy import (§8): keeps the heavy grpc/protobuf chain out of the
             # default container, which only needs the `local` backend.

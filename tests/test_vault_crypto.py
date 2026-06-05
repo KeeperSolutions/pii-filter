@@ -182,6 +182,20 @@ def test_key_manager_unknown_backend_raises() -> None:
         manager.load_blind_index_key()
 
 
+def test_key_manager_gcp_empty_secret_names_real_valve_field() -> None:
+    """The fail-closed message for an empty gcp secret names the actual valve
+    field (`vault_gcp_enc_secret` / `vault_gcp_blind_secret`), not a
+    `vault_gcp_<label>_secret` placeholder — so an operator is pointed at the
+    right env var. The empty-name guard runs before the lazy google.cloud
+    import, so no package is required to exercise it.
+    """
+    manager = KeyManager(backend="gcp_kms", gcp_enc_secret="", gcp_blind_secret="")
+    with pytest.raises(RuntimeError, match="vault_gcp_enc_secret"):
+        manager.load_encryption_key()
+    with pytest.raises(RuntimeError, match="vault_gcp_blind_secret"):
+        manager.load_blind_index_key()
+
+
 # ---------------------------------------------------------------------------
 # Pipeline._build_vault_crypto — on_startup fail-closed validation (§6)
 # ---------------------------------------------------------------------------
@@ -266,6 +280,21 @@ def test_decrypt_stored_value_tampered_returns_none() -> None:
     raw[-1] ^= 0x01
     tampered = _ENC1 + base64.b64encode(bytes(raw)).decode("ascii")
     assert vault._decrypt_stored_value(tampered, "chatA", "[PERSON_1]") is None
+
+
+def test_decrypt_stored_value_malformed_envelope_returns_none() -> None:
+    """A row carrying the ENC1 prefix but a structurally broken body is skipped
+    (None), never raised. ``base64.b64decode(validate=True)`` raises
+    ``binascii.Error`` which is a ``ValueError`` subclass, so it is caught by
+    the read path's ``(InvalidTag, ValueError)`` handler — this locks that in
+    (regression guard for a code-review false positive).
+    """
+    vault = _vault(encryption=True, strict=False)
+    # Body is not valid base64 at all → binascii.Error (a ValueError subclass).
+    assert vault._decrypt_stored_value("ENC1:@@@not-base64@@@", "chatA", "[PERSON_1]") is None
+    # Valid base64 but too short to hold version + key_id + nonce + tag.
+    too_short = _ENC1 + base64.b64encode(b"short").decode("ascii")
+    assert vault._decrypt_stored_value(too_short, "chatA", "[PERSON_1]") is None
 
 
 def test_decrypt_stored_value_plaintext_non_strict_returns_asis() -> None:
