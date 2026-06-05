@@ -5,6 +5,56 @@ All notable changes to `pii-filter` are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] — 2026-06-03
+
+### Added — vault encryption-at-rest (Task 11, Option E)
+
+Application-layer AES-256-GCM encryption of the stored PII so the vault can
+hold customer data under GDPR Art. 32 in a multi-tenant deployment. The
+`original_value` column now stores a random-nonce `ENC1:` envelope; dedup is
+preserved via a keyed HMAC **blind index** (`lookup_hash`).
+
+- **Added** an inline crypto section in `pii_filter.py` (above `class
+  ThreadVault`): `VaultCipher` (AES-256-GCM `ENC1:<base64(...)>` envelope —
+  `[1B version][4B key_id][12B nonce][ciphertext‖16B tag]`, ported from the
+  keeper-openwebui `crypto.py`), `BlindIndex` (HMAC-SHA256 with domain-tagged,
+  length-prefixed framing of `chat_id‖entity_type‖plaintext`), and
+  `KeyManager` (dual `local` / `gcp_kms` key backend).
+- **Added** eight `Valves` fields (env prefix `PII_FILTER_`):
+  `vault_encryption_enabled` (default `false`), `vault_encryption_strict`
+  (default `false`), `vault_kms_backend` (`local`|`gcp_kms`, default `local`),
+  `vault_encryption_key`, `vault_blind_index_key`, `vault_encryption_key_id`
+  (default `1`), `vault_gcp_enc_secret`, `vault_gcp_blind_secret`.
+- **Added** fail-closed key validation at `on_startup`: the blind-index key is
+  always required (it backs the NOT NULL `lookup_hash`); the encryption key is
+  required when encryption is enabled. An empty / non-base64 / non-32-byte key
+  raises `RuntimeError` at startup. No key material is ever logged.
+- **Added** `cryptography>=42.0` to the `requirements:` frontmatter and
+  `requirements.txt`. `google-cloud-secret-manager` is **not** in the default
+  deps — it is lazy-imported only in the `gcp_kms` backend (heavy grpc/protobuf
+  chain; added to the prod image by Senka).
+- **Decrypt never crashes the outlet:** a row that fails GCM tag verification
+  (tamper / wrong key) or is unexpectedly plaintext in strict mode is logged
+  and **skipped** — its placeholder stays masked in the user-facing text.
+
+### Changed — schema (breaking for existing dev DBs)
+
+- `pii_thread_mappings` gains `lookup_hash BYTEA NOT NULL`; the primary key
+  moves from `(chat_id, entity_type, original_value)` to
+  `(chat_id, entity_type, lookup_hash)`. `pii_thread_counters` and both
+  indexes are unchanged.
+- **Breaking for dev:** `CREATE TABLE IF NOT EXISTS` does **not** migrate an
+  existing table, so a local `keeper-postgres` volume with the old schema must
+  be dropped before first run on v0.9.7:
+
+  ```sql
+  DROP TABLE IF EXISTS pii_thread_mappings;
+  DROP TABLE IF EXISTS pii_thread_counters;
+  ```
+
+  Production is greenfield (empty DB) → first `initialize()` creates the new
+  schema; no backfill / data migration is required.
+
 ## [0.9.5] — 2026-05-26
 
 ### Removed — Redis backend (Task 9, breaking)

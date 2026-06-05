@@ -2,7 +2,7 @@
 
 PII detection and masking pipeline for the Keeper AI Gateway (OpenWebUI Pipelines integration).
 
-**Current version: 0.9.2** — multi-language (HR + EN), PostgreSQL vault, multi-turn history, 19 entity types.
+**Current version: 0.9.7** — multi-language (HR + EN), PostgreSQL vault with AES-256-GCM encryption-at-rest, multi-turn history, 19 entity types.
 
 ---
 
@@ -176,6 +176,7 @@ Result: only [EMAIL_1] and [PHONE_1] are masked, no spurious [PERSON_1]
 | spaCy `en_core_web_lg` | 3.7.0 | English NER |
 | asyncpg | ≥ 0.29.0 | PostgreSQL vault (async connection pool) |
 | pydantic-settings | ≥ 2.0 | Valve env-var loading |
+| cryptography | ≥ 42.0 | AES-256-GCM vault encryption-at-rest (ENC1 envelope) |
 
 ---
 
@@ -194,8 +195,67 @@ All valves are visible in OpenWebUI Admin → Pipelines and can be overridden vi
 | `multi_turn_history_max_messages` | `20` | `PII_FILTER_MULTI_TURN_HISTORY_MAX_MESSAGES` | Max user messages processed per request |
 | `ner_deny_list` | *(built-in list)* | `PII_FILTER_NER_DENY_LIST` | Suppress false-positive PERSON entities by exact match |
 | `ner_oib_phone_context_window` | `30` | `PII_FILTER_NER_OIB_PHONE_CONTEXT_WINDOW` | Look-back window (chars) to detect phone context near 11-digit numbers |
+| `vault_encryption_enabled` | `false` | `PII_FILTER_VAULT_ENCRYPTION_ENABLED` | Store `original_value` as an AES-256-GCM `ENC1:` envelope (vs plaintext) |
+| `vault_encryption_strict` | `false` | `PII_FILTER_VAULT_ENCRYPTION_STRICT` | Refuse to serve an unexpected plaintext row (recommended `true` in prod) |
+| `vault_kms_backend` | `"local"` | `PII_FILTER_VAULT_KMS_BACKEND` | Key source — `"local"` (env base64) or `"gcp_kms"` (Secret Manager) |
+| `vault_encryption_key` | `""` | `PII_FILTER_VAULT_ENCRYPTION_KEY` | base64 32-byte AES key (local backend; required when encryption enabled) |
+| `vault_blind_index_key` | `""` | `PII_FILTER_VAULT_BLIND_INDEX_KEY` | base64 32-byte HMAC key (local backend; **always** required when vault runs) |
+| `vault_encryption_key_id` | `1` | `PII_FILTER_VAULT_ENCRYPTION_KEY_ID` | Envelope key_id (u32), packed for future key rotation |
+| `vault_gcp_enc_secret` | `""` | `PII_FILTER_VAULT_GCP_ENC_SECRET` | Secret Manager resource name for the enc key (`gcp_kms` backend) |
+| `vault_gcp_blind_secret` | `""` | `PII_FILTER_VAULT_GCP_BLIND_SECRET` | Secret Manager resource name for the blind-index key (`gcp_kms` backend) |
 
 **Per-user toggle (UserValves):** each user can disable PII masking for their own sessions via `pii_masking_enabled`.
+
+---
+
+## Vault encryption-at-rest (Option E)
+
+The vault stores PII under application-layer **AES-256-GCM** encryption so the
+`pii_thread_mappings.original_value` column never holds plaintext customer data
+(GDPR Art. 32). Because a random-nonce cipher would break the UPSERT dedup
+(same value → different ciphertext → no conflict), dedup is preserved by a
+keyed **blind index**: `lookup_hash = HMAC-SHA256(blind_key, framed(chat_id,
+entity_type, plaintext))`. `lookup_hash` is `NOT NULL` and part of the primary
+key, so it is **always** computed when the vault runs — the blind-index key is
+required whenever `vault_enabled=true`, even with encryption disabled.
+`vault_encryption_enabled` only controls whether `original_value` is ciphertext
+or plaintext.
+
+Stored envelope format: `ENC1:<base64( [1B version][4B key_id][12B nonce][ciphertext‖16B GCM tag] )>`.
+
+**Key management**
+
+- **`local` (dev / self-hosted):** keys are base64-encoded 32-byte values in
+  `PII_FILTER_VAULT_ENCRYPTION_KEY` / `PII_FILTER_VAULT_BLIND_INDEX_KEY`.
+  Generate one with:
+  ```bash
+  python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+  ```
+  See `.env.example` for a full local block. The enc key and blind-index key
+  must be **independent** keys.
+- **`gcp_kms` (production):** set `PII_FILTER_VAULT_KMS_BACKEND=gcp_kms` and
+  point `PII_FILTER_VAULT_GCP_ENC_SECRET` / `PII_FILTER_VAULT_GCP_BLIND_SECRET`
+  at Google Secret Manager resource names whose payloads are the base64 keys.
+  This path lazy-imports `google-cloud-secret-manager`, which is **not** in the
+  default container image — **handoff to Senka:** add it to the prod image / a
+  prod requirements profile before enabling `gcp_kms`.
+
+Keys are validated fail-closed at `on_startup` (empty / non-base64 / non-32-byte
+→ `RuntimeError`); no key material is ever logged. Set
+`vault_encryption_strict=true` in production so an unexpected plaintext row is
+refused rather than served.
+
+**Breaking schema change (existing dev DBs):** `CREATE TABLE IF NOT EXISTS`
+does not migrate an existing table, so a local `keeper-postgres` volume with
+the pre-v0.9.7 schema must be dropped before first run:
+
+```sql
+DROP TABLE IF EXISTS pii_thread_mappings;
+DROP TABLE IF EXISTS pii_thread_counters;
+```
+
+Production is greenfield (empty DB) → the new schema is created on first
+`initialize()`; no backfill is required.
 
 ---
 
@@ -285,6 +345,7 @@ PII_FILTER_POSTGRES_URL=postgresql://user:pass@/db?host=/cloudsql/<INSTANCE_CONN
 | Task 3.3 | TRAU-426 | NER spillover guard — window language classifier eliminates cross-language false positives |
 | Task 8 | TRAU-451 | UserValves `pii_masking_enabled` per-user toggle wired into inlet; Valves `presidio_enabled` admin kill switch |
 | Task 9 | — | Redis backend removal — `PostgresThreadVault` renamed to `ThreadVault`; `vault_backend` / `redis_*` valves dropped; `redis` / `fakeredis` / `lupa` deps gone (v0.9.5) |
+| Task 11 | — | Vault encryption-at-rest (Option E) — AES-256-GCM `ENC1` envelope for `original_value` + HMAC-SHA256 blind index (`lookup_hash`); `local` / `gcp_kms` key backends; `cryptography` dep (v0.9.7) |
 
 ---
 

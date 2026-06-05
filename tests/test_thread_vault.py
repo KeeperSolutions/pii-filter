@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from pii_filter import make_ephemeral_thread_id
-from tests.conftest import postgres_binary_missing
+from pii_filter import VaultCipher, make_ephemeral_thread_id
+from tests.conftest import VAULT_TEST_ENC_KEY, postgres_binary_missing
 
 if TYPE_CHECKING:
     from pii_filter import ThreadVault
@@ -237,34 +237,36 @@ async def test_snapshot_excludes_expired_rows(postgres_vault: ThreadVault) -> No
     """Postgres-specific: snapshot's `WHERE expires_at > now()` filter hides
     rows whose deadline has passed; the bulk TTL renewal in `snapshot_for_request`
     then refreshes only the still-live entries (it issues SET expires_at = $2
-    against ALL rows, but the SELECT after that runs the lazy filter)."""
-    await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
-    await postgres_vault.get_placeholder("chatA", "Ana Marić", "PERSON")
+    against ALL rows, but the SELECT after that runs the lazy filter).
+
+    Task 11: `original_value` is now an ENC1 ciphertext, so rows are targeted
+    and asserted by their (plaintext) `placeholder` rather than by value.
+    """
+    ph_ivan = await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
+    ph_ana = await postgres_vault.get_placeholder("chatA", "Ana Marić", "PERSON")
 
     pool = postgres_vault._pool
     assert pool is not None
     async with pool.acquire() as conn:
-        # Re-poison Ivan's row to look expired AFTER the bulk renewal step
-        # would normally fire — we cheat by setting `expires_at` to NOW()-60s
-        # mid-test and then immediately calling snapshot_for_request, which
-        # bumps every row to a future expiry. So the assertion must run after
-        # we manually re-expire just one row again. The cleanest test is to
-        # bypass the renewal: set the row to expired and call a raw SELECT.
+        # Bypass the renewal: set just Ivan's row to expired and call a raw
+        # SELECT. Target by placeholder (plaintext) — the encrypted
+        # `original_value` cannot be matched by a literal in SQL.
         past = datetime.now(tz=UTC) - timedelta(seconds=60)
         await conn.execute(
             """
             UPDATE pii_thread_mappings
             SET expires_at = $2
-            WHERE chat_id = $1 AND original_value = $3
+            WHERE chat_id = $1 AND placeholder = $3
             """,
             "chatA",
             past,
-            "Ivan Horvat",
+            ph_ivan,
         )
         # Verify the row exists physically.
         row = await conn.fetchrow(
-            "SELECT placeholder FROM pii_thread_mappings WHERE original_value = $1",
-            "Ivan Horvat",
+            "SELECT placeholder FROM pii_thread_mappings WHERE chat_id = $1 AND placeholder = $2",
+            "chatA",
+            ph_ivan,
         )
     assert row is not None  # row physically present
 
@@ -275,14 +277,14 @@ async def test_snapshot_excludes_expired_rows(postgres_vault: ThreadVault) -> No
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT original_value FROM pii_thread_mappings
+            SELECT placeholder FROM pii_thread_mappings
             WHERE chat_id = $1 AND expires_at > now()
             """,
             "chatA",
         )
-    visible_originals = {row["original_value"] for row in rows}
-    assert "Ana Marić" in visible_originals
-    assert "Ivan Horvat" not in visible_originals
+    visible_placeholders = {row["placeholder"] for row in rows}
+    assert ph_ana in visible_placeholders
+    assert ph_ivan not in visible_placeholders
 
 
 async def test_snapshot_does_not_resurrect_expired_rows(
@@ -301,18 +303,20 @@ async def test_snapshot_does_not_resurrect_expired_rows(
     assert pool is not None
     past = datetime.now(tz=UTC) - timedelta(seconds=60)
     async with pool.acquire() as conn:
-        # Expire Ivan's mapping but leave Ana's alone.
+        # Expire Ivan's mapping but leave Ana's alone. Target by placeholder
+        # (plaintext) — `original_value` is now an encrypted ENC1 blob.
         await conn.execute(
             "UPDATE pii_thread_mappings SET expires_at = $2 "
-            "WHERE chat_id = $1 AND original_value = $3",
+            "WHERE chat_id = $1 AND placeholder = $3",
             "chatA",
             past,
-            "Ivan Horvat",
+            placeholder_ivan,
         )
 
     forward, reverse = await postgres_vault.snapshot_for_request("chatA")
 
-    # Ana is live → in the snapshot.
+    # Ana is live → in the snapshot. The snapshot decrypts each row, so the
+    # maps are keyed/valued on plaintext exactly as before.
     assert forward.get("Ana Marić") == placeholder_ana
     assert reverse.get(placeholder_ana) == "Ana Marić"
     # Ivan was expired → snapshot must hide him.
@@ -323,10 +327,9 @@ async def test_snapshot_does_not_resurrect_expired_rows(
     # `expires_at` by the bulk renewal).
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT expires_at FROM pii_thread_mappings "
-            "WHERE chat_id = $1 AND original_value = $2",
+            "SELECT expires_at FROM pii_thread_mappings " "WHERE chat_id = $1 AND placeholder = $2",
             "chatA",
-            "Ivan Horvat",
+            placeholder_ivan,
         )
     assert row is not None
     assert row["expires_at"] <= datetime.now(tz=UTC)
@@ -687,3 +690,81 @@ async def test_mapping_row_records_counter_index_and_created_at(
     assert isinstance(created_at_val, datetime)
     # Should be very recent.
     assert datetime.now(tz=UTC) - created_at_val < timedelta(seconds=30)
+
+
+# ---------------------------------------------------------------------------
+# Task 11 — encryption-at-rest (the `postgres_vault` fixture runs with
+# encryption ON; see conftest). These pin the DB-level behavior that the pure
+# unit tests in test_vault_crypto.py cannot reach.
+# ---------------------------------------------------------------------------
+
+
+async def test_original_value_stored_as_ciphertext(postgres_vault: ThreadVault) -> None:
+    """With encryption ON, the raw `original_value` column is an ENC1 envelope
+    (not plaintext) and decrypts back to the original value."""
+    placeholder = await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
+
+    pool = postgres_vault._pool
+    assert pool is not None
+    async with pool.acquire() as conn:
+        stored: str = await conn.fetchval(
+            "SELECT original_value FROM pii_thread_mappings "
+            "WHERE chat_id = $1 AND placeholder = $2",
+            "chatA",
+            placeholder,
+        )
+
+    assert VaultCipher.is_encrypted(stored)
+    assert stored.startswith("ENC1:")
+    assert "Ivan Horvat" not in stored  # plaintext never appears on disk
+    # The fixture's enc key decrypts it back to the original plaintext.
+    assert VaultCipher(VAULT_TEST_ENC_KEY).decrypt(stored) == "Ivan Horvat"
+
+
+async def test_upsert_dedup_under_encryption(postgres_vault: ThreadVault) -> None:
+    """Same value twice → one row, same placeholder, and the stored ciphertext
+    is NOT re-minted on the second call (ON CONFLICT only bumps expires_at —
+    spec §7.1.5). The blind index makes the UPSERT dedup deterministic even
+    though each encryption draws a fresh random nonce."""
+    pool = postgres_vault._pool
+    assert pool is not None
+
+    first = await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
+    async with pool.acquire() as conn:
+        stored_after_first: str = await conn.fetchval(
+            "SELECT original_value FROM pii_thread_mappings "
+            "WHERE chat_id = $1 AND placeholder = $2",
+            "chatA",
+            first,
+        )
+
+    second = await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT original_value FROM pii_thread_mappings WHERE chat_id = $1",
+            "chatA",
+        )
+
+    assert first == second  # same placeholder (dedup)
+    assert len(rows) == 1  # exactly one mapping row
+    # Ciphertext unchanged on the second call (no fresh-nonce re-encryption).
+    assert rows[0]["original_value"] == stored_after_first
+
+
+async def test_primary_key_is_on_lookup_hash(postgres_vault: ThreadVault) -> None:
+    """The mappings PK is (chat_id, entity_type, lookup_hash); `original_value`
+    is no longer part of the primary key (spec §3)."""
+    pool = postgres_vault._pool
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT a.attname AS col
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+            WHERE i.indrelid = 'pii_thread_mappings'::regclass AND i.indisprimary
+            """
+        )
+    pk_cols = {row["col"] for row in rows}
+    assert pk_cols == {"chat_id", "entity_type", "lookup_hash"}
+    assert "original_value" not in pk_cols
