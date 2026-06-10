@@ -2597,13 +2597,15 @@ class Pipeline:
         # `original`, `placeholder`, or the maps. The plaintext-bearing
         # `pii_detections` list never leaves the pipeline (defense-in-depth);
         # the frontend reconstructs values from the user's own message text.
-        last_user_idx = next(
-            (
-                i
-                for i in range(len(messages) - 1, -1, -1)
-                if isinstance(messages[i], dict) and messages[i].get("role") == "user"
-            ),
-            None,
+        # Only the *current* user turn gets a card: the last message must itself
+        # be a user message. On regeneration (trailing assistant/non-user
+        # message) we emit nothing, so the card never attaches to a stale prior
+        # turn whose offsets no longer match what the frontend renders.
+        # `messages` is guaranteed non-empty here (guarded at the top of inlet).
+        last_user_idx = (
+            len(messages) - 1
+            if isinstance(messages[-1], dict) and messages[-1].get("role") == "user"
+            else None
         )
         emit_card = last_user_idx is not None and self._is_single_text_part(
             messages[last_user_idx]

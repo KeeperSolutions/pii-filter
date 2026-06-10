@@ -529,6 +529,108 @@ async def test_inlet_preserves_pii_detections_with_placeholder(
 
 
 @pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_public_detections_slim_and_no_leak(started_pipeline: Pipeline) -> None:
+    """`pii_detections_public` carries ONLY {type,start,end}; offsets align with
+    the pre-mask original text and no plaintext (`original`/`placeholder`) leaks."""
+    oib = _make_oib("1234567890")
+    original_text = f"My OIB is {oib}"
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": original_text}],
+        "metadata": {"chat_id": "public-1"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    public = result["metadata"]["pii_detections_public"]
+    assert public, "expected at least one public detection"
+    det = next(d for d in public if d["type"] == "HR_OIB")
+    # Slim shape: exactly these three keys, nothing else.
+    assert set(det.keys()) == {"type", "start", "end"}
+    # Offsets are relative to the pre-mask original string.
+    assert original_text[det["start"] : det["end"]] == oib
+    # No plaintext / placeholder / internal field leaks anywhere in the list.
+    for d in public:
+        assert "original" not in d
+        assert "placeholder" not in d
+        assert "entity_type" not in d
+        assert "score" not in d
+        assert "raw_entity_type" not in d
+        assert "message_index" not in d
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_public_detections_empty_when_no_pii(started_pipeline: Pipeline) -> None:
+    """No PII in the last user message → empty public list (card suppressed)."""
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": "the weather is quite nice this afternoon"}],
+        "metadata": {"chat_id": "public-2"},
+    }
+    result = await started_pipeline.inlet(body)
+    assert result["metadata"]["pii_detections_public"] == []
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_public_detections_empty_on_regeneration(started_pipeline: Pipeline) -> None:
+    """Last message is an assistant turn (regeneration) → empty public list."""
+    oib = _make_oib("1234567890")
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": f"My OIB is {oib}"},
+            {"role": "assistant", "content": "Got it."},
+        ],
+        "metadata": {"chat_id": "public-3"},
+    }
+    result = await started_pipeline.inlet(body)
+    assert result["metadata"]["pii_detections_public"] == []
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_public_detections_empty_on_multimodal_multi_text(
+    started_pipeline: Pipeline,
+) -> None:
+    """Multimodal message with ≥2 text parts → guard fires → empty public list
+    (per-part offsets would collide on the flat frontend string)."""
+    oib = _make_oib("1234567890")
+    body: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"My OIB is {oib}"},
+                    {"type": "text", "text": "and a second part"},
+                ],
+            }
+        ],
+        "metadata": {"chat_id": "public-4"},
+    }
+    result = await started_pipeline.inlet(body)
+    assert result["metadata"]["pii_detections_public"] == []
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_public_detections_single_text_part_multimodal(
+    started_pipeline: Pipeline,
+) -> None:
+    """Multimodal message with exactly one text part still emits a slim card,
+    with offsets relative to that text part's string."""
+    oib = _make_oib("1234567890")
+    text_value = f"My OIB is {oib}"
+    image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,XYZ"}}
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": text_value}, image_part]}
+        ],
+        "metadata": {"chat_id": "public-5"},
+    }
+    result = await started_pipeline.inlet(body)
+
+    public = result["metadata"]["pii_detections_public"]
+    assert public, "expected a public detection for the single text part"
+    det = next(d for d in public if d["type"] == "HR_OIB")
+    assert set(det.keys()) == {"type", "start", "end"}
+    assert text_value[det["start"] : det["end"]] == oib
+
+
+@pytest.mark.asyncio(loop_scope="module")
 async def test_inlet_reverse_map_is_inverse_of_forward(started_pipeline: Pipeline) -> None:
     oib = _make_oib("1234567890")
     body: dict[str, Any] = {"messages": [{"role": "user", "content": f"OIB {oib} again {oib}"}]}
