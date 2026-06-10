@@ -2,8 +2,8 @@
 title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
-date: 2026-05-26
-version: 0.9.7
+date: 2026-06-10
+version: 0.9.8
 license: MIT
 description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. The thread vault is PostgreSQL-backed (asyncpg pool, idempotent DDL, lazy expiry), keyed by chat_id, gated by `vault_enabled`. v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives. v0.9.3 (Task 8) wires the `UserValves.pii_masking_enabled` per-user toggle into `inlet` (early return on opt-out, no vault touch, audit INFO log) and adds the admin-level `Valves.presidio_enabled` kill switch (runtime guard: skips analyzer/masking but still pulls vault snapshot for outlet restoration symmetry). v0.9.5 (Task 9) consolidates the vault to a single PostgreSQL backend: the legacy backend-selector valve and the legacy alternate-backend valves are removed, the alternate-backend class is dropped, the kept `ThreadVault` class is the sole vault implementation, and the alternate-backend Python dependencies are gone from `requirements.txt`. `outlet` is unchanged; `on_startup` is collapsed to a single Postgres-only init path gated by `vault_enabled`.
 requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, asyncpg>=0.29.0, pydantic-settings>=2.0, cryptography>=42.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
@@ -2119,6 +2119,27 @@ class Pipeline:
             await self.vault.aclose()
             self.vault = None
 
+    @staticmethod
+    def _is_single_text_part(msg: dict[str, Any]) -> bool:
+        """True when `msg` carries exactly one text segment.
+
+        Used by the PII card builder: per-detection offsets are relative to a
+        single text string, so they only align with the frontend's flat
+        message string when the message has one text part (plain string, or a
+        multimodal list with exactly one `{"type": "text"}` part). With two or
+        more text parts the offsets would collide on the flattened string.
+        """
+        content = msg.get("content")
+        if isinstance(content, str):
+            return True
+        if isinstance(content, list):
+            return sum(
+                1
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ) == 1
+        return False
+
     def _iter_text_parts(
         self, message: dict[str, Any]
     ) -> Iterator[tuple[str, Callable[[str], None]]]:
@@ -2569,6 +2590,40 @@ class Pipeline:
         metadata["pii_detections"] = all_enriched
         metadata["pii_placeholder_map"] = forward_map
         metadata["pii_reverse_map"] = reverse_map
+
+        # --- PII card: safe-to-expose subset (UI only) ---
+        # Slim, PII-free mirror of the last user message's detections for the
+        # per-message "PII masked" card. ONLY {type, start, end} — never
+        # `original`, `placeholder`, or the maps. The plaintext-bearing
+        # `pii_detections` list never leaves the pipeline (defense-in-depth);
+        # the frontend reconstructs values from the user's own message text.
+        # Only the *current* user turn gets a card: the last message must itself
+        # be a user message. On regeneration (trailing assistant/non-user
+        # message) we emit nothing, so the card never attaches to a stale prior
+        # turn whose offsets no longer match what the frontend renders.
+        # `messages` is guaranteed non-empty here (guarded at the top of inlet).
+        last_user_idx = (
+            len(messages) - 1
+            if isinstance(messages[-1], dict) and messages[-1].get("role") == "user"
+            else None
+        )
+        emit_card = last_user_idx is not None and self._is_single_text_part(
+            messages[last_user_idx]
+        )
+        metadata["pii_detections_public"] = (
+            [
+                {"type": d["entity_type"], "start": d["start"], "end": d["end"]}
+                for d in all_enriched
+                if d.get("message_index") == last_user_idx
+            ]
+            if emit_card
+            else []
+        )
+        logger.debug(
+            "pii card: %d public detections, msg idx=%s",
+            len(metadata["pii_detections_public"]),
+            last_user_idx,
+        )
 
         vault_state = ("ephemeral" if raw_chat_id is None else "on") if use_vault else "off"
         languages_active = ",".join(
