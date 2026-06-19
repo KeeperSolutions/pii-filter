@@ -7,11 +7,12 @@ import platform
 import shutil
 import subprocess
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import TYPE_CHECKING, Any
 
 import pytest
 import pytest_asyncio
+from presidio_analyzer import RecognizerResult
 from pytest_postgresql import factories as _pg_factories
 from pytest_postgresql.executor import PostgreSQLExecutor as _PgExecutor
 
@@ -88,7 +89,7 @@ if platform.system() == "Windows":
 
     _PgExecutor.stop = _stop_windows  # type: ignore[method-assign]
 
-from pii_filter import BlindIndex, Pipeline, ThreadVault, VaultCipher
+from pii_filter import BlindIndex, GLiNER2Detector, Pipeline, ThreadVault, VaultCipher
 from tests.helpers.mock_vault import MockThreadVault
 
 # Task 11: two fixed, independent 32-byte test keys (base64) so the
@@ -108,6 +109,31 @@ if TYPE_CHECKING:
 # `and` would only skip when both are absent, leaving tests to fail with a
 # binary-not-found error on hosts that ship one but not the other.
 postgres_binary_missing = shutil.which("pg_ctl") is None or shutil.which("postgres") is None
+
+
+def _stub_gliner_load(self: GLiNER2Detector) -> None:
+    self._model = object()
+
+
+def _stub_gliner_detect(self: GLiNER2Detector, text: str) -> list[RecognizerResult]:
+    return []
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _stub_gliner_model() -> Iterator[None]:
+    """GLiNER2's real model pulls torch + HF weights, unavailable in tests.
+
+    With ``gliner_enabled`` defaulting to True, ``Pipeline.on_startup`` would
+    call ``GLiNER2Detector.load()`` and crash on the missing ``gliner2`` import.
+    Stub ``load()`` to a no-op and ``detect()`` to ``[]`` so on_startup runs;
+    existing tests rely on pattern recognizers (OIB etc.), not PERSON NER, so
+    they are unaffected. The GLiNER detection path has its own dedicated test
+    that injects a canned detector.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(GLiNER2Detector, "load", _stub_gliner_load)
+        mp.setattr(GLiNER2Detector, "detect", _stub_gliner_detect)
+        yield
 
 
 @pytest.fixture
