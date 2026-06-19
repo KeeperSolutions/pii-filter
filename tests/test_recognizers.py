@@ -32,6 +32,7 @@ from pii_filter import (
     USEINRecognizer,
     USSSNRecognizer,
     _classify_window_language,
+    _collapse_same_type_containment,
     _merge_dedupe_detections,
     _nlp_engine_cache,
     _resolve_person_coreference,
@@ -928,6 +929,86 @@ def test_coref_family_wrong_merge_is_a_known_limitation() -> None:
     text = "Ivana Lukić came with her brother. Mr. Lukić is a doctor."
     dets = _dets(text, [("Ivana Lukić", "PERSON"), ("Lukić", "PERSON")])
     assert _resolve_person_coreference(text, dets) == {1: "Ivana Lukić"}
+
+
+# -- Same-type containment collapse (GLiNER sub-token spans) ------------------
+
+
+def _rr(etype: str, start: int, end: int) -> RecognizerResult:
+    return RecognizerResult(entity_type=etype, start=start, end=end, score=0.85)
+
+
+def _key_set(results: list[RecognizerResult]) -> set[tuple[str, int, int]]:
+    return {(r.entity_type, r.start, r.end) for r in results}
+
+
+def test_collapse_drops_subtoken_spans_within_full_name() -> None:
+    # "Ivana Lukić" (0,11) plus sub-tokens "Ivana" (0,5) and "Lukić" (6,11).
+    out = _collapse_same_type_containment(
+        [_rr("PERSON", 0, 11), _rr("PERSON", 0, 5), _rr("PERSON", 6, 11)]
+    )
+    assert _key_set(out) == {("PERSON", 0, 11)}
+
+
+def test_collapse_keeps_partial_overlap() -> None:
+    # Partial overlap is not containment -> both survive.
+    out = _collapse_same_type_containment([_rr("PERSON", 0, 5), _rr("PERSON", 3, 8)])
+    assert _key_set(out) == {("PERSON", 0, 5), ("PERSON", 3, 8)}
+
+
+def test_collapse_does_not_cross_entity_types() -> None:
+    # Same offsets, different types -> neither contains the other.
+    out = _collapse_same_type_containment([_rr("PERSON", 0, 11), _rr("ADDRESS", 0, 5)])
+    assert _key_set(out) == {("PERSON", 0, 11), ("ADDRESS", 0, 5)}
+
+
+def test_collapse_drops_equal_end_contained_span() -> None:
+    # (3,8) is contained in the strictly larger (0,8) (shared end).
+    out = _collapse_same_type_containment([_rr("PERSON", 0, 8), _rr("PERSON", 3, 8)])
+    assert _key_set(out) == {("PERSON", 0, 8)}
+
+
+def test_collapse_dedupes_exact_duplicates() -> None:
+    # Two identical spans collapse to one (harmless dedupe).
+    out = _collapse_same_type_containment([_rr("PERSON", 0, 5), _rr("PERSON", 0, 5)])
+    assert _key_set(out) == {("PERSON", 0, 5)}
+    assert len(out) == 1
+
+
+def test_collapse_empty() -> None:
+    assert _collapse_same_type_containment([]) == []
+
+
+def test_collapse_matches_naive_reference() -> None:
+    # Equivalence guard vs the original O(n^2) "drop if strictly contained in a
+    # larger same-type span" semantics (input has no exact duplicates).
+    spans = [
+        _rr("PERSON", 0, 11),
+        _rr("PERSON", 0, 5),
+        _rr("PERSON", 6, 11),
+        _rr("PERSON", 20, 25),
+        _rr("ADDRESS", 0, 8),
+        _rr("ADDRESS", 2, 6),
+        _rr("PERSON", 30, 40),
+        _rr("PERSON", 33, 37),
+    ]
+
+    def naive(rs: list[RecognizerResult]) -> set[tuple[str, int, int]]:
+        keep = [
+            r
+            for r in rs
+            if not any(
+                o is not r
+                and o.entity_type == r.entity_type
+                and o.start <= r.start
+                and r.end <= o.end
+                and (o.end - o.start) > (r.end - r.start)
+                for o in rs
+            )
+        ]
+        return {(r.entity_type, r.start, r.end) for r in keep}
+
+    assert _key_set(_collapse_same_type_containment(spans)) == naive(spans)
 
 
 # -- Trailing-token strip tests ----------------------------------------------

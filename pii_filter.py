@@ -6,7 +6,7 @@ date: 2026-06-10
 version: 0.10.0
 license: MIT
 description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. The thread vault is PostgreSQL-backed (asyncpg pool, idempotent DDL, lazy expiry), keyed by chat_id, gated by `vault_enabled`. v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives. v0.9.3 (Task 8) wires the `UserValves.pii_masking_enabled` per-user toggle into `inlet` (early return on opt-out, no vault touch, audit INFO log) and adds the admin-level `Valves.presidio_enabled` kill switch (runtime guard: skips analyzer/masking but still pulls vault snapshot for outlet restoration symmetry). v0.9.5 (Task 9) consolidates the vault to a single PostgreSQL backend: the legacy backend-selector valve and the legacy alternate-backend valves are removed, the alternate-backend class is dropped, the kept `ThreadVault` class is the sole vault implementation, and the alternate-backend Python dependencies are gone from `requirements.txt`. `outlet` is unchanged; `on_startup` is collapsed to a single Postgres-only init path gated by `vault_enabled`.
-requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, numpy<2, thinc<8.3, blis<0.8, asyncpg>=0.29.0, pydantic-settings>=2.0, cryptography>=42.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0, gliner2[local]>=1.3.1, transformers<5, tokenizers<0.22, sentencepiece
+requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy<3.8.0, numpy<2, thinc<8.3, blis<0.8, asyncpg>=0.29.0, pydantic-settings>=2.0, cryptography>=42.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0, gliner2[local]>=1.3.1, transformers<5, tokenizers<0.22, sentencepiece
 """
 
 from __future__ import annotations
@@ -440,6 +440,33 @@ GLINER2_LABEL_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+def _collapse_same_type_containment(
+    results: list[RecognizerResult],
+) -> list[RecognizerResult]:
+    """Drop spans fully enclosed by a larger span of the same entity type.
+
+    Several GLiNER labels map to one Presidio type (e.g. person/first name/
+    last name -> PERSON), so GLiNER emits the full name plus its sub-token
+    spans. Collapsing containment makes a name one placeholder, not several.
+
+    O(n log n): sort by (type, start asc, length desc) so a containing span is
+    always visited before the spans it encloses, then keep a span only if its
+    end extends past the furthest end already kept for its type. Exact-duplicate
+    spans collapse to one (harmless — downstream overlap resolution dedupes
+    identical spans anyway). Returned order is not significant: the caller's
+    `_select_accepted_detections` re-sorts before use.
+    """
+    ordered = sorted(results, key=lambda r: (r.entity_type, r.start, -(r.end - r.start)))
+    kept: list[RecognizerResult] = []
+    max_end_by_type: dict[str, int] = {}
+    for r in ordered:
+        if r.end <= max_end_by_type.get(r.entity_type, -1):
+            continue
+        kept.append(r)
+        max_end_by_type[r.entity_type] = r.end
+    return kept
+
+
 class GLiNER2Detector:
     """GLiNER2-PII wrapper. Vraća list[RecognizerResult]; pokreće se jednom po tekstu,
     jezično-agnostički, IZVAN per-language Presidio analyzera."""
@@ -522,22 +549,8 @@ class GLiNER2Detector:
                     RecognizerResult(entity_type=presidio_type, start=s, end=e, score=score)
                 )
 
-        # Collapse same-type containment: several labels map to one type (e.g.
-        # person/first name/last name -> PERSON), so GLiNER emits the full name
-        # plus its sub-token spans. Drop any span fully enclosed by a larger
-        # span of the same type so a name becomes one placeholder, not several.
-        return [
-            r
-            for r in out_results
-            if not any(
-                other is not r
-                and other.entity_type == r.entity_type
-                and other.start <= r.start
-                and r.end <= other.end
-                and (other.end - other.start) > (r.end - r.start)
-                for other in out_results
-            )
-        ]
+        # Collapse same-type containment (full name vs its sub-token spans).
+        return _collapse_same_type_containment(out_results)
 
 
 def _select_accepted_detections(
@@ -2287,7 +2300,14 @@ class Pipeline:
         # name (verified "SpacyRecognizer" in presidio-analyzer 2.2.362); only
         # when GLiNER is enabled, so rollback (gliner_enabled=False) keeps spaCy.
         if self.valves.gliner_enabled:
-            analyzer.registry.remove_recognizer("SpacyRecognizer")
+            try:
+                analyzer.registry.remove_recognizer("SpacyRecognizer")
+            except Exception as exc:
+                logger.warning(
+                    "Could not remove SpacyRecognizer from %s registry: %s",
+                    lang_code,
+                    exc,
+                )
 
         analyzer.analyze(text="warmup", language=lang_code, entities=None)
         return analyzer
@@ -2804,7 +2824,7 @@ class Pipeline:
                     # and BEFORE select, so whitelist + deny-list + trailing-strip +
                     # overlap resolution apply uniformly to GLiNER results too.
                     if self._gliner is not None:
-                        results = results + self._gliner.detect(text)
+                        results.extend(self._gliner.detect(text))
 
                     accepted = _select_accepted_detections(
                         text,
