@@ -32,8 +32,10 @@ from pii_filter import (
     USEINRecognizer,
     USSSNRecognizer,
     _classify_window_language,
+    _collapse_same_type_containment,
     _merge_dedupe_detections,
     _nlp_engine_cache,
+    _resolve_person_coreference,
     _select_accepted_detections,
     make_iban_recognizer,
 )
@@ -728,6 +730,9 @@ _STD: dict[str, str] = Pipeline.PRESIDIO_TO_STANDARD
 # environment-backed settings at import time.
 _DEFAULT_VALVES = Pipeline.Valves.model_construct()
 _DENY_LIST: frozenset[str] = frozenset(s.lower() for s in _DEFAULT_VALVES.ner_deny_list)
+_EXACT_DENY_LIST: frozenset[str] = frozenset(
+    s.lower() for s in _DEFAULT_VALVES.ner_exact_deny_list
+)
 _STRIP_LIST: frozenset[str] = frozenset(s.lower() for s in _DEFAULT_VALVES.ner_trailing_token_strip)
 
 # Confirmed false-positive: passes OIB mod-11,10 checksum but is a stripped
@@ -796,6 +801,214 @@ def test_deny_list_custom_entry_works() -> None:
         text, [_det_person(0, 9)], _STD, deny_list=frozenset(["skywalker"])
     )
     assert result == []
+
+
+def test_exact_deny_list_drops_standalone_ai_model_names() -> None:
+    # AI model / product names must not be masked as PERSON. GLiNER tags them as
+    # PERSON in conversational context ("I pinged Opus and Claude"). They are
+    # product names, not people, so the exact-deny-list must drop them.
+    for name in ("Claude", "Opus", "Sonnet", "Haiku", "Gemini", "GPT"):
+        result = _select_accepted_detections(
+            name, [_det_person(0, len(name))], _STD, exact_deny_list=_EXACT_DENY_LIST
+        )
+        assert result == [], f"{name!r} must be dropped by exact-deny-list, got {result!r}"
+
+
+def test_exact_deny_list_keeps_real_person_starting_with_model_name() -> None:
+    # "Claude Monet" is a real person — exact-deny-list must NOT prefix-drop it,
+    # so the full-name PERSON span survives and gets masked.
+    text = "Claude Monet"
+    result = _select_accepted_detections(
+        text, [_det_person(0, len(text))], _STD, exact_deny_list=_EXACT_DENY_LIST
+    )
+    assert len(result) == 1, f"'Claude Monet' must survive exact-deny-list, got {result!r}"
+    assert result[0].entity_type == "PERSON"
+
+
+# -- PERSON coreference (surname -> full name) -------------------------------
+
+
+def _dets(text: str, items: list[tuple[str, str]]) -> list[RecognizerResult]:
+    """Build non-overlapping detections by locating each (substring, type) in
+    order, advancing a cursor so repeated substrings get distinct offsets."""
+    dets: list[RecognizerResult] = []
+    cursor = 0
+    for name, etype in items:
+        i = text.index(name, cursor)
+        dets.append(RecognizerResult(entity_type=etype, start=i, end=i + len(name), score=0.85))
+        cursor = i + len(name)
+    return dets
+
+
+def test_coref_merges_surname_into_full_name() -> None:
+    text = "recipient Ivana Lukić. Lukić works from home."
+    dets = _dets(text, [("Ivana Lukić", "PERSON"), ("Lukić", "PERSON")])
+    assert _resolve_person_coreference(text, dets) == {1: "Ivana Lukić"}
+
+
+def test_coref_ambiguous_two_full_names_same_surname_not_merged() -> None:
+    text = "Marko Kovač and Ana Kovač met. Kovač paid."
+    dets = _dets(text, [("Marko Kovač", "PERSON"), ("Ana Kovač", "PERSON"), ("Kovač", "PERSON")])
+    # 2 distinct full names share the surname -> ambiguous -> no merge.
+    assert _resolve_person_coreference(text, dets) == {}
+
+
+def test_coref_surname_only_no_full_name_not_merged() -> None:
+    text = "Lukić works from home."
+    dets = _dets(text, [("Lukić", "PERSON")])
+    assert _resolve_person_coreference(text, dets) == {}
+
+
+def test_coref_order_independent_surname_before_full_name() -> None:
+    text = "Lukić called. Later Ivana Lukić arrived."
+    dets = _dets(text, [("Lukić", "PERSON"), ("Ivana Lukić", "PERSON")])
+    assert _resolve_person_coreference(text, dets) == {0: "Ivana Lukić"}
+
+
+def test_coref_first_name_not_merged() -> None:
+    text = "Ivana Lukić arrived. Ivana waved."
+    dets = _dets(text, [("Ivana Lukić", "PERSON"), ("Ivana", "PERSON")])
+    # Only last-token (surname) matching; a bare first name does not merge.
+    assert _resolve_person_coreference(text, dets) == {}
+
+
+def test_coref_ignores_non_person() -> None:
+    text = "Ivana Lukić at 25 Vukovarska. Lukić called."
+    dets = _dets(
+        text,
+        [("Ivana Lukić", "PERSON"), ("25 Vukovarska", "ADDRESS"), ("Lukić", "PERSON")],
+    )
+    assert _resolve_person_coreference(text, dets) == {2: "Ivana Lukić"}
+
+
+def test_coref_three_token_full_name() -> None:
+    text = "Ana Marija Kovač spoke. Kovač left."
+    dets = _dets(text, [("Ana Marija Kovač", "PERSON"), ("Kovač", "PERSON")])
+    assert _resolve_person_coreference(text, dets) == {1: "Ana Marija Kovač"}
+
+
+def test_coref_hyphenated_surname() -> None:
+    text = "Ivana Müller-Lukić arrived. Müller-Lukić signed."
+    dets = _dets(text, [("Ivana Müller-Lukić", "PERSON"), ("Müller-Lukić", "PERSON")])
+    assert _resolve_person_coreference(text, dets) == {1: "Ivana Müller-Lukić"}
+
+
+def test_coref_case_insensitive_surname() -> None:
+    text = "Ivana Lukić arrived. LUKIĆ signed."
+    dets = _dets(text, [("Ivana Lukić", "PERSON"), ("LUKIĆ", "PERSON")])
+    assert _resolve_person_coreference(text, dets) == {1: "Ivana Lukić"}
+
+
+def test_coref_full_name_twice_plus_surname_merges() -> None:
+    text = "Ivana Lukić wrote. Ivana Lukić called. Lukić paid."
+    dets = _dets(
+        text,
+        [("Ivana Lukić", "PERSON"), ("Ivana Lukić", "PERSON"), ("Lukić", "PERSON")],
+    )
+    # Same full-name string twice = one distinct full name -> merge.
+    assert _resolve_person_coreference(text, dets) == {2: "Ivana Lukić"}
+
+
+def test_coref_override_value_is_exact_full_name_span() -> None:
+    # Pitfall 1 guard: every override value must be byte-identical to an actual
+    # full-name span slice (the key the full name uses for get_placeholder).
+    text = "recipient Ivana Lukić. Lukić works from home."
+    dets = _dets(text, [("Ivana Lukić", "PERSON"), ("Lukić", "PERSON")])
+    overrides = _resolve_person_coreference(text, dets)
+    full_spans = [text[d.start : d.end] for d in dets]
+    for canonical in overrides.values():
+        assert canonical in full_spans, f"override {canonical!r} is not a verbatim span slice"
+
+
+def test_coref_family_wrong_merge_is_a_known_limitation() -> None:
+    # Pitfall 2: a bare surname referring to a DIFFERENT, unnamed person who
+    # shares the surname of the single full name present cannot be distinguished
+    # here, so it IS merged. This documents the limitation — the merge is NOT
+    # guaranteed semantically correct; "exactly one distinct full name" does not
+    # prevent a wrong merge.
+    text = "Ivana Lukić came with her brother. Mr. Lukić is a doctor."
+    dets = _dets(text, [("Ivana Lukić", "PERSON"), ("Lukić", "PERSON")])
+    assert _resolve_person_coreference(text, dets) == {1: "Ivana Lukić"}
+
+
+# -- Same-type containment collapse (GLiNER sub-token spans) ------------------
+
+
+def _rr(etype: str, start: int, end: int) -> RecognizerResult:
+    return RecognizerResult(entity_type=etype, start=start, end=end, score=0.85)
+
+
+def _key_set(results: list[RecognizerResult]) -> set[tuple[str, int, int]]:
+    return {(r.entity_type, r.start, r.end) for r in results}
+
+
+def test_collapse_drops_subtoken_spans_within_full_name() -> None:
+    # "Ivana Lukić" (0,11) plus sub-tokens "Ivana" (0,5) and "Lukić" (6,11).
+    out = _collapse_same_type_containment(
+        [_rr("PERSON", 0, 11), _rr("PERSON", 0, 5), _rr("PERSON", 6, 11)]
+    )
+    assert _key_set(out) == {("PERSON", 0, 11)}
+
+
+def test_collapse_keeps_partial_overlap() -> None:
+    # Partial overlap is not containment -> both survive.
+    out = _collapse_same_type_containment([_rr("PERSON", 0, 5), _rr("PERSON", 3, 8)])
+    assert _key_set(out) == {("PERSON", 0, 5), ("PERSON", 3, 8)}
+
+
+def test_collapse_does_not_cross_entity_types() -> None:
+    # Same offsets, different types -> neither contains the other.
+    out = _collapse_same_type_containment([_rr("PERSON", 0, 11), _rr("ADDRESS", 0, 5)])
+    assert _key_set(out) == {("PERSON", 0, 11), ("ADDRESS", 0, 5)}
+
+
+def test_collapse_drops_equal_end_contained_span() -> None:
+    # (3,8) is contained in the strictly larger (0,8) (shared end).
+    out = _collapse_same_type_containment([_rr("PERSON", 0, 8), _rr("PERSON", 3, 8)])
+    assert _key_set(out) == {("PERSON", 0, 8)}
+
+
+def test_collapse_dedupes_exact_duplicates() -> None:
+    # Two identical spans collapse to one (harmless dedupe).
+    out = _collapse_same_type_containment([_rr("PERSON", 0, 5), _rr("PERSON", 0, 5)])
+    assert _key_set(out) == {("PERSON", 0, 5)}
+    assert len(out) == 1
+
+
+def test_collapse_empty() -> None:
+    assert _collapse_same_type_containment([]) == []
+
+
+def test_collapse_matches_naive_reference() -> None:
+    # Equivalence guard vs the original O(n^2) "drop if strictly contained in a
+    # larger same-type span" semantics (input has no exact duplicates).
+    spans = [
+        _rr("PERSON", 0, 11),
+        _rr("PERSON", 0, 5),
+        _rr("PERSON", 6, 11),
+        _rr("PERSON", 20, 25),
+        _rr("ADDRESS", 0, 8),
+        _rr("ADDRESS", 2, 6),
+        _rr("PERSON", 30, 40),
+        _rr("PERSON", 33, 37),
+    ]
+
+    def naive(rs: list[RecognizerResult]) -> set[tuple[str, int, int]]:
+        keep = [
+            r
+            for r in rs
+            if not any(
+                o is not r
+                and o.entity_type == r.entity_type
+                and o.start <= r.start
+                and r.end <= o.end
+                and (o.end - o.start) > (r.end - r.start)
+                for o in rs
+            )
+        ]
+        return {(r.entity_type, r.start, r.end) for r in keep}
+
+    assert _key_set(_collapse_same_type_containment(spans)) == naive(spans)
 
 
 # -- Trailing-token strip tests ----------------------------------------------

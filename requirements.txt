@@ -8,7 +8,16 @@
 
 presidio-analyzer>=2.2.0
 presidio-anonymizer>=2.2.0
-spacy>=3.7.0
+spacy>=3.7.0,<3.8.0
+# Pin shared native deps to the spaCy-3.7-compatible set. The GLiNER/torch stack
+# pulls newer numpy 2.x / thinc 8.3 / blis 1.3, but spaCy 3.7 (+ the 3.7.0 lg model
+# wheels) requires the older line. The Pipelines container installs requirements
+# one-by-one, so without these pins numpy/thinc/blis churn up/down and leave an
+# inconsistent native env -> ABI mismatch -> SIGBUS / import crash. torch tolerates
+# numpy<2; thinc/blis are spaCy-only. Keeps the runtime install converged.
+numpy<2
+thinc<8.3
+blis<0.8
 asyncpg>=0.29.0
 # pydantic-settings: Valves uses BaseSettings for typed env-var loading
 # (PII_FILTER_* prefix). Required at Pipelines runtime.
@@ -23,3 +32,22 @@ cryptography>=42.0
 # HR spaCy model (hard requirement — no EN fallback per spec).
 # Pipelines container reads this URL line from the frontmatter `requirements:` field.
 https://github.com/explosion/spacy-models/releases/download/hr_core_news_lg-3.7.0/hr_core_news_lg-3.7.0-py3-none-any.whl
+
+# GLiNER2-PII: contextual NER layer (replaces spaCy NER as the PERSON source).
+# `gliner2[local]` pulls torch + transformers (large download). Mirrors the
+# `gliner2[local]>=1.3.1` entry in the frontmatter requirements line.
+gliner2[local]>=1.3.1
+
+# Pin transformers<5 so the framework's uvicorn keeps a working click
+# (transformers 5.x pulls click 8.4.x which breaks uvicorn's `click.Choice`).
+# The model's tokenizer_config `extra_special_tokens` (a list) is removed in the
+# vendored copy so the 4.x DeBERTa-v2 fast tokenizer loads without the
+# `AttributeError: 'list' has no 'keys'` (tokens stay via tokenizer.json
+# added_tokens). All deps are baked as a single resolved install in the
+# pipelines-gliner image (see Dockerfile.gliner) to avoid runtime churn.
+transformers<5
+tokenizers<0.22
+# DeBERTa-v2 tokenizer (GLiNER2's encoder) requires SentencePiece. The Pipelines
+# container image does NOT ship it -> without it the load crashes (fast path:
+# AttributeError on extra_special_tokens; slow path: ImportError). Dev box has it.
+sentencepiece

@@ -17,7 +17,7 @@ import pytest
 import pytest_asyncio
 from presidio_analyzer import RecognizerResult
 
-from pii_filter import CUSTOM_ENTITY_TYPES, Pipeline, mask_text, restore_text
+from pii_filter import CUSTOM_ENTITY_TYPES, GLiNER2Detector, Pipeline, mask_text, restore_text
 from tests.conftest import postgres_binary_missing
 from tests.helpers.mock_vault import MockThreadVault
 
@@ -114,6 +114,44 @@ def test_distinct_values_same_type() -> None:
     assert masked == "[PERSON_1] i [PERSON_2]"
     assert counters == {"PERSON": 2}
     assert fwd == {"Ana Ivić": "[PERSON_1]", "Marko Marić": "[PERSON_2]"}
+
+
+def test_mask_text_coreference_merges_surname_into_full_name_placeholder() -> None:
+    text = "recipient Ivana Lukić. Lukić works from home."
+    i1 = text.index("Ivana Lukić")
+    i2 = text.index("Lukić", i1 + len("Ivana Lukić"))
+    dets = [
+        RecognizerResult(entity_type="PERSON", start=i1, end=i1 + len("Ivana Lukić"), score=0.85),
+        RecognizerResult(entity_type="PERSON", start=i2, end=i2 + len("Lukić"), score=0.85),
+    ]
+    counters, fwd, rev = _fresh_state()
+
+    masked, enriched = mask_text(text, dets, _STANDARD, counters, fwd, rev, coreference=True)
+
+    # Both mentions collapse to a single placeholder keyed on the full name.
+    assert masked == "recipient [PERSON_1]. [PERSON_1] works from home."
+    assert counters == {"PERSON": 1}
+    assert fwd == {"Ivana Lukić": "[PERSON_1]"}
+    assert rev == {"[PERSON_1]": "Ivana Lukić"}
+    # Enriched `original` stays the surface span (Lukić), not the canonical key.
+    assert [e["original"] for e in enriched] == ["Ivana Lukić", "Lukić"]
+
+
+def test_mask_text_without_coreference_keeps_separate_placeholders() -> None:
+    text = "recipient Ivana Lukić. Lukić works from home."
+    i1 = text.index("Ivana Lukić")
+    i2 = text.index("Lukić", i1 + len("Ivana Lukić"))
+    dets = [
+        RecognizerResult(entity_type="PERSON", start=i1, end=i1 + len("Ivana Lukić"), score=0.85),
+        RecognizerResult(entity_type="PERSON", start=i2, end=i2 + len("Lukić"), score=0.85),
+    ]
+    counters, fwd, rev = _fresh_state()
+
+    # Default (coreference=False) -> legacy behavior: two separate placeholders.
+    masked, _ = mask_text(text, dets, _STANDARD, counters, fwd, rev)
+
+    assert masked == "recipient [PERSON_1]. [PERSON_2] works from home."
+    assert counters == {"PERSON": 2}
 
 
 def test_overlap_score_resolution() -> None:
@@ -445,6 +483,46 @@ async def test_inlet_masks_user_message(started_pipeline: Pipeline) -> None:
     rev = result["metadata"]["pii_reverse_map"]
     assert fwd[oib] == "[HR_OIB_1]"
     assert rev["[HR_OIB_1]"] == oib
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_inlet_coreference_merges_surname_placeholder(
+    started_pipeline: Pipeline,
+) -> None:
+    """Within-message coreference: a bare surname reuses the full name's
+    placeholder through the real inlet/vault path.
+
+    NER-dependent: needs the analyzer to detect BOTH 'Ivana Lukić' (full) and a
+    bare 'Lukić' as PERSON. If this environment's NER doesn't produce both
+    spans, skip rather than fail (mirrors the EN-model skip convention used by
+    other integration tests in this module). The deterministic placeholder-key
+    logic is covered exhaustively by the `mask_text` and helper unit tests.
+    """
+    assert started_pipeline.valves.ner_person_coreference_enabled is True
+    text = (
+        "Please send the parcel to Ivana Lukić at 23 Vukovarska. "
+        "Lukić works from home on Tuesdays so call ahead."
+    )
+    body: dict[str, Any] = {
+        "messages": [{"role": "user", "content": text}],
+        "metadata": {"chat_id": "coref-inlet"},
+    }
+
+    result = await started_pipeline.inlet(body)
+
+    detections = result["metadata"].get("pii_detections", [])
+    originals = {
+        d["original"]: d["placeholder"] for d in detections if d["entity_type"] == "PERSON"
+    }
+    if "Ivana Lukić" not in originals or "Lukić" not in originals:
+        pytest.skip(
+            "NER did not produce both 'Ivana Lukić' and a bare 'Lukić' as PERSON "
+            f"in this environment; got PERSON originals {sorted(originals)}"
+        )
+    # The bare surname reuses the full name's placeholder.
+    assert originals["Lukić"] == originals["Ivana Lukić"]
+    masked = result["messages"][-1]["content"]
+    assert masked.count(originals["Ivana Lukić"]) >= 2
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -2075,18 +2153,28 @@ async def test_inlet_detects_oib_in_english_chat(started_pipeline: Pipeline) -> 
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_detects_person_in_english_text(started_pipeline: Pipeline) -> None:
-    if started_pipeline.analyzer_en is None:
-        pytest.skip("en_core_web_lg not installed")
+async def test_inlet_detects_person_in_english_text(
+    started_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """English PERSON is masked via GLiNER2 (the contextual NER source that
+    replaced spaCy NER when gliner_enabled). Uses a canned GLiNER detection."""
+    text = "My name is John Smith"
+    start = text.index("John Smith")
+    end = start + len("John Smith")
+
+    def _canned_detect(self: GLiNER2Detector, t: str) -> list[RecognizerResult]:
+        if "John Smith" in t:
+            return [RecognizerResult(entity_type="PERSON", start=start, end=end, score=0.99)]
+        return []
+
+    monkeypatch.setattr(GLiNER2Detector, "detect", _canned_detect)
     body: dict[str, Any] = {
-        "messages": [{"role": "user", "content": "My name is John Smith"}],
+        "messages": [{"role": "user", "content": text}],
         "metadata": {"chat_id": "task3.2-person-en"},
     }
     result = await started_pipeline.inlet(body)
     content = result["messages"][0]["content"]
-    assert (
-        "[PERSON_1]" in content
-    ), f"Expected PERSON placeholder via en_core_web_lg NER, got: {content!r}"
+    assert "[PERSON_1]" in content, f"Expected PERSON placeholder via GLiNER2, got: {content!r}"
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -2224,22 +2312,32 @@ async def test_inlet_hr_baseline_no_label_word_false_positives(
 
 
 @pytest.mark.asyncio
-async def test_inlet_en_baseline_person_detected(started_pipeline: Pipeline) -> None:
-    """EN text: PERSON and US_SSN must both be detected when EN analyzer is active."""
-    if started_pipeline.analyzer_en is None:
-        pytest.skip("en_core_web_lg not installed — skipping EN baseline integration test")
+async def test_inlet_en_baseline_person_detected(
+    started_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EN text: PERSON (via GLiNER2, replacing spaCy NER) and US_SSN (pattern
+    recognizer) must both be detected. PERSON uses a canned GLiNER detection;
+    US_SSN exercises the real recognizer."""
+    text = "My name is John Smith and my SSN is 123-45-6789."
+    start = text.index("John Smith")
+    end = start + len("John Smith")
+
+    def _canned_detect(self: GLiNER2Detector, t: str) -> list[RecognizerResult]:
+        if "John Smith" in t:
+            return [RecognizerResult(entity_type="PERSON", start=start, end=end, score=0.99)]
+        return []
+
+    monkeypatch.setattr(GLiNER2Detector, "detect", _canned_detect)
     body: dict[str, Any] = {
-        "messages": [
-            {"role": "user", "content": "My name is John Smith and my SSN is 123-45-6789."}
-        ],
+        "messages": [{"role": "user", "content": text}],
         "metadata": {"chat_id": "task3.3-en-baseline"},
     }
     result = await started_pipeline.inlet(body)
     content = result["messages"][0]["content"]
     detections = result.get("metadata", {}).get("pii_detections", [])
     entity_types = {d.get("entity_type") for d in detections}
-    assert "PERSON" in entity_types, f"PERSON must be detected in EN text; content={content!r}"
-    assert "US_SSN" in entity_types, f"US_SSN must be detected in EN text; content={content!r}"
+    assert "PERSON" in entity_types, f"PERSON must be detected; content={content!r}"
+    assert "US_SSN" in entity_types, f"US_SSN must be detected; content={content!r}"
 
 
 @pytest.mark.asyncio

@@ -3,10 +3,10 @@ title: PII Filter
 author: Keeper Solutions AI Lab
 author_url: https://github.com/keeper-solutions/pii-filter
 date: 2026-06-10
-version: 0.9.8
+version: 0.10.0
 license: MIT
 description: PII detection and masking filter for Keeper AI Gateway. Task 3.2 — dual-analyzer architecture (HR + EN): two independent AnalyzerEngine instances (hr_core_news_lg + en_core_web_lg) run over every text fragment; results are merged and deduplicated before the existing _select_accepted_detections pipeline. Task 3.3 — cross-lingual NER spillover guard: per-detection window language classifier drops PERSON/LOCATION/NRP detections whose local context language does not match the source analyzer, eliminating EN-NER false positives on Croatian text. The thread vault is PostgreSQL-backed (asyncpg pool, idempotent DDL, lazy expiry), keyed by chat_id, gated by `vault_enabled`. v0.9.1 skips OpenWebUI background tasks (title/tags/follow-up generation) which embed chat history as user content and would produce false-positive detections. v0.9.2 removes DATE_TIME from the NER spillover guard and from PRESIDIO_TO_STANDARD — date substrings within credit card numbers (e.g. "12/27" in an expiry) were incorrectly tagged as DATE, producing false positives. v0.9.3 (Task 8) wires the `UserValves.pii_masking_enabled` per-user toggle into `inlet` (early return on opt-out, no vault touch, audit INFO log) and adds the admin-level `Valves.presidio_enabled` kill switch (runtime guard: skips analyzer/masking but still pulls vault snapshot for outlet restoration symmetry). v0.9.5 (Task 9) consolidates the vault to a single PostgreSQL backend: the legacy backend-selector valve and the legacy alternate-backend valves are removed, the alternate-backend class is dropped, the kept `ThreadVault` class is the sole vault implementation, and the alternate-backend Python dependencies are gone from `requirements.txt`. `outlet` is unchanged; `on_startup` is collapsed to a single Postgres-only init path gated by `vault_enabled`.
-requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy>=3.7.0, asyncpg>=0.29.0, pydantic-settings>=2.0, cryptography>=42.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0
+requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy<3.8.0, numpy<2, thinc<8.3, blis<0.8, asyncpg>=0.29.0, pydantic-settings>=2.0, cryptography>=42.0, hr-core-news-lg==3.7.0, en-core-web-lg==3.7.0, gliner2[local]>=1.3.1, transformers<5, tokenizers<0.22, sentencepiece
 """
 
 from __future__ import annotations
@@ -410,6 +410,149 @@ CUSTOM_ENTITY_TYPES: frozenset[str] = frozenset(
 )
 
 
+# GLiNER2 label -> Presidio entity type. Samo kontekstualni tipovi.
+# Strukturirani HR/IE/RO/UK/US ID-evi OSTAJU u custom recognizerima (NE ovdje).
+GLINER2_ENTITY_MAPPING: dict[str, str] = {
+    "person": "PERSON",
+    "first name": "PERSON",
+    "last name": "PERSON",
+    "address": "ADDRESS",
+    "street address": "ADDRESS",
+    "city": "ADDRESS",
+    "postal code": "ADDRESS",
+    "username": "USERNAME",
+    "ip address": "IP_ADDRESS",
+    "api key": "SECRET",
+    "password": "SECRET",
+    "access token": "SECRET",
+}
+
+GLINER2_LABEL_DESCRIPTIONS: dict[str, str] = {
+    "person": (
+        "Full name of a real human being. NOT products, software, AI model names "
+        "(e.g. Opus, Claude, GPT), company names, or conversational filler words "
+        "like 'yes', 'okay', 'thanks', 'yeah'."
+    ),
+    "username": "Account handle or login name, e.g. @jdoe or kperic.",
+    "street address": "Street name and house/building number.",
+    "postal code": "ZIP or postal code.",
+    "api key": "API key, access token, or credential string.",
+}
+
+
+def _collapse_same_type_containment(
+    results: list[RecognizerResult],
+) -> list[RecognizerResult]:
+    """Drop spans fully enclosed by a larger span of the same entity type.
+
+    Several GLiNER labels map to one Presidio type (e.g. person/first name/
+    last name -> PERSON), so GLiNER emits the full name plus its sub-token
+    spans. Collapsing containment makes a name one placeholder, not several.
+
+    O(n log n): sort by (type, start asc, length desc) so a containing span is
+    always visited before the spans it encloses, then keep a span only if its
+    end extends past the furthest end already kept for its type. Exact-duplicate
+    spans collapse to one (harmless — downstream overlap resolution dedupes
+    identical spans anyway). Returned order is not significant: the caller's
+    `_select_accepted_detections` re-sorts before use.
+    """
+    ordered = sorted(results, key=lambda r: (r.entity_type, r.start, -(r.end - r.start)))
+    kept: list[RecognizerResult] = []
+    max_end_by_type: dict[str, int] = {}
+    for r in ordered:
+        if r.end <= max_end_by_type.get(r.entity_type, -1):
+            continue
+        kept.append(r)
+        max_end_by_type[r.entity_type] = r.end
+    return kept
+
+
+class GLiNER2Detector:
+    """GLiNER2-PII wrapper. Vraća list[RecognizerResult]; pokreće se jednom po tekstu,
+    jezično-agnostički, IZVAN per-language Presidio analyzera."""
+
+    def __init__(
+        self,
+        model_name: str = "fastino/gliner2-privacy-filter-PII-multi",
+        entity_mapping: dict[str, str] | None = None,
+        label_descriptions: dict[str, str] | None = None,
+        threshold: float = 0.5,
+        map_location: str = "cpu",
+        local_files_only: bool = False,  # True za Path B (vendored model)
+    ) -> None:
+        self.model_name = model_name
+        self.entity_mapping = entity_mapping or GLINER2_ENTITY_MAPPING
+        self.label_descriptions = label_descriptions or GLINER2_LABEL_DESCRIPTIONS
+        self.threshold = threshold
+        self.map_location = map_location
+        self.local_files_only = local_files_only
+        self._model: Any = None
+
+    def load(self) -> None:
+        from gliner2 import GLiNER2  # lazy import (heavy: torch/transformers)
+
+        kwargs: dict[str, Any] = {"map_location": self.map_location}
+        if self.local_files_only:
+            kwargs["local_files_only"] = True
+        self._model = GLiNER2.from_pretrained(self.model_name, **kwargs)
+
+    def _labels(self) -> dict[str, str]:
+        return {lbl: self.label_descriptions.get(lbl, lbl) for lbl in self.entity_mapping}
+
+    @staticmethod
+    def _reconcile(
+        text: str, span_text: str, start: int | None, end: int | None
+    ) -> tuple[int, int] | tuple[None, None]:
+        if (
+            start is not None
+            and end is not None
+            and 0 <= start < end <= len(text)
+            and text[start:end] == span_text
+        ):
+            return start, end
+        if span_text:
+            idx = text.find(span_text, max(0, (start or 0) - 5))
+            if idx == -1:
+                idx = text.find(span_text)
+            if idx != -1:
+                return idx, idx + len(span_text)
+        return None, None
+
+    def detect(self, text: str) -> list[RecognizerResult]:
+        out_results: list[RecognizerResult] = []
+        if not text or self._model is None:
+            return out_results
+        try:
+            raw = self._model.extract_entities(
+                text, self._labels(), include_confidence=True, include_spans=True
+            )
+        except Exception:
+            logger.exception("GLiNER2 inference failed; skipping contextual NER")
+            return out_results
+        entities = raw.get("entities", {}) if isinstance(raw, dict) else {}
+        for gliner_label, spans in entities.items():
+            presidio_type = self.entity_mapping.get(gliner_label)
+            if presidio_type is None:
+                continue
+            for span in spans:
+                if not isinstance(span, dict):
+                    continue
+                score = float(span.get("confidence", self.threshold))
+                if score < self.threshold:
+                    continue
+                s, e = self._reconcile(
+                    text, span.get("text", ""), span.get("start"), span.get("end")
+                )
+                if s is None or e is None:
+                    continue
+                out_results.append(
+                    RecognizerResult(entity_type=presidio_type, start=s, end=e, score=score)
+                )
+
+        # Collapse same-type containment (full name vs its sub-token spans).
+        return _collapse_same_type_containment(out_results)
+
+
 def _select_accepted_detections(
     text: str,
     detections: list[RecognizerResult],
@@ -417,6 +560,7 @@ def _select_accepted_detections(
     deny_list: frozenset[str] = frozenset(),
     trailing_strip: frozenset[str] = frozenset(),
     oib_phone_window: int = 0,
+    exact_deny_list: frozenset[str] = frozenset(),
 ) -> list[RecognizerResult]:
     """Filter, prioritize, and de-overlap raw analyzer detections.
 
@@ -427,9 +571,12 @@ def _select_accepted_detections(
     Processing order (Task 3.1 additions in steps 2-4):
       1. Whitelist filter — drop entity types not in `presidio_to_standard`.
       2. Deny-list filter — drop PERSON entities whose lowercased text either
-         exactly matches an entry in `deny_list` or starts with a deny-listed
-         entry followed by a space (suppresses spaCy false positives on
-         English/code keywords).
+         exactly matches an entry in `deny_list`/`exact_deny_list` or starts
+         with a `deny_list` entry followed by a space (suppresses spaCy false
+         positives on English/code keywords). `exact_deny_list` entries drop on
+         exact match only — never via the prefix rule — so a standalone AI model
+         name ("Claude") is dropped while a longer real name beginning with it
+         ("Claude Monet") survives.
       3. Trailing-token strip — for PERSON entities whose last whitespace-
          separated token is in `trailing_strip`, shorten the span to exclude
          that token (also strips trailing punctuation). Drop if span becomes
@@ -460,13 +607,16 @@ def _select_accepted_detections(
         return []
 
     # Step 2: Deny-list filter (PERSON entities only)
-    if deny_list:
+    if deny_list or exact_deny_list:
         kept: list[RecognizerResult] = []
         for d in candidates:
             if d.entity_type == "PERSON":
                 entity_lower = text[d.start : d.end].lower().strip()
-                if entity_lower in deny_list:
+                # Exact-match drop applies to both lists.
+                if entity_lower in deny_list or entity_lower in exact_deny_list:
                     continue
+                # Prefix drop applies to deny_list ONLY — exact_deny_list entries
+                # must never drop a longer span (e.g. keep "Claude Monet").
                 if any(entity_lower.startswith(denied + " ") for denied in deny_list):
                     continue
             kept.append(d)
@@ -545,6 +695,54 @@ def _select_accepted_detections(
     return accepted
 
 
+def _resolve_person_coreference(
+    text: str, detections: list[RecognizerResult]
+) -> dict[int, str]:
+    """Within-message PERSON coreference (Approach A).
+
+    Returns an *overrides* map ``{detection_index -> canonical_original}`` where
+    a bare-surname PERSON span is merged into a full-name PERSON span from the
+    SAME message. ``canonical_original`` is the RAW slice ``text[d.start:d.end]``
+    of the matched full-name span — byte-identical to the key the full name
+    itself uses for ``get_placeholder`` / ``forward_map`` — so both resolve to
+    the same placeholder. Only merged surnames appear in the map; callers
+    default to ``text[d.start:d.end]`` for every other detection.
+
+    Merge rule: a bare surname (single whitespace-token PERSON span) merges into
+    a full name (>= 2 token PERSON span) iff its lowercased text equals the
+    lowercased last token of EXACTLY ONE distinct full-name span in the message.
+    Zero or 2+ distinct matches leave the surname as its own placeholder.
+
+    Tokenization runs on the ``.strip()``-ed span, but the stored canonical
+    value is the un-stripped raw slice so it matches the full name's own key.
+
+    LIMITATION (not an impossibility): "exactly one distinct full name" does NOT
+    guarantee the merge is semantically correct. A bare surname may refer to a
+    different, unnamed person who merely shares the surname of the single full
+    name present; that case is indistinguishable here and IS merged. See the
+    family wrong-merge test.
+    """
+    full_by_last: dict[str, set[str]] = {}
+    surname_candidates: dict[int, str] = {}
+
+    for idx, d in enumerate(detections):
+        if d.entity_type != "PERSON":
+            continue
+        raw = text[d.start : d.end]
+        tokens = raw.strip().split()
+        if len(tokens) >= 2:
+            full_by_last.setdefault(tokens[-1].lower(), set()).add(raw)
+        elif len(tokens) == 1:
+            surname_candidates[idx] = tokens[0].lower()
+
+    overrides: dict[int, str] = {}
+    for idx, surname in surname_candidates.items():
+        matches = full_by_last.get(surname)
+        if matches is not None and len(matches) == 1:
+            overrides[idx] = next(iter(matches))
+    return overrides
+
+
 def _build_enriched_detection(
     det: RecognizerResult,
     text: str,
@@ -571,6 +769,7 @@ def mask_text(
     counter_state: dict[str, int],
     forward_map: dict[str, str],
     reverse_map: dict[str, str],
+    coreference: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Replace detected spans in `text` with deterministic placeholders.
 
@@ -588,6 +787,10 @@ def mask_text(
             placeholder instead of allocating a new one.
         reverse_map: `placeholder -> original_value`; mutated in place. Outlet
             (Task 6) reads this to restore originals.
+        coreference: when True, run within-message PERSON coreference so a bare
+            surname reuses the placeholder of a same-message full name (see
+            `_resolve_person_coreference`). Default False keeps one placeholder
+            per distinct span (legacy behavior).
 
     Returns:
         `(masked_text, surviving_detections)` where each surviving detection
@@ -608,6 +811,8 @@ def mask_text(
     if not accepted:
         return text, []
 
+    overrides = _resolve_person_coreference(text, accepted) if coreference else {}
+
     # Build masked text in a single left-to-right pass and enrich detections.
     # The placeholder *source* here is the local `forward_map` / `counter_state`
     # passed in by the caller; the inlet vault path uses the same
@@ -615,20 +820,23 @@ def mask_text(
     pieces: list[str] = []
     enriched: list[dict[str, Any]] = []
     last_end = 0
-    for det in accepted:
-        original = text[det.start : det.end]
+    for idx, det in enumerate(accepted):
+        surface = text[det.start : det.end]
+        # Coreference may remap the placeholder *key* to a same-message full
+        # name; the spliced span and enriched `original` stay the surface text.
+        key = overrides.get(idx, surface)
         standard_type = presidio_to_standard[det.entity_type]
-        placeholder = forward_map.get(original)
+        placeholder = forward_map.get(key)
         if placeholder is None:
             n = counter_state.get(standard_type, 0) + 1
             counter_state[standard_type] = n
             placeholder = f"[{standard_type}_{n}]"
-            forward_map[original] = placeholder
-            reverse_map[placeholder] = original
+            forward_map[key] = placeholder
+            reverse_map[placeholder] = key
         pieces.append(text[last_end : det.start])
         pieces.append(placeholder)
         last_end = det.end
-        enriched.append(_build_enriched_detection(det, text, standard_type, original, placeholder))
+        enriched.append(_build_enriched_detection(det, text, standard_type, surface, placeholder))
     pieces.append(text[last_end:])
 
     return "".join(pieces), enriched
@@ -1746,6 +1954,53 @@ class Pipeline:
                 "PII_FILTER_NER_DENY_LIST env var."
             ),
         )
+        # Exact-match-only denylist for PERSON entities. Unlike ner_deny_list,
+        # entries here NEVER trigger the prefix-drop, so a multi-token span that
+        # merely starts with one of these survives. This keeps AI model/product
+        # names from being masked when they stand alone ("I pinged Opus and
+        # Claude") while still masking a real person whose name begins with one
+        # ("Claude Monet" -> PERSON, masked).
+        ner_exact_deny_list: list[str] = Field(
+            default_factory=lambda: [
+                "claude",
+                "opus",
+                "sonnet",
+                "haiku",
+                "gpt",
+                "chatgpt",
+                "gemini",
+                "bard",
+                "copilot",
+                "llama",
+                "mistral",
+                "mixtral",
+                "grok",
+                "deepseek",
+                "qwen",
+            ],
+            description=(
+                "Lowercase, exact-match-only denylist for PERSON entities. "
+                "Drops a PERSON detection only when its full text equals an entry "
+                "(no prefix matching), so standalone AI model names are dropped "
+                "while real multi-token names that begin with one are kept. "
+                "Configurable via PII_FILTER_NER_EXACT_DENY_LIST env var."
+            ),
+        )
+        # PERSON coreference merging (Approach A — within-message). When True,
+        # a bare surname span that uniquely matches the last token of exactly
+        # one full-name PERSON span in the SAME message reuses that full name's
+        # placeholder, so the same person gets one consistent [PERSON_n].
+        # See docs/superpowers/specs/2026-06-19-person-coreference-design.md.
+        ner_person_coreference_enabled: bool = Field(
+            default=True,
+            description=(
+                "When True, a bare surname is merged into a same-message full "
+                "name's placeholder when the surname matches exactly one full "
+                "name's last token (case-insensitive). Ambiguous matches (zero "
+                "or 2+ distinct full names) are left as separate placeholders. "
+                "Configurable via PII_FILTER_NER_PERSON_COREFERENCE_ENABLED env var."
+            ),
+        )
         # If a PERSON entity ends with one of these tokens, the trailing
         # token is stripped from the span before vault insertion.
         ner_trailing_token_strip: list[str] = Field(
@@ -1810,6 +2065,41 @@ class Pipeline:
                 "Configurable via PII_FILTER_NER_OIB_PHONE_CONTEXT_WINDOW."
             ),
         )
+        # ---- GLiNER2-PII contextual NER (replaces spaCy NER as PERSON source) ----
+        gliner_enabled: bool = Field(
+            default=True,
+            description=(
+                "When True, GLiNER2-PII runs as the contextual NER source and "
+                "SpacyRecognizer is removed from each analyzer. Set False to "
+                "roll back to spaCy NER without a redeploy. "
+                "Configurable via PII_FILTER_GLINER_ENABLED."
+            ),
+        )
+        gliner_threshold: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Minimum GLiNER2 span confidence to accept a detection. "
+                "Raise (0.6-0.7) to cut noise, lower to recover recall. "
+                "Configurable via PII_FILTER_GLINER_THRESHOLD."
+            ),
+        )
+        gliner_model_name: str = Field(
+            default="fastino/gliner2-privacy-filter-PII-multi",
+            description=(
+                "HuggingFace model id, or a local path for the vendored/offline "
+                "model (Path B). Configurable via PII_FILTER_GLINER_MODEL_NAME."
+            ),
+        )
+        gliner_local_files_only: bool = Field(
+            default=False,
+            description=(
+                "When True, load the GLiNER2 model from local files only "
+                "(Path B / vendored, no HF egress). "
+                "Configurable via PII_FILTER_GLINER_LOCAL_FILES_ONLY."
+            ),
+        )
         # ---- Task 8.5: Multi-turn history scope ----------------------------
         multi_turn_history_scope: bool = Field(
             default=True,
@@ -1868,6 +2158,11 @@ class Pipeline:
     # silently dropped before masking, the same way unmapped types already are.
     PRESIDIO_TO_STANDARD: ClassVar[dict[str, str]] = {
         "PERSON": "PERSON",
+        # GLiNER2 contextual types (targets of GLINER2_ENTITY_MAPPING).
+        "ADDRESS": "ADDRESS",
+        "USERNAME": "USERNAME",
+        "IP_ADDRESS": "IP_ADDRESS",
+        "SECRET": "SECRET",
         "EMAIL_ADDRESS": "EMAIL",
         "PHONE_NUMBER": "PHONE",
         "CREDIT_CARD": "CREDIT_CARD",
@@ -1904,6 +2199,9 @@ class Pipeline:
         self.user_valves = self.UserValves()
         self.analyzer_hr: AnalyzerEngine | None = None
         self.analyzer_en: AnalyzerEngine | None = None
+        # GLiNER2-PII detector (language-agnostic). Built in `on_startup` when
+        # `gliner_enabled`; stays None on rollback so inlet falls back to spaCy NER.
+        self._gliner: GLiNER2Detector | None = None
         # The vault is built in `on_startup` from the current valves so
         # admin-edited vault settings take effect on Pipelines restart.
         self.vault: ThreadVault | None = None
@@ -1997,6 +2295,20 @@ class Pipeline:
         if lang_code == "hr":
             analyzer.registry.add_recognizer(CreditCardRecognizer(supported_language=lang_code))
 
+        # GLiNER2 takes over contextual NER -> drop the spaCy NER source so
+        # PERSON/LOCATION come only from GLiNER2 (confidence-scored). Removed by
+        # name (verified "SpacyRecognizer" in presidio-analyzer 2.2.362); only
+        # when GLiNER is enabled, so rollback (gliner_enabled=False) keeps spaCy.
+        if self.valves.gliner_enabled:
+            try:
+                analyzer.registry.remove_recognizer("SpacyRecognizer")
+            except Exception as exc:
+                logger.warning(
+                    "Could not remove SpacyRecognizer from %s registry: %s",
+                    lang_code,
+                    exc,
+                )
+
         analyzer.analyze(text="warmup", language=lang_code, entities=None)
         return analyzer
 
@@ -2054,6 +2366,20 @@ class Pipeline:
 
         self.analyzer_hr = self._build_analyzer("hr") if "hr" in languages else None
         self.analyzer_en = self._build_analyzer("en") if "en" in languages else None
+
+        # GLiNER2-PII (language-agnostic, single pass). Hard-fail in startup if
+        # enabled but the model does not load -> caught in staging, not silently
+        # in production. Rebuilt each on_startup so a valve toggle takes effect
+        # on Pipelines restart (mirrors the analyzer rebuild above).
+        self._gliner = None
+        if self.valves.gliner_enabled:
+            self._gliner = GLiNER2Detector(
+                model_name=self.valves.gliner_model_name,
+                threshold=self.valves.gliner_threshold,
+                local_files_only=self.valves.gliner_local_files_only,
+            )
+            self._gliner.load()
+            self._gliner.detect("warmup Ivan Horvat")  # warmup
 
         logger.info(
             "PII Filter on_startup: analyzers ready (hr=%s, en=%s)",
@@ -2442,6 +2768,7 @@ class Pipeline:
                 use_vault = False
 
         deny_set = frozenset(s.lower() for s in self.valves.ner_deny_list)
+        exact_deny_set = frozenset(s.lower() for s in self.valves.ner_exact_deny_list)
         trailing_set = frozenset(s.lower() for s in self.valves.ner_trailing_token_strip)
         # Per-call compile: respects operator changes to multi_turn_already_masked_pattern
         # via valve without requiring a restart.
@@ -2490,6 +2817,15 @@ class Pipeline:
                         hr_results, en_results, text
                     )
                     total_spillover_dropped += spillover_count
+
+                    # GLiNER2-PII contextual entities (single pass, language-agnostic).
+                    # Added AFTER merge/spillover (GLiNER spans are language-agnostic,
+                    # not HR/EN duplicates so the spillover guard must not touch them)
+                    # and BEFORE select, so whitelist + deny-list + trailing-strip +
+                    # overlap resolution apply uniformly to GLiNER results too.
+                    if self._gliner is not None:
+                        results.extend(self._gliner.detect(text))
+
                     accepted = _select_accepted_detections(
                         text,
                         results,
@@ -2497,36 +2833,47 @@ class Pipeline:
                         deny_set,
                         trailing_set,
                         self.valves.ner_oib_phone_context_window,
+                        exact_deny_set,
                     )
                     if not accepted:
                         continue
 
+                    # Within-message PERSON coreference: a bare surname reuses
+                    # the placeholder of a same-message full name (valve-gated).
+                    overrides = (
+                        _resolve_person_coreference(text, accepted)
+                        if self.valves.ner_person_coreference_enabled
+                        else {}
+                    )
                     pieces: list[str] = []
                     last_end = 0
-                    for det in accepted:
-                        original = text[det.start : det.end]
+                    for idx, det in enumerate(accepted):
+                        surface = text[det.start : det.end]
+                        # Coreference may remap the placeholder *key* to a full
+                        # name; spliced span + enriched `original` stay surface.
+                        key = overrides.get(idx, surface)
                         standard_type = self.PRESIDIO_TO_STANDARD[det.entity_type]
                         placeholder: str
                         if use_vault:
                             assert self.vault is not None  # for mypy
                             placeholder = await self.vault.get_placeholder(
-                                thread_id, original, standard_type
+                                thread_id, key, standard_type
                             )
                         else:
-                            existing = forward_map.get(original)
+                            existing = forward_map.get(key)
                             if existing is None:
                                 n = counter_state.get(standard_type, 0) + 1
                                 counter_state[standard_type] = n
                                 placeholder = f"[{standard_type}_{n}]"
-                                forward_map[original] = placeholder
-                                reverse_map[placeholder] = original
+                                forward_map[key] = placeholder
+                                reverse_map[placeholder] = key
                             else:
                                 placeholder = existing
                         pieces.append(text[last_end : det.start])
                         pieces.append(placeholder)
                         last_end = det.end
                         enriched_det = _build_enriched_detection(
-                            det, text, standard_type, original, placeholder
+                            det, text, standard_type, surface, placeholder
                         )
                         enriched_det["message_index"] = msg_idx
                         all_enriched.append(enriched_det)

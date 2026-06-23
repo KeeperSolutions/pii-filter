@@ -67,6 +67,13 @@ ignore_missing_imports = true
 module = "google.cloud.*"
 ignore_missing_imports = true
 
+# gliner2 ships no type stubs; treat the import as untyped so mypy --strict
+# passes without the package installed locally (same handling as asyncpg /
+# schemas / google.cloud above).
+[[tool.mypy.overrides]]
+module = "gliner2"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
