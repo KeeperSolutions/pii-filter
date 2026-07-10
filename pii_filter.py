@@ -599,6 +599,27 @@ def _select_accepted_detections(
     if not text or not detections:
         return []
 
+    # Step 0: Placeholder overlap filter (TRAU-522).
+    # Re-analysis of already-masked content (multi-turn history / background
+    # tasks) feeds existing `[TYPE_N]` placeholders back through detection.
+    # Regex/checksum recognizers never match a placeholder, but GLiNER (neural)
+    # re-detects them as entities ([PERSON_1]->PERSON, [ADDRESS_1]->ADDRESS).
+    # Left unchecked, that would re-mask a placeholder (mint a NEW number keyed
+    # on the literal "[PERSON_1]"), renumbering it and breaking inlet<->outlet
+    # vault parity so restore returns the placeholder instead of the real value.
+    # Drop any detection whose span OVERLAPS a placeholder span; adjacent real
+    # names (non-overlapping) are untouched. This is the single, source-agnostic
+    # idempotency guard that lets the per-message already-masked skip be removed.
+    placeholder_spans = [(m.start(), m.end()) for m in _PLACEHOLDER_RE.finditer(text)]
+    if placeholder_spans:
+        detections = [
+            d
+            for d in detections
+            if not any(d.start < ph_end and d.end > ph_start for ph_start, ph_end in placeholder_spans)
+        ]
+        if not detections:
+            return []
+
     # Step 1: Whitelist filter
     candidates: list[RecognizerResult] = [
         d for d in detections if d.entity_type in presidio_to_standard
@@ -852,6 +873,49 @@ def mask_text(
 # `CREDIT_CARD`), an underscore, then a positive integer counter. Compiled
 # once at module load so `restore_text` does not pay re.compile per call.
 _PLACEHOLDER_RE = re.compile(r"\[[A-Z_]+_\d+\]")
+
+
+def _build_vault_remasker(forward: dict[str, str]) -> re.Pattern[str] | None:
+    """Compile a single deterministic re-mask pattern over the vault's known
+    originals for this thread (TRAU-522 Option A).
+
+    `forward` is the vault snapshot's ``{original -> placeholder}`` map. Because
+    it is keyed by original, EVERY distinct original is preserved even when
+    several share one placeholder (surname coreference: both "Robert Plant" and
+    "Plant" -> [PERSON_1]) — so building the matcher here never drops an entry.
+
+    The alternation is ordered longest-original-first so a longer original wins
+    at a shared start position (Python alternation is leftmost, first-match):
+    "Robert Plant" is tried before "Plant". Each original is `\\b`-bounded and
+    matched case-sensitively, so "Plant" does not fire inside "Plantation" and
+    "ann" does not match a vaulted "Ann". Returns None when there is nothing to
+    re-mask (empty snapshot), letting callers skip the pass entirely.
+    """
+    if not forward:
+        return None
+    originals = sorted((o for o in forward if o), key=len, reverse=True)
+    if not originals:
+        return None
+    alternation = "|".join(re.escape(o) for o in originals)
+    return re.compile(r"\b(?:" + alternation + r")\b")
+
+
+def _apply_vault_remask(
+    text: str, pattern: re.Pattern[str] | None, forward: dict[str, str]
+) -> str:
+    """Replace every known vault original in `text` with its placeholder in ONE
+    left-to-right pass (TRAU-522 Option A).
+
+    Single-pass `re.sub` means an inserted ``[TYPE_N]`` is never re-scanned, so
+    there is no cascade or double-masking. Existing placeholders are never
+    targets — originals are real values, never placeholder-shaped — so this is a
+    no-op on already-masked text (idempotent). Returns `text` unchanged when
+    there is no matcher or no original occurs.
+    """
+    if pattern is None or not text:
+        return text
+    return pattern.sub(lambda m: forward[m.group(0)], text)
+
 
 # Compiled once at module load so _select_accepted_detections pays no re.compile per call.
 # Each pattern uses a $ anchor so it only matches when the phone keyword is immediately
@@ -2654,32 +2718,21 @@ class Pipeline:
             )
             return body
 
-        # Task 3.2/3.3 OpenWebUI integration: skip background tasks.
-        # OpenWebUI sends embedded chat history as user content for
-        # title/tags/follow-up generation, which would produce false-positive
-        # PII detections on assistant content inside the embedded history.
-        # Background tasks are identified by metadata["task"] key
-        # (e.g., "title_generation", "tags_generation", "follow_up_generation").
-        # The original user message has already been processed by the primary
-        # inlet call; outlet will still restore placeholders in task responses.
-        metadata = body.get("metadata")
-        if isinstance(metadata, dict):
-            task = metadata.get("task")
-            if task:
-                logger.info(
-                    "inlet: skipping OpenWebUI background task '%s' "
-                    "(chat_id=%s, body_size=%d chars)",
-                    task,
-                    metadata.get("chat_id"),
-                    sum(
-                        len(str(m.get("content", "")))
-                        for m in body.get("messages", [])
-                        if isinstance(m, dict)
-                    )
-                    if isinstance(body.get("messages"), list)
-                    else 0,
-                )
-                return body
+        # TRAU-522: OpenWebUI background tasks (title / tags / follow-up /
+        # image_prompt / queries / autocompletion / emoji / moa) embed the chat
+        # message as user content and were previously skipped here UNCONDITIONALLY
+        # — leaking raw PII to the external LLM even when per-chat masking was ON.
+        # The skip has been removed so task payloads flow through the normal
+        # detect -> get_placeholder -> splice path below. The toggle is honored in
+        # BOTH directions by the gates ABOVE this point, which run first:
+        #   * masking OFF short-circuits at the `pii_masking_enabled` gate, so a
+        #     task is never masked against the user's explicit opt-out;
+        #   * masking ON reaches here and is masked like any other turn.
+        # Because task payloads carry `metadata.chat_id`, `_resolve_chat_id`
+        # resolves the same thread as the main chat, so masked tasks reuse the
+        # existing vault mapping (same [PERSON_1]) rather than renumbering.
+        # NOTE: an equivalent unconditional task skip exists in the sibling
+        # pii-filter repo (pii_filter.py ~:2657) and must get the same removal.
 
         if self.analyzer_hr is None and self.analyzer_en is None:
             logger.warning("inlet called before on_startup completed; returning body unchanged")
@@ -2704,14 +2757,21 @@ class Pipeline:
                 return body
             target_indices = [last]
         else:
-            all_user_indices = [
-                i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"
+            # TRAU-522 Option A: process user AND assistant turns. The leak that
+            # NER-only masking left open lived in the ASSISTANT history turns —
+            # they carry the outlet-restored real name and were never re-masked.
+            # Including them lets the deterministic vault re-mask (and NER) cover
+            # assistant content too. system turns stay out (templates, no PII).
+            all_history_indices = [
+                i
+                for i, m in enumerate(messages)
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
             ]
-            if not all_user_indices:
-                logger.debug("inlet: no user messages found, skipping analysis")
+            if not all_history_indices:
+                logger.debug("inlet: no user/assistant messages found, skipping analysis")
                 return body
             cap = self.valves.multi_turn_history_max_messages
-            target_indices = all_user_indices[-cap:]
+            target_indices = all_history_indices[-cap:]
 
         raw_chat_id, thread_id = self._resolve_chat_id(body)
         if raw_chat_id is None:
@@ -2767,20 +2827,40 @@ class Pipeline:
                     ) from None
                 use_vault = False
 
+        # TRAU-522 Option A: deterministic vault re-mask. NER re-derives masking
+        # every turn and its recall degrades on accumulated multi-turn context,
+        # so a previously-vaulted name can slip through unmasked (E2E: repeated
+        # name on turn 2+, carried in an assistant turn). Pull the START snapshot
+        # ONCE per request and build an exact-match matcher over the thread's
+        # known originals; the per-part loop applies it BEFORE any analyzer.
+        # Self-limiting: only originals already vaulted from PRIOR turns are
+        # re-masked — a name new to THIS turn is absent from the snapshot,
+        # untouched by re-mask, and caught by the normal NER path. This is one
+        # extra snapshot read per request (~ms, dwarfed by the GLiNER pass); the
+        # end-of-inlet snapshot (metadata) stays as-is since it must also reflect
+        # placeholders minted during this turn.
+        # KNOWN TRADE-OFF (accepted): two different people sharing a name string
+        # ("Ann" A vs "Ann" B) collapse to one placeholder. That is inherent to
+        # any string-based masking (the NER path collapses them too) and is
+        # OVER-masking (fail-safe), never a leak.
+        remask_forward: dict[str, str] = {}
+        remask_pattern: re.Pattern[str] | None = None
+        if use_vault:
+            assert self.vault is not None  # for mypy
+            try:
+                remask_forward, _ = await self.vault.snapshot_for_request(thread_id)
+            except Exception:
+                logger.exception(
+                    "inlet: vault snapshot for deterministic re-mask failed; "
+                    "proceeding NER-only for thread_id=%s",
+                    thread_id,
+                )
+                remask_forward = {}
+            remask_pattern = _build_vault_remasker(remask_forward)
+
         deny_set = frozenset(s.lower() for s in self.valves.ner_deny_list)
         exact_deny_set = frozenset(s.lower() for s in self.valves.ner_exact_deny_list)
         trailing_set = frozenset(s.lower() for s in self.valves.ner_trailing_token_strip)
-        # Per-call compile: respects operator changes to multi_turn_already_masked_pattern
-        # via valve without requiring a restart.
-        _default_masked_pattern = r"\[[A-Z_]+_\d+\]"
-        try:
-            already_masked_re = re.compile(self.valves.multi_turn_already_masked_pattern)
-        except re.error:
-            logger.error(
-                "inlet: invalid multi_turn_already_masked_pattern %r — falling back to default",
-                self.valves.multi_turn_already_masked_pattern,
-            )
-            already_masked_re = re.compile(_default_masked_pattern)
 
         messages_processed = 0
         messages_skipped = 0
@@ -2789,32 +2869,46 @@ class Pipeline:
             for msg_idx in target_indices:
                 target_msg = messages[msg_idx]
 
-                # Regex pre-check: skip messages already containing placeholders
-                # (from a prior inlet call). This avoids a redundant Presidio
-                # analyzer call — the dominant latency source — for history
-                # messages that were masked in an earlier turn.
-                full_content = _get_message_text_for_precheck(target_msg)
-                if already_masked_re.search(full_content):
-                    messages_skipped += 1
-                    continue
+                # TRAU-522: the per-message already-masked skip was removed here.
+                # It short-circuited any message containing a placeholder, which
+                # leaked on mixed content — an existing placeholder plus a NEW name
+                # in the same message (e.g. embedded follow-up history): the new
+                # name was never masked. Every message is now analyzed; the
+                # placeholder overlap-filter in `_select_accepted_detections`
+                # (Step 0) keeps re-analysis idempotent, so existing placeholders
+                # are never renumbered. `messages_skipped` is retained (now always
+                # 0) for log/return-guard compatibility. NOTE: the sibling
+                # pii-filter repo has the same skip (~pii_filter.py:2657) and needs
+                # the identical removal.
 
                 parts = list(self._iter_text_parts(target_msg))
                 if not parts:
                     continue
 
                 for text, write_back in parts:
+                    # TRAU-522 Option A step (a): deterministic vault re-mask
+                    # FIRST — before BOTH analyzers. Known originals become their
+                    # placeholders regardless of NER recall. Running it before
+                    # Presidio HR/EN (and their merge/spillover guard) and GLiNER
+                    # means every analyzer sees the SAME already-re-masked text,
+                    # and the Step-0 overlap-filter in `_select_accepted_detections`
+                    # protects the inserted placeholders from re-detection /
+                    # renumbering. All subsequent detection + splice work runs on
+                    # `analyzed`, whose offsets are what `write_back` persists.
+                    analyzed = _apply_vault_remask(text, remask_pattern, remask_forward)
+
                     hr_results: list[RecognizerResult] = (
-                        self.analyzer_hr.analyze(text=text, language="hr")
+                        self.analyzer_hr.analyze(text=analyzed, language="hr")
                         if self.analyzer_hr is not None
                         else []
                     )
                     en_results: list[RecognizerResult] = (
-                        self.analyzer_en.analyze(text=text, language="en")
+                        self.analyzer_en.analyze(text=analyzed, language="en")
                         if self.analyzer_en is not None
                         else []
                     )
                     results, spillover_count = _merge_dedupe_detections(
-                        hr_results, en_results, text
+                        hr_results, en_results, analyzed
                     )
                     total_spillover_dropped += spillover_count
 
@@ -2824,10 +2918,10 @@ class Pipeline:
                     # and BEFORE select, so whitelist + deny-list + trailing-strip +
                     # overlap resolution apply uniformly to GLiNER results too.
                     if self._gliner is not None:
-                        results.extend(self._gliner.detect(text))
+                        results.extend(self._gliner.detect(analyzed))
 
                     accepted = _select_accepted_detections(
-                        text,
+                        analyzed,
                         results,
                         self.PRESIDIO_TO_STANDARD,
                         deny_set,
@@ -2836,19 +2930,24 @@ class Pipeline:
                         exact_deny_set,
                     )
                     if not accepted:
+                        # No NEW names to mint, but re-mask may still have masked
+                        # known originals; persist it so the deterministic re-mask
+                        # is not lost when NER finds nothing.
+                        if analyzed != text:
+                            write_back(analyzed)
                         continue
 
                     # Within-message PERSON coreference: a bare surname reuses
                     # the placeholder of a same-message full name (valve-gated).
                     overrides = (
-                        _resolve_person_coreference(text, accepted)
+                        _resolve_person_coreference(analyzed, accepted)
                         if self.valves.ner_person_coreference_enabled
                         else {}
                     )
                     pieces: list[str] = []
                     last_end = 0
                     for idx, det in enumerate(accepted):
-                        surface = text[det.start : det.end]
+                        surface = analyzed[det.start : det.end]
                         # Coreference may remap the placeholder *key* to a full
                         # name; spliced span + enriched `original` stay surface.
                         key = overrides.get(idx, surface)
@@ -2869,15 +2968,15 @@ class Pipeline:
                                 reverse_map[placeholder] = key
                             else:
                                 placeholder = existing
-                        pieces.append(text[last_end : det.start])
+                        pieces.append(analyzed[last_end : det.start])
                         pieces.append(placeholder)
                         last_end = det.end
                         enriched_det = _build_enriched_detection(
-                            det, text, standard_type, surface, placeholder
+                            det, analyzed, standard_type, surface, placeholder
                         )
                         enriched_det["message_index"] = msg_idx
                         all_enriched.append(enriched_det)
-                    pieces.append(text[last_end:])
+                    pieces.append(analyzed[last_end:])
                     write_back("".join(pieces))
 
                 messages_processed += 1
