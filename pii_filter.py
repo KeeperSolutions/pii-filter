@@ -874,6 +874,19 @@ def mask_text(
 # once at module load so `restore_text` does not pay re.compile per call.
 _PLACEHOLDER_RE = re.compile(r"\[[A-Z_]+_\d+\]")
 
+# Extracts the standard entity type from a placeholder: `[HR_OIB_1]` -> `HR_OIB`.
+# The type may itself contain underscores, so the trailing `_<digits>` counter is
+# stripped by anchoring the digit run at the end.
+_PLACEHOLDER_TYPE_RE = re.compile(r"^\[([A-Z_]+)_\d+\]$")
+
+
+def _entity_type_from_placeholder(placeholder: str) -> str | None:
+    """Return the standard entity type encoded in a `[TYPE_n]` placeholder, or
+    None if the string is not a well-formed placeholder (defensive — vault
+    values are always well-formed, so this only guards against corruption)."""
+    m = _PLACEHOLDER_TYPE_RE.match(placeholder)
+    return m.group(1) if m else None
+
 
 def _build_vault_remasker(forward: dict[str, str]) -> re.Pattern[str] | None:
     """Compile a single deterministic re-mask pattern over the vault's known
@@ -902,19 +915,91 @@ def _build_vault_remasker(forward: dict[str, str]) -> re.Pattern[str] | None:
 
 def _apply_vault_remask(
     text: str, pattern: re.Pattern[str] | None, forward: dict[str, str]
-) -> str:
+) -> tuple[str, list[dict[str, Any]]]:
     """Replace every known vault original in `text` with its placeholder in ONE
-    left-to-right pass (TRAU-522 Option A).
+    left-to-right pass (TRAU-522 Option A), returning `(masked_text, spans)`.
 
-    Single-pass `re.sub` means an inserted ``[TYPE_N]`` is never re-scanned, so
-    there is no cascade or double-masking. Existing placeholders are never
+    `spans` is the list of masked occurrences, each
+    ``{start, end, original, placeholder, entity_type}`` where `start`/`end` are
+    offsets into the *original* `text` (the matcher runs over the input, before
+    any substitution) and `entity_type` is derived from the placeholder (None if
+    it is malformed). These serve two purposes: (1) they feed the PII card so a
+    repeated vaulted mention — which the deterministic re-mask handles before the
+    analyzers, so it never reaches the NER `accepted` path that normally
+    populates the card — still shows up; and (2) they are the analyzed<->original
+    offset map (`_analyzed_to_original_offset`) that translates NER offsets on a
+    NEW name back to the original message. Original coordinates let the frontend
+    slice the value straight out of the user's own message text. EVERY masked
+    occurrence is recorded (even with entity_type=None) so the offset map is
+    complete; only the card emitter skips the type-less entries.
+
+    Single left-to-right pass means an inserted ``[TYPE_N]`` is never re-scanned,
+    so there is no cascade or double-masking. Existing placeholders are never
     targets — originals are real values, never placeholder-shaped — so this is a
-    no-op on already-masked text (idempotent). Returns `text` unchanged when
-    there is no matcher or no original occurs.
+    no-op on already-masked text (idempotent). Returns `(text, [])` when there is
+    no matcher or no original occurs.
     """
     if pattern is None or not text:
-        return text
-    return pattern.sub(lambda m: forward[m.group(0)], text)
+        return text, []
+    pieces: list[str] = []
+    spans: list[dict[str, Any]] = []
+    last_end = 0
+    for m in pattern.finditer(text):
+        original = m.group(0)
+        placeholder = forward[original]
+        pieces.append(text[last_end : m.start()])
+        pieces.append(placeholder)
+        last_end = m.end()
+        # Record every masked occurrence so the offset map stays complete. A
+        # malformed placeholder (entity_type=None) still shifts offsets, so it
+        # must be in the map even though the card emitter will skip it.
+        spans.append(
+            {
+                "start": m.start(),
+                "end": m.end(),
+                "original": original,
+                "placeholder": placeholder,
+                "entity_type": _entity_type_from_placeholder(placeholder),
+            }
+        )
+    pieces.append(text[last_end:])
+    return "".join(pieces), spans
+
+
+def _analyzed_to_original_offset(
+    pos: int, remask_spans: list[dict[str, Any]]
+) -> int | None:
+    """Map an offset in the re-masked `analyzed` text back to the original text.
+
+    The deterministic re-mask replaced known originals with placeholders BEFORE
+    the analyzers ran, so NER offsets are relative to the length-changed
+    `analyzed` string. `remask_spans` (from `_apply_vault_remask`, in ORIGINAL
+    coordinates, left-to-right) undoes those changes: for every placeholder that
+    lies fully before `pos` in `analyzed`, add back its
+    ``len(original) - len(placeholder)`` length delta.
+
+    Returns None when `pos` falls INSIDE a placeholder region — an undefined
+    mapping. This should be unreachable for accepted NER detections, which never
+    overlap a re-masked span (the Step-0 overlap filter drops placeholder
+    overlaps); the caller treats None defensively (skips the card entry, keeps
+    the mask). With no re-mask the list is empty and `pos` is returned unchanged.
+    """
+    cumulative = 0  # sum of (len_original - len_placeholder) applied so far
+    for span in remask_spans:
+        len_original = span["end"] - span["start"]
+        len_placeholder = len(span["placeholder"])
+        analyzed_start = span["start"] - cumulative
+        analyzed_end = analyzed_start + len_placeholder
+        if analyzed_end <= pos:
+            cumulative += len_original - len_placeholder
+        elif pos < analyzed_start:
+            # `pos` precedes this (and, since spans are ordered, every later)
+            # placeholder — nothing more to add.
+            break
+        else:
+            # analyzed_start <= pos < analyzed_end: `pos` is inside a placeholder.
+            return None
+    return pos + cumulative
 
 
 # Compiled once at module load so _select_accepted_detections pays no re.compile per call.
@@ -2895,7 +2980,35 @@ class Pipeline:
                     # protects the inserted placeholders from re-detection /
                     # renumbering. All subsequent detection + splice work runs on
                     # `analyzed`, whose offsets are what `write_back` persists.
-                    analyzed = _apply_vault_remask(text, remask_pattern, remask_forward)
+                    analyzed, remask_spans = _apply_vault_remask(
+                        text, remask_pattern, remask_forward
+                    )
+
+                    # TRAU-522 (card): feed the deterministic re-mask into the
+                    # card. A repeated vaulted name is masked here, BEFORE the
+                    # analyzers, so it never reaches the NER `accepted` loop below
+                    # that normally populates `all_enriched` -> without this the
+                    # card would silently stop showing on repeat mentions. These
+                    # spans carry ORIGINAL-text offsets, so the frontend slices
+                    # the value from the user's own message correctly. `remask_spans`
+                    # also doubles as the analyzed<->original offset map used just
+                    # below to translate NER offsets for NEW names in the same
+                    # message (skip type-less entries here, keep them in the map).
+                    for span in remask_spans:
+                        if span["entity_type"] is None:
+                            continue
+                        all_enriched.append(
+                            {
+                                "entity_type": span["entity_type"],
+                                "start": span["start"],
+                                "end": span["end"],
+                                "score": 1.0,  # deterministic vault hit, not probabilistic NER
+                                "raw_entity_type": span["entity_type"],
+                                "original": span["original"],
+                                "placeholder": span["placeholder"],
+                                "message_index": msg_idx,
+                            }
+                        )
 
                     hr_results: list[RecognizerResult] = (
                         self.analyzer_hr.analyze(text=analyzed, language="hr")
@@ -2971,9 +3084,30 @@ class Pipeline:
                         pieces.append(analyzed[last_end : det.start])
                         pieces.append(placeholder)
                         last_end = det.end
+                        # The card slices the ORIGINAL user message, but `det`
+                        # offsets are in the re-masked `analyzed` text. Translate
+                        # them back so a NEW name sharing a message with a
+                        # re-masked repeat still highlights the right span (fixes
+                        # the 'know Eleanor Fitz' shift). No-op when nothing was
+                        # re-masked. Length is preserved — no placeholder falls
+                        # inside an accepted NER span — so `end` tracks `start`.
+                        # None => the detection overlaps a re-masked placeholder
+                        # (Step-0 invariant violated, should be unreachable): the
+                        # mask above already applied (splice uses `det`), so we
+                        # only skip the — now undefined — card entry.
+                        orig_start = _analyzed_to_original_offset(det.start, remask_spans)
+                        if orig_start is None:
+                            logger.warning(
+                                "pii card: NER detection at analyzed offset %d overlaps a "
+                                "re-masked placeholder; skipping card entry",
+                                det.start,
+                            )
+                            continue
                         enriched_det = _build_enriched_detection(
                             det, analyzed, standard_type, surface, placeholder
                         )
+                        enriched_det["start"] = orig_start
+                        enriched_det["end"] = orig_start + (det.end - det.start)
                         enriched_det["message_index"] = msg_idx
                         all_enriched.append(enriched_det)
                     pieces.append(analyzed[last_end:])
