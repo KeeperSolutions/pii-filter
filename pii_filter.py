@@ -899,10 +899,15 @@ def _build_vault_remasker(forward: dict[str, str]) -> re.Pattern[str] | None:
 
     The alternation is ordered longest-original-first so a longer original wins
     at a shared start position (Python alternation is leftmost, first-match):
-    "Robert Plant" is tried before "Plant". Each original is `\\b`-bounded and
-    matched case-sensitively, so "Plant" does not fire inside "Plantation" and
-    "ann" does not match a vaulted "Ann". Returns None when there is nothing to
-    re-mask (empty snapshot), letting callers skip the pass entirely.
+    "Robert Plant" is tried before "Plant". Each original is bounded by
+    ``(?<!\\w)``/``(?!\\w)`` and matched case-sensitively, so "Plant" does not
+    fire inside "Plantation" and "ann" does not match a vaulted "Ann". These
+    lookarounds are used instead of ``\\b`` because ``\\b`` only matches at a
+    word/non-word transition, so it would never match an original that begins or
+    ends with a non-word character (e.g. a "+385…" phone or a "@handle") — the
+    lookarounds keep the "not inside a larger word" guard while still matching
+    those. Returns None when there is nothing to re-mask (empty snapshot),
+    letting callers skip the pass entirely.
     """
     if not forward:
         return None
@@ -910,7 +915,7 @@ def _build_vault_remasker(forward: dict[str, str]) -> re.Pattern[str] | None:
     if not originals:
         return None
     alternation = "|".join(re.escape(o) for o in originals)
-    return re.compile(r"\b(?:" + alternation + r")\b")
+    return re.compile(r"(?<!\w)(?:" + alternation + r")(?!\w)")
 
 
 def _apply_vault_remask(
@@ -1810,26 +1815,6 @@ def _find_last_user_index(messages: list[dict[str, Any]]) -> int:
     return -1
 
 
-def _get_message_text_for_precheck(msg: dict[str, Any]) -> str:
-    """Return all text content from a message as a single string for regex pre-check.
-
-    Handles both str content and list[dict] multimodal content.
-    Image-only parts contribute nothing; returns '' if no text exists.
-    """
-    content = msg.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text", "")
-                if isinstance(text, str):
-                    parts.append(text)
-        return " ".join(parts)
-    return ""
-
-
 def _merge_dedupe_detections(
     hr_results: list[RecognizerResult],
     en_results: list[RecognizerResult],
@@ -2271,14 +2256,6 @@ class Pipeline:
                 "processing (equivalent to disabling multi_turn_history_scope)."
             ),
         )
-        multi_turn_already_masked_pattern: str = Field(
-            default=r"\[[A-Z_]+_\d+\]",
-            description=(
-                "Regex pattern to detect messages already masked from a prior "
-                "inlet call. Messages matching this pattern are skipped without "
-                "calling Presidio (performance optimization)."
-            ),
-        )
 
     class UserValves(BaseModel):
         """Per-user toggles. Schema only — Task 8 wires the masking toggle.
@@ -2705,17 +2682,19 @@ class Pipeline:
     async def inlet(
         self, body: dict[str, Any], user: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Detect PII in user messages, mask in place via the thread-scoped
-        vault (Task 5/5.1), and stash forward + reverse maps in
-        `body["metadata"]` so the outlet (Task 6) keeps reading the same
-        keys regardless of backend.
+        """Detect PII in the conversation's user and assistant messages, mask
+        in place via the thread-scoped vault (Task 5/5.1), and stash forward +
+        reverse maps in `body["metadata"]` so the outlet (Task 6) keeps reading
+        the same keys regardless of backend.
 
-        Task 8.5: by default (`multi_turn_history_scope=True`), ALL user
-        messages in `body["messages"]` are processed (up to
-        `multi_turn_history_max_messages`), not just the last one.  Already-
-        masked messages (matching `multi_turn_already_masked_pattern`) are
-        skipped via a cheap regex pre-check to avoid redundant Presidio calls.
-        Assistant messages pass through unchanged.
+        Task 8.5 / TRAU-522: by default (`multi_turn_history_scope=True`), ALL
+        user AND assistant messages in `body["messages"]` are processed (up to
+        `multi_turn_history_max_messages` from the tail), not just the last one.
+        Assistant history is masked too, so an outlet-restored real name from a
+        prior turn cannot leak back to the LLM. Every message is analyzed on
+        every turn; the deterministic vault re-mask plus the placeholder
+        overlap-filter (Step 0) keep re-analysis idempotent — existing
+        `[TYPE_N]` placeholders are never renumbered.
 
         Mutates each processed message's `content` field in place. All other
         body keys are left untouched. On analyzer / vault failure, behavior
