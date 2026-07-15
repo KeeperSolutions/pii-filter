@@ -11,7 +11,9 @@ requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy<3.8.0,
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import functools
 import hashlib
 import hmac
 import logging
@@ -19,6 +21,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
@@ -40,6 +43,39 @@ logger = logging.getLogger(__name__)
 # across repeated on_startup calls (test reruns, multiple Pipeline instances).
 # AnalyzerEngine instances are still rebuilt per startup.
 _nlp_engine_cache: dict[str, Any] = {}
+
+
+# ---------------------------------------------------------------------------
+# NER thread configuration (KORAK 3 — torch/BLAS intra-op cap)
+# ---------------------------------------------------------------------------
+
+
+def _ner_thread_limit() -> int:
+    """Intra-op thread count for a SINGLE NER inference (torch + BLAS).
+
+    NER is serialized on a dedicated single-worker executor
+    (``Pipeline._ner_executor``), so there is never a second concurrent
+    inference to over-subscribe — one inference may safely use every allocated
+    vCPU. This caps the *intra-op* parallelism of that one inference (torch's
+    thread pool via ``torch.set_num_threads`` for the GLiNER forward pass, and
+    OpenMP/BLAS via the ``OMP_NUM_THREADS`` env for spaCy/thinc/blis).
+
+    Env-tunable via ``PII_FILTER_NER_TORCH_THREADS`` (default 4 = the Cloud Run
+    vCPU allocation); a malformed or <1 value falls back to 1.
+
+    ``os.cpu_count()`` is deliberately NOT used as the default: on Cloud Run it
+    reports the host's core count, not the container's cgroup quota, which is
+    exactly the over-subscription trap this cap exists to avoid. The Dockerfile
+    sets ``OMP_NUM_THREADS``/``OPENBLAS_NUM_THREADS``/``MKL_NUM_THREADS`` to the
+    same value so the BLAS side (which ``torch.set_num_threads`` does not touch)
+    is capped too; keep the env and this default in sync when tuning.
+    """
+    raw = os.environ.get("PII_FILTER_NER_TORCH_THREADS", "4")
+    try:
+        n = int(raw)
+    except ValueError:
+        return 1
+    return n if n >= 1 else 1
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +525,16 @@ class GLiNER2Detector:
         self._model: Any = None
 
     def load(self) -> None:
+        import torch  # lazy import (heavy); bundled with gliner2[local]
         from gliner2 import GLiNER2  # lazy import (heavy: torch/transformers)
+
+        # KORAK 3: cap torch intra-op threads for the GLiNER forward pass. With
+        # NER serialized on the single-worker executor there is no concurrent
+        # inference, so this one may use every allocated vCPU (default 4) — but
+        # it must never exceed the cgroup quota, hence the explicit cap instead
+        # of torch's host-core default. spaCy/BLAS is capped separately via the
+        # OMP_NUM_THREADS env (Dockerfile); see `_ner_thread_limit`.
+        torch.set_num_threads(_ner_thread_limit())
 
         kwargs: dict[str, Any] = {"map_location": self.map_location}
         if self.local_files_only:
@@ -2331,8 +2376,45 @@ class Pipeline:
         # The vault is built in `on_startup` from the current valves so
         # admin-edited vault settings take effect on Pipelines restart.
         self.vault: ThreadVault | None = None
+        # KORAK 4: dedicated single-worker executor for the CPU-bound, sync,
+        # NOT-thread-safe NER calls (Presidio spaCy + GLiNER torch). max_workers=1
+        # serializes all inferences onto one thread so the shared analyzer/model
+        # instances are never touched concurrently (thread-safety) while the
+        # event loop stays free to service other coroutines. Created lazily via
+        # `_get_ner_executor` and torn down in `on_shutdown`.
+        self._ner_executor: ThreadPoolExecutor | None = None
 
         logger.info("PII Filter pipeline initialized (analyzer not loaded yet)")
+
+    def _get_ner_executor(self) -> ThreadPoolExecutor:
+        """Return the single-worker NER executor, creating it on first use.
+
+        A single worker is load-bearing: Presidio's spaCy NLP pass and GLiNER's
+        torch forward pass are NOT thread-safe for concurrent calls on the shared
+        instances, so serializing every `analyze`/`detect` onto one thread is the
+        thread-safety guarantee (not a lock, not per-thread model copies). Lazy
+        creation keeps the offload path working even if `inlet` is somehow reached
+        before `on_startup` (e.g. tests inject fakes directly).
+        """
+        if self._ner_executor is None:
+            self._ner_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pii-ner"
+            )
+        return self._ner_executor
+
+    async def _offload_ner(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run a sync, CPU-bound NER call on the single-worker executor.
+
+        `run_in_executor` takes no kwargs, so bind them with `functools.partial`.
+        Awaiting the returned future yields the event loop while the worker thread
+        runs the inference — other coroutines (vault async DB, other requests)
+        progress meanwhile. Serialization across all callers is structural: the
+        executor has exactly one thread.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._get_ner_executor(), functools.partial(fn, *args, **kwargs)
+        )
 
     def _build_analyzer(self, lang_code: str) -> AnalyzerEngine:
         """Build a single-language AnalyzerEngine with all relevant recognizers.
@@ -2507,10 +2589,19 @@ class Pipeline:
             self._gliner.load()
             self._gliner.detect("warmup Ivan Horvat")  # warmup
 
+        # KORAK 4: (re)create the single-worker NER executor. A prior instance
+        # (on_startup re-called after on_shutdown on a Pipelines reload) is torn
+        # down first so we never leak worker threads.
+        if self._ner_executor is not None:
+            self._ner_executor.shutdown(wait=False)
+            self._ner_executor = None
+        self._get_ner_executor()
+
         logger.info(
-            "PII Filter on_startup: analyzers ready (hr=%s, en=%s)",
+            "PII Filter on_startup: analyzers ready (hr=%s, en=%s, ner_threads=%d)",
             self.analyzer_hr is not None,
             self.analyzer_en is not None,
+            _ner_thread_limit(),
         )
 
         # Vault initialization (Postgres-only). `initialize()` opens the
@@ -2567,6 +2658,11 @@ class Pipeline:
         logger.info("PII Filter on_shutdown")
         self.analyzer_hr = None
         self.analyzer_en = None
+        if self._ner_executor is not None:
+            # Don't block shutdown on an in-flight inference; the worker thread
+            # is a daemon of the pool and exits when its current call returns.
+            self._ner_executor.shutdown(wait=False)
+            self._ner_executor = None
         if self.vault is not None:
             await self.vault.aclose()
             self.vault = None
@@ -2989,13 +3085,21 @@ class Pipeline:
                             }
                         )
 
+                    # KORAK 4: the three NER calls below are synchronous, CPU-bound
+                    # and NOT thread-safe (Presidio's spaCy NLP pass; GLiNER's torch
+                    # forward pass). Each is offloaded onto the single-worker NER
+                    # executor via `_offload_ner` so it runs on a worker thread
+                    # (event loop stays free) while `max_workers=1` serializes them
+                    # so the shared analyzer/model instances are never called
+                    # concurrently. Behaviour is identical to the prior sync calls —
+                    # same inputs, same results, same order — only the thread differs.
                     hr_results: list[RecognizerResult] = (
-                        self.analyzer_hr.analyze(text=analyzed, language="hr")
+                        await self._offload_ner(self.analyzer_hr.analyze, text=analyzed, language="hr")
                         if self.analyzer_hr is not None
                         else []
                     )
                     en_results: list[RecognizerResult] = (
-                        self.analyzer_en.analyze(text=analyzed, language="en")
+                        await self._offload_ner(self.analyzer_en.analyze, text=analyzed, language="en")
                         if self.analyzer_en is not None
                         else []
                     )
@@ -3009,8 +3113,10 @@ class Pipeline:
                     # not HR/EN duplicates so the spillover guard must not touch them)
                     # and BEFORE select, so whitelist + deny-list + trailing-strip +
                     # overlap resolution apply uniformly to GLiNER results too.
+                    # Offloaded onto the same single-worker NER executor (see above).
                     if self._gliner is not None:
-                        results.extend(self._gliner.detect(analyzed))
+                        gliner_results = await self._offload_ner(self._gliner.detect, analyzed)
+                        results.extend(gliner_results)
 
                     accepted = _select_accepted_detections(
                         analyzed,
