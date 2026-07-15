@@ -1917,6 +1917,27 @@ def _merge_dedupe_detections(
     return list(merged.values()), spillover_dropped
 
 
+# OpenWebUI background-task types (carried on `metadata.task`) whose generated
+# output is consumed by the SAME LLM and never handed to a third party. For these
+# — and ONLY these — the inlet skips the NER detection pass (GLiNER + dual
+# Presidio) and relies on the deterministic vault re-mask alone (KORAK 5).
+#
+# Why skip: a single chat turn fans out into several heavy background-task
+# requests; running full NER on each spikes memory (OOM). The re-mask (regex, µs)
+# still runs, so every value vaulted on a prior turn stays masked here — only the
+# detection of brand-new names is skipped.
+#
+# Why ONLY these three: query_generation and image_prompt_generation are
+# deliberately EXCLUDED — their output is sent to an EXTERNAL service (RAG search
+# / image backend), where an un-vaulted name would leak to a third party, so they
+# must keep full NER. Every other task type (and any unknown value) also keeps
+# full NER by default — this is an allowlist, not `metadata.task`-generic.
+# Strings are the OpenWebUI `TASKS` enum values (open_webui/constants.py).
+_LLM_FACING_SKIP_NER_TASKS: frozenset[str] = frozenset(
+    {"title_generation", "tags_generation", "follow_up_generation"}
+)
+
+
 class Pipeline:
     """PII Filter pipeline — Keeper AI Gateway.
 
@@ -2751,6 +2772,23 @@ class Pipeline:
             return raw, raw
         return None, make_ephemeral_thread_id()
 
+    @staticmethod
+    def _resolve_task(body: dict[str, Any]) -> str | None:
+        """Return the OpenWebUI background-task type from `metadata.task`, or None.
+
+        A truthy `metadata.task` marks the request as an OWUI-generated background
+        task (title / tags / follow-ups / queries / image_prompt / …); a normal
+        chat completion has no such key. Used by the inlet's KORAK 5 NER-skip to
+        distinguish LLM-facing tasks (safe to skip NER) from external-facing ones
+        (must keep NER). None -> a normal chat turn (full NER).
+        """
+        metadata = body.get("metadata")
+        if isinstance(metadata, dict):
+            task = metadata.get("task")
+            if isinstance(task, str) and task:
+                return task
+        return None
+
     def _resolve_user_valves(self, user: dict[str, Any] | None) -> Pipeline.UserValves:
         """Build the effective UserValves for this request.
 
@@ -2937,6 +2975,14 @@ class Pipeline:
         if raw_chat_id is None:
             logger.warning("inlet: chat_id missing, using ephemeral thread_id=%s", thread_id)
 
+        # KORAK 5: decide once whether this request is an LLM-facing background
+        # task whose NER detection pass may be skipped (deterministic re-mask
+        # still runs). Allowlist only — external-facing tasks (queries /
+        # image_prompt) and normal chat turns keep full NER. See
+        # `_LLM_FACING_SKIP_NER_TASKS` and the per-part seam below for rationale.
+        task_type = self._resolve_task(body)
+        skip_ner_for_task = task_type in _LLM_FACING_SKIP_NER_TASKS
+
         # Decide whether to use the vault or fall back to per-request dicts.
         # Vault path requires `vault_enabled=True`, a vault instance, and
         # a healthy backend (SELECT 1 for Postgres). On any
@@ -3058,6 +3104,36 @@ class Pipeline:
                     analyzed, remask_spans = _apply_vault_remask(
                         text, remask_pattern, remask_forward
                     )
+
+                    # KORAK 5 seam: LLM-facing background tasks (title / tags /
+                    # follow-ups) stop here — deterministic vault re-mask ONLY, no
+                    # NER. Persist the re-masked text (if the re-mask changed it)
+                    # and move on, reusing the existing "nothing to splice" branch.
+                    #
+                    #  * Why skip: one chat turn fans out into ~4 heavy
+                    #    background-task requests; running GLiNER + dual Presidio on
+                    #    each spikes memory (the OOM this fixes). The re-mask above
+                    #    is regex (µs) and already ran.
+                    #  * Why safe (no Layer-2 regression): the removed Layer-2 skip
+                    #    masked NOTHING; this skips only NEW-name DETECTION. The
+                    #    re-mask above already replaced every value vaulted on a
+                    #    prior turn with its placeholder, so known user PII stays
+                    #    masked. A name new to this payload entered via the main
+                    #    chat, whose full NER runs unconditionally and vaults it.
+                    #  * Why ONLY LLM-facing: these tasks' output is consumed by the
+                    #    SAME LLM. query_generation / image_prompt_generation go to
+                    #    an EXTERNAL service (search / image) where an un-vaulted
+                    #    name would leak to a third party — they are NOT in the
+                    #    allowlist and keep full NER (fall through below).
+                    #
+                    # ACCEPTED behaviour: an LLM-generated name appearing only in
+                    # the current assistant turn is sent UNMASKED to that same LLM
+                    # inside a task payload (model output fed back to the model, not
+                    # user-typed PII); the main chat vaults it on the next turn.
+                    if skip_ner_for_task:
+                        if analyzed != text:
+                            write_back(analyzed)
+                        continue
 
                     # TRAU-522 (card): feed the deterministic re-mask into the
                     # card. A repeated vaulted name is masked here, BEFORE the
