@@ -507,6 +507,29 @@ class GLiNER2Detector:
     """GLiNER2-PII wrapper. Vraća list[RecognizerResult]; pokreće se jednom po tekstu,
     jezično-agnostički, IZVAN per-language Presidio analyzera."""
 
+    # Input chunking (OOM + recall fix; isolation-measured 2026-07-16).
+    # gliner2 does NO internal chunking: the whole text went into ONE mdeberta
+    # forward. mdeberta uses relative position embeddings, so long input does
+    # not error — it silently costs O(n²) attention memory (5 KB → +1 GB RSS,
+    # 10 KB → OOM at a 5 GB cap) AND collapses recall (5 KB dense text: 12
+    # detections whole vs 92 as 1 KB chunks, same wall-clock, ±0 MB).
+    #
+    #  * CHUNK_SIZE 1024 chars: measured sweet spot — ~+63 MB peak per forward,
+    #    recall intact (the model was trained on short sequences).
+    #  * CHUNK_OVERLAP 256 chars: must exceed the longest entity this mapping
+    #    can emit, or a window cut severs it and the model misses both halves
+    #    (a LEAK, not a degradation). Longest realistic mapped entities: full
+    #    address (street + number + postal + city, ~120–150 chars), API key
+    #    (~64), full person name with titles (~80). 256 ≥ 2× the worst case.
+    #    GUARANTEE: with stride = size − overlap, any span of length L ≤ overlap
+    #    starting at p lies fully inside the window k = floor(p / stride):
+    #    k·stride ≤ p and p + L < k·stride + stride + overlap = window end.
+    #  * ACCEPTED residual: an entity LONGER than the overlap (e.g. an 800-char
+    #    JWT) may be seen only as fragments; each window still detects/masks
+    #    the fragment it sees, so coverage degrades to partial, never to zero.
+    _DEFAULT_CHUNK_SIZE = 1024
+    _DEFAULT_CHUNK_OVERLAP = 256
+
     def __init__(
         self,
         model_name: str = "fastino/gliner2-privacy-filter-PII-multi",
@@ -515,13 +538,22 @@ class GLiNER2Detector:
         threshold: float = 0.5,
         map_location: str = "cpu",
         local_files_only: bool = False,  # True za Path B (vendored model)
+        chunk_size: int = _DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
     ) -> None:
+        if chunk_overlap >= chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({chunk_overlap}) must be smaller than "
+                f"chunk_size ({chunk_size})"
+            )
         self.model_name = model_name
         self.entity_mapping = entity_mapping or GLINER2_ENTITY_MAPPING
         self.label_descriptions = label_descriptions or GLINER2_LABEL_DESCRIPTIONS
         self.threshold = threshold
         self.map_location = map_location
         self.local_files_only = local_files_only
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
         self._model: Any = None
 
     def load(self) -> None:
@@ -563,39 +595,79 @@ class GLiNER2Detector:
                 return idx, idx + len(span_text)
         return None, None
 
-    def detect(self, text: str) -> list[RecognizerResult]:
-        out_results: list[RecognizerResult] = []
-        if not text or self._model is None:
-            return out_results
-        try:
-            raw = self._model.extract_entities(
-                text, self._labels(), include_confidence=True, include_spans=True
-            )
-        except Exception:
-            logger.exception("GLiNER2 inference failed; skipping contextual NER")
-            return out_results
-        entities = raw.get("entities", {}) if isinstance(raw, dict) else {}
-        for gliner_label, spans in entities.items():
-            presidio_type = self.entity_mapping.get(gliner_label)
-            if presidio_type is None:
-                continue
-            for span in spans:
-                if not isinstance(span, dict):
-                    continue
-                score = float(span.get("confidence", self.threshold))
-                if score < self.threshold:
-                    continue
-                s, e = self._reconcile(
-                    text, span.get("text", ""), span.get("start"), span.get("end")
-                )
-                if s is None or e is None:
-                    continue
-                out_results.append(
-                    RecognizerResult(entity_type=presidio_type, start=s, end=e, score=score)
-                )
+    def _iter_chunks(self, text: str):
+        """Yield ``(offset, window)`` pairs covering `text` with overlapping
+        windows of ``chunk_size`` chars advancing by ``chunk_size - chunk_overlap``.
 
-        # Collapse same-type containment (full name vs its sub-token spans).
-        return _collapse_same_type_containment(out_results)
+        Texts up to one window yield a single ``(0, text)`` — identical to the
+        pre-chunking behavior. Coverage guarantee (incl. why no entity shorter
+        than the overlap can be severed by a cut) is documented on the class
+        constants above.
+        """
+        if len(text) <= self.chunk_size:
+            yield 0, text
+            return
+        stride = self.chunk_size - self.chunk_overlap
+        start = 0
+        while start < len(text):
+            yield start, text[start : start + self.chunk_size]
+            if start + self.chunk_size >= len(text):
+                break
+            start += stride
+
+    def detect(self, text: str) -> list[RecognizerResult]:
+        if not text or self._model is None:
+            return []
+        # Dedup across overlapping windows: an entity in the overlap zone is
+        # seen by BOTH adjacent windows and would double up. Exact-span
+        # duplicates (same type + same ORIGINAL-text offsets) collapse to the
+        # highest-scoring one; partial edge detections (a window that saw only
+        # a severed fragment) are absorbed by the same-type containment
+        # collapse below, exactly as sub-token spans always were.
+        seen: dict[tuple[str, int, int], RecognizerResult] = {}
+        for offset, chunk in self._iter_chunks(text):
+            try:
+                raw = self._model.extract_entities(
+                    chunk, self._labels(), include_confidence=True, include_spans=True
+                )
+            except Exception:
+                logger.exception(
+                    "GLiNER2 inference failed for chunk at offset %d; skipping chunk",
+                    offset,
+                )
+                continue
+            entities = raw.get("entities", {}) if isinstance(raw, dict) else {}
+            for gliner_label, spans in entities.items():
+                presidio_type = self.entity_mapping.get(gliner_label)
+                if presidio_type is None:
+                    continue
+                for span in spans:
+                    if not isinstance(span, dict):
+                        continue
+                    score = float(span.get("confidence", self.threshold))
+                    if score < self.threshold:
+                        continue
+                    # Reconcile within the WINDOW (the coordinates the model
+                    # emitted), then remap into ORIGINAL-text offsets — the
+                    # splice/mask path downstream slices the original text.
+                    s, e = self._reconcile(
+                        chunk, span.get("text", ""), span.get("start"), span.get("end")
+                    )
+                    if s is None or e is None:
+                        continue
+                    key = (presidio_type, offset + s, offset + e)
+                    prev = seen.get(key)
+                    if prev is None or score > prev.score:
+                        seen[key] = RecognizerResult(
+                            entity_type=presidio_type,
+                            start=offset + s,
+                            end=offset + e,
+                            score=score,
+                        )
+
+        # Collapse same-type containment (full name vs its sub-token spans —
+        # and, with chunking, severed edge fragments inside the full span).
+        return _collapse_same_type_containment(list(seen.values()))
 
 
 def _select_accepted_detections(
@@ -1860,6 +1932,22 @@ def _find_last_user_index(messages: list[dict[str, Any]]) -> int:
     return -1
 
 
+def _find_last_assistant_index(messages: list[dict[str, Any]]) -> int:
+    """Return the index of the last message with role=='assistant', or -1 if none.
+
+    Mirror of `_find_last_user_index` for the middle-ground NER scope: the last
+    assistant message is where an LLM-generated name first appears, and it must
+    be NER-ed on the SAME turn so the KORAK 5 task skip's re-mask can cover it.
+    Kept separate (not a generalization of `_find_last_user_index`) so the Task 4
+    backward-compat contract of that helper stays untouched.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        message = messages[i]
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return i
+    return -1
+
+
 def _merge_dedupe_detections(
     hr_results: list[RecognizerResult],
     en_results: list[RecognizerResult],
@@ -2975,6 +3063,25 @@ class Pipeline:
             cap = self.valves.multi_turn_history_max_messages
             target_indices = all_history_indices[-cap:]
 
+        # Middle-ground NER scope (main chat): full NER runs ONLY on the last
+        # user and last assistant message; every other targeted history message
+        # gets the deterministic vault re-mask alone (seam below, next to the
+        # KORAK 5 task skip). Why exactly these two and not last-only:
+        #   * last USER message — where new user-typed PII enters this turn;
+        #   * last ASSISTANT message — where an LLM-generated name first
+        #     appears. NER-ing it vaults that name on the SAME turn, which is
+        #     the full-NER backstop the KORAK 5 task skip's safety argument
+        #     rests on (tasks re-mask from the vault instead of detecting).
+        # This makes inlet NER cost constant in history length (~2 jobs per
+        # turn instead of one per history message — the OOM/latency driver).
+        # -1 sentinels ("no such role") are harmless set members: msg_idx is
+        # always >= 0. An index outside the cap window (or outside the legacy
+        # single-message scope) is equally inert — the loop only visits
+        # `target_indices`, membership here just widens NER within it.
+        last_user_idx = _find_last_user_index(messages)
+        last_assistant_idx = _find_last_assistant_index(messages)
+        ner_indices = {last_user_idx, last_assistant_idx}
+
         raw_chat_id, thread_id = self._resolve_chat_id(body)
         if raw_chat_id is None:
             logger.warning("inlet: chat_id missing, using ephemeral thread_id=%s", thread_id)
@@ -3146,7 +3253,25 @@ class Pipeline:
                     # UNMASKED to that same LLM inside a task payload (model output
                     # fed back to the model, not user-typed PII); the main chat
                     # vaults it on the next turn.
-                    if skip_ner_for_task and remask_pattern is not None:
+                    #
+                    # Middle-ground NER scope (second disjunct): on MAIN chat
+                    # turns, history messages other than the last user / last
+                    # assistant one (`ner_indices`, computed above) also stop at
+                    # the re-mask — full NER runs only on the two messages where
+                    # new PII can enter this turn. The `remask_pattern is not
+                    # None` gate is shared and LOAD-BEARING for both disjuncts:
+                    # an empty/disabled vault (first turn) has no matcher, so
+                    # `analyzed == text` and skipping NER would ship raw history
+                    # unmasked (Layer-2 leak) — instead EVERYTHING falls through
+                    # to full NER until the vault has entries.
+                    # ACCEPTED residual (middle-ground): a never-vaulted name
+                    # sitting only in OLDER history is re-mask-only, i.e. sent
+                    # as-is — that is model output fed back to the model, or
+                    # user text the LLM already saw on the turn it was typed
+                    # (when NER ran on it in full); not a new leak surface.
+                    if (
+                        skip_ner_for_task or msg_idx not in ner_indices
+                    ) and remask_pattern is not None:
                         if analyzed != text:
                             write_back(analyzed)
                         continue
