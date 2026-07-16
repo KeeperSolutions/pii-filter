@@ -2680,8 +2680,12 @@ class Pipeline:
         self.analyzer_hr = None
         self.analyzer_en = None
         if self._ner_executor is not None:
-            # Don't block shutdown on an in-flight inference; the worker thread
-            # is a daemon of the pool and exits when its current call returns.
+            # Don't block shutdown on an in-flight inference: shutdown(wait=False)
+            # returns immediately. The single worker is NOT a daemon thread (since
+            # Py3.9 ThreadPoolExecutor uses non-daemon workers joined via a
+            # concurrent.futures atexit handler), so it runs to the end of its
+            # current call and is joined at interpreter exit — fine here because
+            # NER calls are bounded and always return.
             self._ner_executor.shutdown(wait=False)
             self._ner_executor = None
         if self.vault is not None:
@@ -3125,12 +3129,24 @@ class Pipeline:
                     #    an EXTERNAL service (search / image) where an un-vaulted
                     #    name would leak to a third party — they are NOT in the
                     #    allowlist and keep full NER (fall through below).
+                    #  * Why gated on `remask_pattern is not None`: the whole safety
+                    #    argument rests on the re-mask actually being active. When it
+                    #    is inert — vault disabled, degraded to passthrough, or an
+                    #    empty thread snapshot — `analyzed == text` and skipping NER
+                    #    would ship RAW user content to the LLM unmasked (reopening
+                    #    the Layer-2 leak). So we only skip when a re-mask matcher
+                    #    exists; otherwise we fall through to full NER. This keeps the
+                    #    OOM win where it matters (a large task payload means an
+                    #    established thread → non-empty vault → matcher present),
+                    #    while an empty/disabled vault (necessarily a small, early
+                    #    payload) safely runs NER.
                     #
-                    # ACCEPTED behaviour: an LLM-generated name appearing only in
-                    # the current assistant turn is sent UNMASKED to that same LLM
-                    # inside a task payload (model output fed back to the model, not
-                    # user-typed PII); the main chat vaults it on the next turn.
-                    if skip_ner_for_task:
+                    # ACCEPTED behaviour: with the re-mask active, an LLM-generated
+                    # name appearing only in the current assistant turn is sent
+                    # UNMASKED to that same LLM inside a task payload (model output
+                    # fed back to the model, not user-typed PII); the main chat
+                    # vaults it on the next turn.
+                    if skip_ner_for_task and remask_pattern is not None:
                         if analyzed != text:
                             write_back(analyzed)
                         continue
