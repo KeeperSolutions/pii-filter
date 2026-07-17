@@ -78,6 +78,110 @@ def _ner_thread_limit() -> int:
     return n if n >= 1 else 1
 
 
+def _debug_unmask_log_enabled() -> bool:
+    """Whether the plaintext-PII debug log is on (env PII_DEBUG_UNMASK_LOG).
+
+    OFF by default and MUST stay off in production / Cloud Run: it logs the
+    original PII value next to its placeholder so a local OpenWebUI chat can be
+    watched live (`docker logs -f ... | grep PII_DEBUG`). Read per-call so the
+    flag can be toggled in tests; the cost is one dict lookup.
+    """
+    return os.environ.get("PII_DEBUG_UNMASK_LOG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _debug_color_enabled() -> bool:
+    """Whether the debug block uses ANSI color (env PII_DEBUG_COLOR).
+
+    Default OFF so piped/grepped logs stay free of escape codes; enable only when
+    watching `docker logs -f` directly in a color terminal.
+    """
+    return os.environ.get("PII_DEBUG_COLOR", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _debug_log_mask(
+    original_text: str,
+    masked_text: str,
+    remask_spans: list[dict[str, Any]],
+    inturn_forward: dict[str, str],
+) -> None:
+    """Emit a readable multi-line `[PII_DEBUG]` block: the original text, the
+    masked text, and each original->placeholder mapping with its occurrence
+    count in the original (the "identified in every place" signal). The map is
+    the vault re-masked values (`remask_spans`) plus values minted this turn
+    (`inturn_forward`), ordered by first appearance in the text.
+
+    No-op unless `_debug_unmask_log_enabled()`. Only called from the mask path,
+    so it never fires when masking is off. Logs plaintext PII by design — the
+    caller gates it on the env flag; see `_debug_unmask_log_enabled`. Color is
+    opt-in via PII_DEBUG_COLOR (off by default so piped logs stay clean).
+    """
+    if not _debug_unmask_log_enabled():
+        return
+
+    mapping: dict[str, str] = {}
+    for span in remask_spans:
+        original = span.get("original")
+        placeholder = span.get("placeholder")
+        if original and placeholder:
+            mapping[original] = placeholder
+    mapping.update(inturn_forward)
+
+    # Drop subsumed sub-values from the display: a partial detection (bare
+    # surname "Kovac") that shares a placeholder with a longer value containing
+    # it ("Ana Kovac" -> same [PERSON_1]) is never masked independently
+    # (longest-first consumes the full value), so listing it double-counts one
+    # entity. Masking is unaffected — this only de-clutters the report.
+    mapping = {
+        value: ph
+        for value, ph in mapping.items()
+        if not any(
+            other != value and other_ph == ph and value in other
+            for other, other_ph in mapping.items()
+        )
+    }
+
+    color = _debug_color_enabled()
+
+    def _paint(code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if color else s
+
+    cyan = lambda s: _paint("36", s)
+    yellow = lambda s: _paint("33", s)
+    bold = lambda s: _paint("1", s)
+
+    # Order the mapping by where each value first appears in the original text
+    # so the list reads top-to-bottom in reading order.
+    ordered = sorted(mapping.items(), key=lambda kv: (original_text.find(kv[0]), kv[0]))
+
+    lines = [
+        bold("[PII_DEBUG] PII mask report"),
+        f"  original : {original_text}",
+        f"  masked   : {masked_text}",
+    ]
+    if ordered:
+        lines.append(f"  values   : {len(ordered)} masked")
+        for original_value, placeholder in ordered:
+            count = original_text.count(original_value)
+            times = "1 place" if count == 1 else f"{count} places"
+            lines.append(
+                f"    • {cyan(repr(original_value))} → {yellow(placeholder)}  ({times})"
+            )
+    else:
+        lines.append("  values   : (none)")
+
+    logger.info("\n".join(lines))
+
+
 # ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
@@ -503,6 +607,59 @@ def _collapse_same_type_containment(
     return kept
 
 
+# Max whitespace gap (chars) between two same-type spans still treated as one
+# entity by _merge_adjacent_same_type. A normal name token boundary is a single
+# space; 3 covers double/triple spacing without merging across a large gap that
+# more likely separates two distinct entities.
+_ADJACENCY_MAX_WS_GAP = 3
+
+
+def _merge_adjacent_same_type(
+    results: list[RecognizerResult], text: str
+) -> list[RecognizerResult]:
+    """Merge CONSECUTIVE same-type spans whose only gap is short whitespace into
+    one span, so a name GLiNER emitted as separate sub-tokens ('first name' +
+    'last name') collapses to the full name.
+
+    Complements `_collapse_same_type_containment`, which only merges ENCLOSED
+    spans: on a repeated name GLiNER may return the first mention as adjacent
+    "Robert"+"Plant" sub-tokens (no enclosing span) and the second as the full
+    "Robert Plant" — leaving the first fragmented into two placeholders. Here two
+    same-type spans separated only by whitespace (``<= _ADJACENCY_MAX_WS_GAP``
+    chars, or directly touching) become one [start_of_first, end_of_last] span
+    with the max score. Merging only ever GROWS a masked span, so the worst case
+    is over-masking (fail-safe), never a leak. A gap containing any non-space
+    character (comma, "and", newline-run beyond the cap) blocks the merge, so
+    genuinely distinct adjacent entities stay separate. Returned order is not
+    significant — the caller re-sorts.
+    """
+    if len(results) < 2:
+        return list(results)
+    ordered = sorted(results, key=lambda r: (r.entity_type, r.start))
+    merged: list[RecognizerResult] = []
+    cur = ordered[0]
+    for nxt in ordered[1:]:
+        gap = text[cur.end : nxt.start]
+        contiguous = (
+            nxt.entity_type == cur.entity_type
+            and nxt.start >= cur.end
+            and len(gap) <= _ADJACENCY_MAX_WS_GAP
+            and (gap == "" or gap.isspace())
+        )
+        if contiguous:
+            cur = RecognizerResult(
+                entity_type=cur.entity_type,
+                start=cur.start,
+                end=max(cur.end, nxt.end),
+                score=max(cur.score, nxt.score),
+            )
+        else:
+            merged.append(cur)
+            cur = nxt
+    merged.append(cur)
+    return merged
+
+
 class GLiNER2Detector:
     """GLiNER2-PII wrapper. Vraća list[RecognizerResult]; pokreće se jednom po tekstu,
     jezično-agnostički, IZVAN per-language Presidio analyzera."""
@@ -675,7 +832,9 @@ class GLiNER2Detector:
                         )
 
         # Collapse same-type containment (full name vs its sub-token spans —
-        # and, with chunking, severed edge fragments inside the full span).
+        # and, with chunking, severed edge fragments inside the full span). The
+        # adjacency merge of separately-emitted sub-tokens runs later in the
+        # inlet, on the final accepted set (detector-agnostic).
         return _collapse_same_type_containment(list(seen.values()))
 
 
@@ -1095,6 +1254,41 @@ def _apply_vault_remask(
         )
     pieces.append(text[last_end:])
     return "".join(pieces), spans
+
+
+def _mask_full_values_all_occurrences(
+    text: str, forward: dict[str, str]
+) -> str:
+    """Mask EVERY occurrence of each in-turn detected value in `text`, keyed by
+    the ``{detected_surface -> placeholder}`` map minted this message.
+
+    This runs on the un-fragmented `analyzed` text BEFORE any positional splice,
+    so it fixes the asymmetric-recall leak: when a repeated name is detected
+    fully at one mention but only partially at another (GLiNER returns just the
+    surname "Kovac" for the first "Ana Kovac"), masking the full LITERAL value
+    at every position covers the partially-detected mention wholesale — the
+    first name never leaks. Because it re-derives positions by string search,
+    the (removed) offset-remap of a positional splice is unnecessary.
+
+    Uses the same safe matcher as the vault re-mask (`_build_vault_remasker`):
+    longest-original-first so a full name wins over its bare surname at a shared
+    start, ``(?<!\\w)..(?!\\w)`` word boundaries so "Ana" never fires inside
+    "Anamarija", and case-sensitive matching. A single left-to-right `re.sub`
+    pass never re-scans an inserted placeholder. Deliberately NOT built on
+    `_apply_vault_remask` (which also collects an offset-map for the card): the
+    card is built separately during minting, and only PRIMARY entity types reach
+    `forward` here — GLiNER sub-tokens ('first name'/'last name') already map to
+    PERSON and collapse, so there is no sub-token surface to special-case.
+
+    Masks ONLY values an analyzer already confirmed; worst case over-masks (two
+    people sharing a name string collapse to one placeholder — inherent to any
+    string masking, fail-safe), never a leak. Returns `text` unchanged when the
+    map is empty.
+    """
+    pattern = _build_vault_remasker(forward)
+    if pattern is None:
+        return text
+    return pattern.sub(lambda m: forward[m.group(0)], text)
 
 
 def _analyzed_to_original_offset(
@@ -3353,12 +3547,30 @@ class Pipeline:
                         self.valves.ner_oib_phone_context_window,
                         exact_deny_set,
                     )
+                    # Merge adjacent same-type spans the analyzers emitted
+                    # separately (e.g. GLiNER 'first name' + 'last name' for one
+                    # mention of a full name, with no enclosing span to collapse)
+                    # so a person is masked as ONE placeholder, consistent with
+                    # occurrences the model returned whole. Detector-agnostic:
+                    # runs on the final merged accepted set (GLiNER + Presidio).
+                    # Offsets are in `analyzed`, the text the splice below uses.
+                    # Re-sort by start: the splice loop walks `accepted` in
+                    # position order (the merge groups by type), and coreference
+                    # resolution expects positional order too.
+                    accepted = sorted(
+                        _merge_adjacent_same_type(accepted, analyzed),
+                        key=lambda r: r.start,
+                    )
                     if not accepted:
                         # No NEW names to mint, but re-mask may still have masked
                         # known originals; persist it so the deterministic re-mask
                         # is not lost when NER finds nothing.
                         if analyzed != text:
                             write_back(analyzed)
+                        # Live-watch debug: a re-mask-only turn (all PII already
+                        # vaulted, no new detection) must still be visible. No
+                        # in-turn mints here, so the map is the vault re-mask.
+                        _debug_log_mask(text, analyzed, remask_spans, {})
                         continue
 
                     # Within-message PERSON coreference: a bare surname reuses
@@ -3368,12 +3580,25 @@ class Pipeline:
                         if self.valves.ner_person_coreference_enabled
                         else {}
                     )
-                    pieces: list[str] = []
-                    last_end = 0
+                    # Values minted (or reused) in THIS message: detected surface
+                    # -> its placeholder. This drives the value-based mask below
+                    # (mask-all-full-values), which replaces the old per-position
+                    # splice: masking by value over the un-fragmented `analyzed`
+                    # text covers occurrences the analyzers detected only
+                    # partially (the asymmetric-recall leak). Keyed by surface,
+                    # not the coreference `key`: it is the string that physically
+                    # recurs in the text.
+                    inturn_forward: dict[str, str] = {}
+                    # Card entries built this message, held until inturn_forward
+                    # is complete so subsumed sub-values can be filtered out (a
+                    # bare surname "Kovac" that shares a placeholder with the full
+                    # "Ana Kovac" must not appear as a second card row).
+                    card_candidates: list[tuple[str, str, dict[str, Any]]] = []
                     for idx, det in enumerate(accepted):
                         surface = analyzed[det.start : det.end]
                         # Coreference may remap the placeholder *key* to a full
-                        # name; spliced span + enriched `original` stay surface.
+                        # name; the recorded surface + enriched `original` stay
+                        # the detected surface.
                         key = overrides.get(idx, surface)
                         standard_type = self.PRESIDIO_TO_STANDARD[det.entity_type]
                         placeholder: str
@@ -3392,9 +3617,7 @@ class Pipeline:
                                 reverse_map[placeholder] = key
                             else:
                                 placeholder = existing
-                        pieces.append(analyzed[last_end : det.start])
-                        pieces.append(placeholder)
-                        last_end = det.end
+                        inturn_forward[surface] = placeholder
                         # The card slices the ORIGINAL user message, but `det`
                         # offsets are in the re-masked `analyzed` text. Translate
                         # them back so a NEW name sharing a message with a
@@ -3420,9 +3643,41 @@ class Pipeline:
                         enriched_det["start"] = orig_start
                         enriched_det["end"] = orig_start + (det.end - det.start)
                         enriched_det["message_index"] = msg_idx
+                        card_candidates.append((surface, placeholder, enriched_det))
+                    # Drop subsumed card entries: a detection whose surface is a
+                    # substring of another detection's surface with the SAME
+                    # placeholder (bare surname "Kovac" inside "Ana Kovac" ->
+                    # both [PERSON_1]) is one entity, not two. It is still minted/
+                    # vaulted (keeps a later standalone "Kovac" re-masking
+                    # consistently) — only the card row is dropped.
+                    for surface, placeholder, enriched_det in card_candidates:
+                        if any(
+                            other != surface
+                            and other_ph == placeholder
+                            and surface in other
+                            for other, other_ph in inturn_forward.items()
+                        ):
+                            continue
                         all_enriched.append(enriched_det)
-                    pieces.append(analyzed[last_end:])
-                    write_back("".join(pieces))
+                    # Mask every occurrence of each detected value over the
+                    # un-fragmented `analyzed` text (value-based, not per-position).
+                    # This is the single masking step — it REPLACES the old
+                    # positional splice. Masking by literal value covers a mention
+                    # the analyzers detected only partially: GLiNER's asymmetric
+                    # recall may return the full "Ana Kovac" at one mention but
+                    # only the surname "Kovac" at another; a per-position splice
+                    # would leave the first name "Ana" of the partial mention
+                    # unmasked (a leak). Longest-first + word boundary keep it
+                    # safe (see `_mask_full_values_all_occurrences`). No offset
+                    # remap: positions are re-derived by string search. The card
+                    # (all_enriched) was finalized in ORIGINAL coordinates during
+                    # minting above and is intentionally left as-is.
+                    masked = _mask_full_values_all_occurrences(analyzed, inturn_forward)
+                    write_back(masked)
+
+                    # Opt-in plaintext-PII debug log (env PII_DEBUG_UNMASK_LOG).
+                    # No-op unless the flag is on; local-only, never production.
+                    _debug_log_mask(text, masked, remask_spans, inturn_forward)
 
                 messages_processed += 1
 
