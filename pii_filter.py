@@ -541,6 +541,14 @@ class GLiNER2Detector:
         chunk_size: int = _DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
     ) -> None:
+        # Reject any params that break the coverage guarantee: chunk_size <= 0
+        # gives a non-positive stride (infinite loop), chunk_overlap <= 0 makes
+        # windows abut with no overlap so a boundary-straddling entity is
+        # severed and lost (a LEAK), and overlap >= size collapses the stride.
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size ({chunk_size}) must be positive")
+        if chunk_overlap <= 0:
+            raise ValueError(f"chunk_overlap ({chunk_overlap}) must be positive")
         if chunk_overlap >= chunk_size:
             raise ValueError(
                 f"chunk_overlap ({chunk_overlap}) must be smaller than "
@@ -625,10 +633,11 @@ class GLiNER2Detector:
         # a severed fragment) are absorbed by the same-type containment
         # collapse below, exactly as sub-token spans always were.
         seen: dict[tuple[str, int, int], RecognizerResult] = {}
+        labels = self._labels()  # invariant per call; hoist out of the chunk loop
         for offset, chunk in self._iter_chunks(text):
             try:
                 raw = self._model.extract_entities(
-                    chunk, self._labels(), include_confidence=True, include_spans=True
+                    chunk, labels, include_confidence=True, include_spans=True
                 )
             except Exception:
                 logger.exception(
