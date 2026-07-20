@@ -555,15 +555,32 @@ CUSTOM_ENTITY_TYPES: frozenset[str] = frozenset(
 )
 
 
+# TRANSIENT entity type for a bare city/toponym span (TRAU-530). Deliberately
+# ABSENT from `PRESIDIO_TO_STANDARD`: it is not a canonical output type and must
+# never reach masking, the vault, or `metadata.pii_detections`. Step 0.5 of
+# `_select_accepted_detections` resolves every occurrence — promoting it into a
+# neighbouring ADDRESS span or discarding it — and the Step 1 whitelist is the
+# independent backstop that drops any that a future bug fails to resolve.
+_ADDRESS_CITY_TYPE = "ADDRESS_CITY"
+
+
 # GLiNER2 label -> Presidio entity type. Samo kontekstualni tipovi.
 # Strukturirani HR/IE/RO/UK/US ID-evi OSTAJU u custom recognizerima (NE ovdje).
+#
+# NOTE on "city" (TRAU-530): it maps to the TRANSIENT `_ADDRESS_CITY_TYPE`, not
+# straight to ADDRESS. Mapping it to ADDRESS meant a bare toponym with no
+# structural signal ("trip from cahersiveen to thurles via farranfore") was
+# masked as [ADDRESS_1]/[ADDRESS_2]/[ADDRESS_3] and the LLM refused to answer.
+# A bare place name is not personal data — the same reasoning that keeps
+# LOCATION out of `PRESIDIO_TO_STANDARD` (see the note there); "city" -> ADDRESS
+# routed around that decision by a side door.
 GLINER2_ENTITY_MAPPING: dict[str, str] = {
     "person": "PERSON",
     "first name": "PERSON",
     "last name": "PERSON",
     "address": "ADDRESS",
     "street address": "ADDRESS",
-    "city": "ADDRESS",
+    "city": _ADDRESS_CITY_TYPE,
     "postal code": "ADDRESS",
     "username": "USERNAME",
     "ip address": "IP_ADDRESS",
@@ -843,6 +860,114 @@ class GLiNER2Detector:
         return _collapse_same_type_containment(list(seen.values()))
 
 
+# Characters allowed in the gap between two address components for them to count
+# as ONE address (TRAU-530). Whitespace, the separators that punctuate a written
+# address, and digits — a postal code routinely sits between street and city
+# ("Vukovarska 23, 10000 Zagreb") and we cannot tell it from any other number
+# without structural tables. LETTERS ARE NOT ALLOWED: they are what distinguishes
+# a written address from a sentence linking two places ("cahersiveen to thurles",
+# "Ilica 5 near Zagreb").
+#
+# DELIBERATELY SEPARATE from `_ADJACENCY_MAX_WS_GAP` / `_merge_adjacent_same_type`,
+# whose predicate is whitespace-ONLY and must stay that way: a comma between two
+# PERSON sub-tokens means two distinct people, while address components are
+# routinely comma-separated. The two relations are not one parameterized rule —
+# neither is derivable from the other, so they get their own constants.
+_CITY_ADJACENCY_ALLOWED_GAP_CHARS: frozenset[str] = frozenset(
+    " \t\n\r\f\v,.-0123456789"
+)
+# Max gap (chars) between two address components. 12 spans ", 10000 " plus slack
+# for a longer postal code or an extra separator, while still refusing to reach
+# across half a sentence. Distance is its own signal.
+_CITY_ADJACENCY_MAX_GAP = 12
+
+
+def _resolve_address_cities(
+    text: str, detections: list[RecognizerResult]
+) -> list[RecognizerResult]:
+    """Resolve every transient `_ADDRESS_CITY_TYPE` span: promote or discard.
+
+    A bare city name is not personal data. It becomes one only when it is part of
+    a written address — and the only signal available (no keyword tables, no city
+    whitelist, no structural regex) is ADJACENCY to a span some other recognizer
+    already called an ADDRESS.
+
+    Address-typed spans (ADDRESS + ADDRESS_CITY) are clustered left-to-right:
+    consecutive spans whose gap contains only `_CITY_ADJACENCY_ALLOWED_GAP_CHARS`
+    and is at most `_CITY_ADJACENCY_MAX_GAP` long join the same cluster. Then:
+
+      * cluster contains >= 1 real ADDRESS -> emit ONE ADDRESS span covering
+        [min(start), max(end)] with the max member score.
+      * cluster is ADDRESS_CITY only -> discard every member. Cities cannot
+        anchor each other, so "Zagreb, Split" stays unmasked.
+
+    Detections of every other type pass through untouched — a PERSON is not an
+    address anchor, so "Ivan Horvat, Klanjec" keeps its city (deliberate product
+    decision, TRAU-530).
+
+    Merging here rather than leaving it to `_merge_adjacent_same_type` is
+    load-bearing: that function refuses any non-whitespace gap, so it would leave
+    "Ilica 5, Zagreb" as two placeholders. Its predicate is intentionally not
+    widened (see the constants above).
+
+    The single left-to-right pass IS the transitive fixed point. Spans are
+    processed in start order and a cluster only ever grows rightward, so a span
+    that merges also exposes its own right edge to the next candidate in the same
+    pass ("12 Main Street, Thurles, Co. Tipperary" collapses to one span), and no
+    earlier gap can reopen. Overlapping spans yield an empty gap and always merge.
+
+    Promotion builds a NEW `RecognizerResult` rather than mutating in place: the
+    transient type is copied into `metadata.pii_detections[*].raw_entity_type` by
+    `_build_enriched_detection`, and mutation would leak it out of the pipeline.
+
+    Widening a span only ever GROWS what gets masked, so the worst case is
+    over-masking (fail-safe), never a leak — the same argument
+    `_merge_adjacent_same_type` makes for its own merge.
+    """
+    address_like = [
+        d for d in detections if d.entity_type in ("ADDRESS", _ADDRESS_CITY_TYPE)
+    ]
+    if not address_like:
+        return list(detections)
+
+    resolved: list[RecognizerResult] = [
+        d for d in detections if d.entity_type not in ("ADDRESS", _ADDRESS_CITY_TYPE)
+    ]
+
+    def _flush(cluster: list[RecognizerResult]) -> None:
+        # Anchor-less cities are dropped; anything containing a real ADDRESS
+        # collapses to a single span of the canonical type.
+        if not any(d.entity_type == "ADDRESS" for d in cluster):
+            return
+        resolved.append(
+            RecognizerResult(
+                entity_type="ADDRESS",
+                start=min(d.start for d in cluster),
+                end=max(d.end for d in cluster),
+                score=max(d.score for d in cluster),
+            )
+        )
+
+    ordered = sorted(address_like, key=lambda d: (d.start, d.end))
+    cluster = [ordered[0]]
+    cluster_end = ordered[0].end
+    for nxt in ordered[1:]:
+        gap = text[cluster_end : nxt.start]
+        joins = len(gap) <= _CITY_ADJACENCY_MAX_GAP and all(
+            c in _CITY_ADJACENCY_ALLOWED_GAP_CHARS for c in gap
+        )
+        if joins:
+            cluster.append(nxt)
+            cluster_end = max(cluster_end, nxt.end)
+        else:
+            _flush(cluster)
+            cluster = [nxt]
+            cluster_end = nxt.end
+    _flush(cluster)
+
+    return resolved
+
+
 def _select_accepted_detections(
     text: str,
     detections: list[RecognizerResult],
@@ -859,6 +984,16 @@ def _select_accepted_detections(
     *selection* is identical and must stay in lockstep.
 
     Processing order (Task 3.1 additions in steps 2-4):
+      0. Placeholder overlap filter — drop detections overlapping an existing
+         `[TYPE_N]` placeholder, so re-analysis of already-masked content never
+         renumbers it (TRAU-522).
+      0.5. Address-city resolution — resolve every transient `ADDRESS_CITY`
+         span: promote it into an adjacent ADDRESS span (merging both into one),
+         or discard it when no address anchors it (TRAU-530). Runs BEFORE the
+         whitelist so the transient type never needs to be whitelisted; see
+         `_resolve_address_cities`. Placement is free: steps 2-4 touch only
+         PERSON and HR_OIB, so an ADDRESS present here is still present at
+         step 5, and resolving early is equivalent to resolving late.
       1. Whitelist filter — drop entity types not in `presidio_to_standard`.
       2. Deny-list filter — drop PERSON entities whose lowercased text either
          exactly matches an entry in `deny_list`/`exact_deny_list` or starts
@@ -909,6 +1044,17 @@ def _select_accepted_detections(
         ]
         if not detections:
             return []
+
+    # Step 0.5: Address-city resolution (TRAU-530).
+    # A bare toponym is not personal data. GLiNER emits city names as the
+    # transient ADDRESS_CITY type; promote each into an adjacent ADDRESS span
+    # (merged into one) or discard it. Runs BEFORE the whitelist filter, which
+    # then acts as the independent backstop: ADDRESS_CITY is not a canonical
+    # type, so anything this step somehow fails to resolve is dropped rather
+    # than minted as a literal [ADDRESS_CITY_N] placeholder.
+    detections = _resolve_address_cities(text, detections)
+    if not detections:
+        return []
 
     # Step 1: Whitelist filter
     candidates: list[RecognizerResult] = [
@@ -1176,6 +1322,45 @@ def _entity_type_from_placeholder(placeholder: str) -> str | None:
     values are always well-formed, so this only guards against corruption)."""
     m = _PLACEHOLDER_TYPE_RE.match(placeholder)
     return m.group(1) if m else None
+
+
+_VAULT_KEY_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_vault_key(value: str) -> str:
+    """Collapse whitespace runs to one space and strip, for VAULT LOOKUP ONLY.
+
+    The vault key is the exact surface text of a detection, hashed into
+    ``lookup_hash`` (the PK) by `BlindIndex.compute`. A multi-line address is the
+    same address as its single-line form, but the two surfaces hash differently,
+    so one value minted TWO placeholders in one thread (TRAU-530)::
+
+        turn 1  "45 Baggot Street Lower,\\nDublin 2"  -> [ADDRESS_2]
+        turn 2  "45 Baggot Street Lower, Dublin 2"    -> [ADDRESS_6]
+
+    The LLM then sees two placeholders for one object and the conversation's
+    semantics break. Collapsing whitespace makes both forms one key.
+
+    USE FOR LOOKUP ONLY — NEVER FOR THE STORED VALUE. What is stored is what
+    `outlet` hands back to the user, and formatting whitespace is load-bearing
+    there: an IBAN is conventionally grouped in fours ("HR12 3456 7890 1234 5678
+    9") and a phone number spaced by convention ("+385 1 234 5678"). Normalizing
+    the stored value would hand the user back a reformatted bank account — not
+    cosmetic for a value that gets copy-pasted.
+
+    Deliberately NOT casefolding: the whole detection path is case-sensitive by
+    design (see `_build_vault_remasker` on "ann" vs "Ann"), and folding case
+    could merge two genuinely distinct values. Deliberately NOT applying Unicode
+    NFKC either — composed vs decomposed Croatian diacritics are a real but
+    SEPARATE problem with its own risks, and mixing the two would make both
+    harder to reason about.
+
+    NOTE: ``\\s`` is Unicode-aware for `str` patterns, so this also collapses
+    NBSP (``\\xa0``), which copy-paste from PDF/Word routinely injects into
+    addresses. That works in our favour (more variants collapse onto one key),
+    but it reaches wider than "newline vs space" and is accepted knowingly.
+    """
+    return _VAULT_KEY_WS_RE.sub(" ", value).strip()
 
 
 def _build_vault_remasker(forward: dict[str, str]) -> re.Pattern[str] | None:
@@ -1921,9 +2106,37 @@ class ThreadVault:
         """
         return None
 
-    async def get_placeholder(self, chat_id: str, original: str, entity_type: str) -> str:
+    async def get_placeholder(
+        self,
+        chat_id: str,
+        original: str,
+        entity_type: str,
+        lookup_value: str | None = None,
+    ) -> str:
         """Atomic get-or-mint. Idempotent under concurrency for the same
-        `(chat_id, entity_type, original)`.
+        `(chat_id, entity_type, lookup_value or original)`.
+
+        THE TWO VALUE ARGUMENTS ARE NOT INTERCHANGEABLE (TRAU-530):
+
+          * `original` — the LITERAL, un-normalized text. This is what gets
+            STORED (encrypted or plaintext) and therefore what `outlet` hands
+            back to the user, and what `snapshot_for_request` returns for
+            `_build_vault_remasker` to match against raw message text. Its exact
+            bytes are load-bearing twice over: an IBAN typed "HR12 3456 7890"
+            must come back spaced the same way, and the re-mask pattern is a
+            `re.escape`d literal, so a stored value that does not occur verbatim
+            in the text will never match it.
+          * `lookup_value` — the NORMALIZED identity, used ONLY to derive
+            `lookup_hash` (the PK). Whitespace-collapsed so a multi-line address
+            and its single-line form are ONE key instead of two placeholders for
+            one place. Defaults to `original`, which keeps every existing caller
+            (and the test doubles) working unchanged.
+
+        Store the normalized form by passing it as `original` and two things
+        break silently: `outlet` reformats the user's own IBAN, and the
+        deterministic re-mask stops covering the multi-line occurrence in
+        history — that one is a PII LEAK, with no exception and no log. See
+        `_normalize_vault_key` and the call site in `inlet`.
 
         Step A bumps the per-(chat_id, entity_type) counter and returns the
         new index. Step B inserts the mapping with `[entity_type_N]` as the
@@ -1931,6 +2144,10 @@ class ThreadVault:
         the existing placeholder is returned via `RETURNING placeholder`.
         Both steps run inside a single transaction. TTL is bumped on both
         rows in this call.
+
+        Because `ON CONFLICT DO UPDATE` only bumps `expires_at` and never
+        rewrites `original_value`, the FIRST literal form to claim a key is the
+        one stored for that key's lifetime (first-write-wins).
 
         Expired rows for `chat_id` are deleted at the top of the
         transaction so a stale counter never bumps off an old `next_value`
@@ -1986,7 +2203,12 @@ class ThreadVault:
                     "ThreadVault.get_placeholder requires a BlindIndex (lookup_hash is "
                     "NOT NULL); construct the vault with a blind_index (spec D1)."
                 )
-            lookup_hash = blind_index.compute(chat_id, entity_type, original)
+            # Hash the NORMALIZED identity (dedup), store the LITERAL text
+            # (restore + re-mask). Never collapse these two into one value —
+            # see the docstring.
+            lookup_hash = blind_index.compute(
+                chat_id, entity_type, original if lookup_value is None else lookup_value
+            )
             stored = self._cipher.encrypt(original) if self._cipher is not None else original
 
             mapping_row = await conn.fetchrow(
@@ -3604,24 +3826,70 @@ class Pipeline:
                         # Coreference may remap the placeholder *key* to a full
                         # name; the recorded surface + enriched `original` stay
                         # the detected surface.
-                        key = overrides.get(idx, surface)
+                        #
+                        # `key` and `surface` are DELIBERATELY NOT THE SAME VALUE.
+                        # Do not "tidy this up" by collapsing them into one
+                        # variable — that is a PII LEAK, not a refactor:
+                        #
+                        #   * `key` (normalized) is the VAULT LOOKUP identity. It
+                        #     is whitespace-collapsed so a multi-line address and
+                        #     its single-line form resolve to ONE placeholder
+                        #     (TRAU-530: "45 Baggot Street Lower,\nDublin 2" and
+                        #     "45 Baggot Street Lower, Dublin 2" hashed to two
+                        #     different lookup_hash values -> [ADDRESS_2] and
+                        #     [ADDRESS_6] for one object, and the LLM could not
+                        #     tell they were the same place).
+                        #   * `surface` (literal) is the string that PHYSICALLY
+                        #     OCCURS in the text. It is what
+                        #     `_mask_full_values_all_occurrences` searches for
+                        #     below, via a `re.escape`d literal matcher.
+                        #
+                        # Feed the NORMALIZED form to the masker and it searches
+                        # for "..., Dublin 2" in text that actually contains
+                        # "...,\nDublin 2": no match, nothing is replaced, and the
+                        # raw address goes to the LLM UNMASKED. The failure is
+                        # silent — no exception, no log — so it would ship.
+                        #
+                        # `canonical` is the LITERAL value (coreference-resolved
+                        # but never normalized) and `key` is its normalized
+                        # identity. They go to the vault as two SEPARATE
+                        # arguments — see `ThreadVault.get_placeholder`.
+                        canonical = overrides.get(idx, surface)
+                        key = _normalize_vault_key(canonical)
                         standard_type = self.PRESIDIO_TO_STANDARD[det.entity_type]
                         placeholder: str
                         if use_vault:
                             assert self.vault is not None  # for mypy
+                            # original=canonical -> STORED (restore + re-mask must
+                            # see the literal text). lookup_value=key -> HASHED
+                            # (dedup across whitespace variants). Passing `key` as
+                            # `original` reintroduces the leak this split fixes.
                             placeholder = await self.vault.get_placeholder(
-                                thread_id, key, standard_type
+                                thread_id, canonical, standard_type, lookup_value=key
                             )
                         else:
+                            # Vault-less fallback mirrors the same split: dedup on
+                            # the normalized `key`, restore the literal
+                            # `canonical`. First-write-wins, matching the vault's
+                            # ON CONFLICT semantics.
                             existing = forward_map.get(key)
                             if existing is None:
                                 n = counter_state.get(standard_type, 0) + 1
                                 counter_state[standard_type] = n
                                 placeholder = f"[{standard_type}_{n}]"
                                 forward_map[key] = placeholder
-                                reverse_map[placeholder] = key
+                                reverse_map[placeholder] = canonical
                             else:
                                 placeholder = existing
+                        # Keyed by the LITERAL `surface`, never by the normalized
+                        # `key` — see the block above. This map drives
+                        # `_mask_full_values_all_occurrences`, which matches
+                        # `re.escape`d literals against the raw text, so its keys
+                        # must be byte-identical to what occurs there. Two
+                        # whitespace variants of one value legitimately appear as
+                        # two entries here pointing at the SAME placeholder: the
+                        # vault deduped them, the masker still needs both literal
+                        # forms to find them.
                         inturn_forward[surface] = placeholder
                         # The card slices the ORIGINAL user message, but `det`
                         # offsets are in the re-masked `analyzed` text. Translate

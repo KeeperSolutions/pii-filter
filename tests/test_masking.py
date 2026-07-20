@@ -788,23 +788,46 @@ async def test_inlet_does_not_mask_country_names(started_pipeline: Pipeline) -> 
     Until then LOCATION is intentionally not in PRESIDIO_TO_STANDARD, so
     spaCy/Presidio LOCATION hits are dropped silently before masking and
     country names like 'Hrvatska' / 'Njemačku' stay in the prompt the LLM sees.
+
+    TRAU-530 extends this to BARE CITY NAMES, which are the same decision one
+    level down. The 'city' GLiNER label used to map straight to ADDRESS, routing
+    around the LOCATION exclusion this test documents: "trip from cahersiveen to
+    thurles via farranfore" came back as [ADDRESS_1]/[ADDRESS_2]/[ADDRESS_3] and
+    the LLM refused to answer. A toponym with no address structure around it is
+    not personal data.
+
+    SCOPE NOTE: `_stub_gliner_model` makes GLiNER return [] in this suite, so the
+    city cases here assert that the spaCy/Presidio stack alone never mints an
+    ADDRESS. The promote-or-discard logic itself is covered against controlled
+    detections in `tests/test_address_city_adjacency.py`.
     """
-    original = "Pišem iz Hrvatske, putujem u Njemačku."
-    body: dict[str, Any] = {"messages": [{"role": "user", "content": original}]}
-    result = await started_pipeline.inlet(body)
+    # Each inlet call gets its own ephemeral thread (no chat_id), so the
+    # placeholder maps are accumulated rather than read off the last result.
+    all_forward: dict[str, str] = {}
+    for original in (
+        "Pišem iz Hrvatske, putujem u Njemačku.",
+        # TRAU-530: bare toponyms, no street/number/postal anywhere.
+        "help me plan a coordinated bus and train trip from cahersiveen "
+        "to thurles via farranfore on thursday 23rd july",
+        "Koji je najbolji restoran u Zagrebu?",
+        "Let's meet in Dublin next week",
+    ):
+        body: dict[str, Any] = {"messages": [{"role": "user", "content": original}]}
+        result = await started_pipeline.inlet(body)
 
-    detections = result["metadata"].get("pii_detections", [])
-    address_detections = [d for d in detections if d.get("entity_type") == "ADDRESS"]
-    location_detections = [d for d in detections if d.get("entity_type") == "LOCATION"]
-    assert address_detections == [], "ADDRESS detection out of Task 4 scope"
-    assert location_detections == [], "LOCATION must not appear as canonical entity"
+        detections = result["metadata"].get("pii_detections", [])
+        address_detections = [d for d in detections if d.get("entity_type") == "ADDRESS"]
+        location_detections = [
+            d for d in detections if d.get("entity_type") == "LOCATION"
+        ]
+        assert address_detections == [], f"bare toponym masked as ADDRESS: {original}"
+        assert location_detections == [], "LOCATION must not appear as canonical entity"
 
-    assert result["messages"][-1]["content"] == original
+        assert result["messages"][-1]["content"] == original
+        all_forward.update(result["metadata"].get("pii_placeholder_map", {}))
 
-    fwd = result["metadata"].get("pii_placeholder_map", {})
-    assert "Hrvatska" not in fwd
-    assert "Hrvatske" not in fwd
-    assert "Njemačku" not in fwd
+    for value in ("Hrvatska", "Hrvatske", "Njemačku", "cahersiveen", "thurles", "Dublin"):
+        assert value not in all_forward
 
 
 @pytest.mark.asyncio(loop_scope="module")
