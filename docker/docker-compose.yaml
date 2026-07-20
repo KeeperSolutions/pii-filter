@@ -1,0 +1,99 @@
+# Local end-to-end stack for testing this repo's pii_filter.py in OpenWebUI.
+#
+#   docker compose -f docker/docker-compose.yaml up -d --build
+#   open http://localhost:3000
+#
+# Run from the REPO ROOT — the build context is `..` so the Dockerfile can COPY
+# pii_filter.py, which lives at the root rather than in docker/.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pii
+      POSTGRES_PASSWORD: pii
+      POSTGRES_DB: pii
+    # The vault creates its own tables idempotently at on_startup; no init SQL.
+    volumes:
+      - pii-postgres:/var/lib/postgresql/data
+    # pii_filter's on_startup raises when vault_enabled=true and Postgres is
+    # unreachable, so gate the pipelines container on a real readiness probe
+    # rather than mere container start.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pii -d pii"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pipelines:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: pii-filter-pipelines:local
+    ports:
+      - "9099:9099"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PIPELINES_API_KEY: 0p3n-w3bu!
+
+      # --- vault -----------------------------------------------------------
+      # vault_enabled defaults to true and on_startup fails closed without a
+      # DSN, so this is required, not optional.
+      PII_FILTER_POSTGRES_URL: postgresql://pii:pii@postgres:5432/pii
+      PII_FILTER_VAULT_ENABLED: "true"
+
+      # THROWAWAY LOCAL-TEST KEYS — NEVER use these anywhere deployed.
+      # They are the byte ranges 0x00..0x1f and 0x20..0x3f, the same fixed dev
+      # pair tests/conftest.py uses, so the stack boots with no setup step.
+      #
+      # The blind-index key is required whenever the vault runs, even with
+      # encryption OFF: lookup_hash is NOT NULL and part of the primary key
+      # (spec D1), so _build_vault_crypto fails closed without it.
+      PII_FILTER_VAULT_BLIND_INDEX_KEY: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+
+      # Encryption-at-rest is OFF by default in this repo (the deployment copy
+      # defaults it ON). Uncomment both lines to exercise the ENC1 envelope
+      # path; the encryption key must differ from the blind-index key above.
+      # Generate a real pair with:
+      #   python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+      # PII_FILTER_VAULT_ENCRYPTION_ENABLED: "true"
+      # PII_FILTER_VAULT_ENCRYPTION_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
+      # --- debugging -------------------------------------------------------
+      # TRAU-529's mask report: logs original vs masked text plus a
+      # value -> placeholder list with per-value occurrence counts. This is the
+      # fastest way to see what the ported work actually did to a message.
+      PII_DEBUG_UNMASK_LOG: "true"
+      PII_DEBUG_COLOR: "true"
+
+      # degradation_mode defaults to "block" in this repo (fail-closed): if the
+      # analyzer errors, the request is rejected rather than forwarded
+      # unfiltered. Kept as-is deliberately — during testing you want failures
+      # loud. Set to "passthrough" to match the deployment default.
+      # PII_FILTER_DEGRADATION_MODE: passthrough
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    depends_on:
+      - pipelines
+    environment:
+      # Registers the Pipelines server as an OpenAI-compatible connection so the
+      # PII filter shows up under Admin > Settings > Pipelines. You still need a
+      # real LLM connection for chat — add it in the UI, or uncomment the
+      # OpenAI pair below and supply a key.
+      OPENAI_API_BASE_URL: http://pipelines:9099
+      OPENAI_API_KEY: 0p3n-w3bu!
+      # OPENAI_API_BASE_URLS: "http://pipelines:9099;https://api.openai.com/v1"
+      # OPENAI_API_KEYS: "0p3n-w3bu!;sk-..."
+    volumes:
+      - pii-open-webui:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  pii-postgres: {}
+  pii-open-webui: {}
