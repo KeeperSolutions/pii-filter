@@ -111,12 +111,34 @@ if TYPE_CHECKING:
 postgres_binary_missing = shutil.which("pg_ctl") is None or shutil.which("postgres") is None
 
 
+# The real, unpatched bound methods, captured before `_stub_gliner_model`
+# installs the session-wide stubs.
+_REAL_GLINER_LOAD = GLiNER2Detector.load
+_REAL_GLINER_DETECT = GLiNER2Detector.detect
+
+
+class _DummyGlinerModel:
+    """Sentinel installed by the stubbed `load()` in place of the torch model."""
+
+
 def _stub_gliner_load(self: GLiNER2Detector) -> None:
-    self._model = object()
+    self._model = _DummyGlinerModel()
 
 
 def _stub_gliner_detect(self: GLiNER2Detector, text: str) -> list[RecognizerResult]:
-    return []
+    """Return [] only for a detector carrying the stubbed-in dummy model.
+
+    The TRAU-522/529 suites (chunking, sub-token collapse, adjacency merge)
+    construct a real `GLiNER2Detector` and inject their OWN fake model, then
+    assert on what the genuine `detect()` does with it — chunk iteration, offset
+    remap, dedup, containment collapse. A blanket `return []` would silently turn
+    every one of those assertions into "no detections found" rather than failing
+    loudly, so the short-circuit is narrowed to the dummy model that only the
+    stubbed `load()` installs.
+    """
+    if isinstance(self._model, _DummyGlinerModel):
+        return []
+    return _REAL_GLINER_DETECT(self, text)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -140,6 +162,187 @@ def _stub_gliner_model() -> Iterator[None]:
 def pipeline() -> Pipeline:
     """Fresh Pipeline instance for each test."""
     return Pipeline()
+
+
+# ---------------------------------------------------------------------------
+# TRAU-522 / TRAU-529 — in-memory fakes for the fast (no-Postgres, no-torch)
+# inlet/outlet tests ported from the pipelines-v4 deployment repo.
+# ---------------------------------------------------------------------------
+#
+# The v4 harness stubs `presidio_analyzer` in `sys.modules` and loads the
+# pipeline by file path, because that repo does not install presidio. Here
+# presidio IS a real dependency and the module under test is importable as
+# `pii_filter`, so `pii_mod` is simply the real module and `RecognizerResult`
+# the real presidio value object. Keeping the *names* identical is what lets
+# the ported test files run unmodified.
+
+import pii_filter as pii_mod  # noqa: E402
+
+
+class FakeVault:
+    """In-memory ThreadVault stand-in.
+
+    `get_placeholder` is idempotent per `(chat_id, entity_type, original)` and
+    mints `[TYPE_n]` with a per-(chat_id, entity_type) counter — mirroring the
+    real vault's `ON CONFLICT ... RETURNING placeholder` contract without a
+    Postgres round-trip. This is what lets a repeated entity (same chat_id +
+    same original) reuse the same placeholder across the main chat and a
+    background task.
+    """
+
+    def __init__(self) -> None:
+        # (chat_id, entity_type, original) -> placeholder
+        self._mappings: dict[tuple[str, str, str], str] = {}
+        # (chat_id, entity_type) -> next index
+        self._counters: dict[tuple[str, str], int] = {}
+        self.get_placeholder_calls: list[tuple[str, str, str]] = []
+
+    async def healthcheck(self) -> bool:
+        return True
+
+    async def get_or_create_thread(self, chat_id: str) -> None:
+        return None
+
+    async def get_placeholder(self, chat_id: str, original: str, entity_type: str) -> str:
+        self.get_placeholder_calls.append((chat_id, original, entity_type))
+        key = (chat_id, entity_type, original)
+        existing = self._mappings.get(key)
+        if existing is not None:
+            return existing
+        n = self._counters.get((chat_id, entity_type), 0) + 1
+        self._counters[(chat_id, entity_type)] = n
+        placeholder = f"[{entity_type}_{n}]"
+        self._mappings[key] = placeholder
+        return placeholder
+
+    async def snapshot_for_request(self, chat_id: str) -> tuple[dict[str, str], dict[str, str]]:
+        forward: dict[str, str] = {}
+        reverse: dict[str, str] = {}
+        for (cid, _etype, original), placeholder in self._mappings.items():
+            if cid == chat_id:
+                forward[original] = placeholder
+                reverse[placeholder] = original
+        return forward, reverse
+
+
+class FakeAnalyzer:
+    """Deterministic analyzer that flags configured substrings as entities.
+
+    Replaces the spaCy-backed AnalyzerEngine. `spans` maps a literal substring
+    to an entity_type; every occurrence in `text` is returned as a
+    RecognizerResult, so tests control detection exactly.
+    """
+
+    def __init__(self, spans: dict[str, str], score: float = 0.95) -> None:
+        self._spans = spans
+        self._score = score
+
+    def analyze(self, text: str, language: str) -> list[RecognizerResult]:
+        results = []
+        for needle, entity_type in self._spans.items():
+            start = text.find(needle)
+            while start != -1:
+                results.append(
+                    RecognizerResult(
+                        entity_type=entity_type,
+                        start=start,
+                        end=start + len(needle),
+                        score=self._score,
+                    )
+                )
+                start = text.find(needle, start + 1)
+        return results
+
+
+class FakeGliner:
+    """In-memory stand-in for GLiNER2Detector reproducing the recon's root cause.
+
+    Real GLiNER (neural) re-detects existing placeholders as entities
+    ([PERSON_1]->PERSON 0.862, [ADDRESS_1]->ADDRESS 0.937, ...). This fake does
+    the same: every `[TYPE_N]` placeholder in the text is emitted as a PERSON
+    detection (a whitelisted type, so absent the overlap-filter it would survive
+    to the mask loop and renumber). Configured real-name substrings are emitted
+    too — mirroring GLiNER being the production PERSON source (spaCy NER off).
+    """
+
+    def __init__(self, name_spans: dict[str, str] | None = None, score: float = 0.9) -> None:
+        self.name_spans = name_spans or {}
+        self._score = score
+
+    def detect(self, text: str) -> list[RecognizerResult]:
+        results = []
+        # Re-detect placeholders (the dangerous behavior the filter must catch).
+        for m in pii_mod._PLACEHOLDER_RE.finditer(text):
+            results.append(
+                RecognizerResult(
+                    entity_type="PERSON", start=m.start(), end=m.end(), score=self._score
+                )
+            )
+        # Real entities.
+        for needle, entity_type in self.name_spans.items():
+            start = text.find(needle)
+            while start != -1:
+                results.append(
+                    RecognizerResult(
+                        entity_type=entity_type,
+                        start=start,
+                        end=start + len(needle),
+                        score=self._score,
+                    )
+                )
+                start = text.find(needle, start + 1)
+        return results
+
+
+def make_gliner_pipeline(
+    *, masking_enabled: bool = True, name_spans: dict[str, str] | None = None
+) -> Pipeline:
+    """Pipeline whose PERSON source is a FakeGliner (mirrors production: GLiNER on,
+    spaCy NER off). analyzer_hr is a no-op non-None analyzer so inlet's
+    'analyzer loaded' guard passes; all detection comes from the fake GLiNER."""
+    pipe = Pipeline()
+    pipe.valves.enabled = True
+    pipe.valves.presidio_enabled = True
+    pipe.valves.vault_enabled = True
+    pipe.user_valves.pii_masking_enabled = masking_enabled
+    pipe.analyzer_hr = FakeAnalyzer({})  # returns [] but non-None (guard)
+    pipe.analyzer_en = None
+    pipe._gliner = FakeGliner(name_spans=name_spans or {"Jimmy Page": "PERSON"})
+    pipe.vault = FakeVault()
+    return pipe
+
+
+def make_pipeline(*, masking_enabled: bool = True, person_needle: str = "Ivan Horvat") -> Pipeline:
+    """Build a Pipeline wired with in-memory fakes, no on_startup, no DB.
+
+    Analyzer detections run through the HR analyzer with no EN markers in the
+    fixture text, so the spillover guard classifies the window as 'hr' (the
+    tie-break default) and keeps the PERSON detection.
+    """
+    pipe = Pipeline()
+    pipe.valves.enabled = True
+    pipe.valves.presidio_enabled = True
+    pipe.valves.vault_enabled = True
+    pipe.user_valves.pii_masking_enabled = masking_enabled
+    pipe.analyzer_hr = FakeAnalyzer({person_needle: "PERSON"})
+    pipe.analyzer_en = None
+    pipe._gliner = None
+    pipe.vault = FakeVault()
+    return pipe
+
+
+def user_payload(masking_enabled: bool) -> dict[str, Any]:
+    return {"valves": {"pii_masking_enabled": masking_enabled}}
+
+
+@pytest.fixture
+def pii():
+    return pii_mod
+
+
+@pytest.fixture
+def make_pipe():
+    return make_pipeline
 
 
 @pytest_asyncio.fixture

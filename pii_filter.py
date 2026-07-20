@@ -155,9 +155,14 @@ def _debug_log_mask(
     def _paint(code: str, s: str) -> str:
         return f"\033[{code}m{s}\033[0m" if color else s
 
-    cyan = lambda s: _paint("36", s)
-    yellow = lambda s: _paint("33", s)
-    bold = lambda s: _paint("1", s)
+    def cyan(s: str) -> str:
+        return _paint("36", s)
+
+    def yellow(s: str) -> str:
+        return _paint("33", s)
+
+    def bold(s: str) -> str:
+        return _paint("1", s)
 
     # Order the mapping by where each value first appears in the original text
     # so the list reads top-to-bottom in reading order.
