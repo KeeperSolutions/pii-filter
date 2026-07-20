@@ -11,7 +11,9 @@ requirements: presidio-analyzer>=2.2.0, presidio-anonymizer>=2.2.0, spacy<3.8.0,
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import functools
 import hashlib
 import hmac
 import logging
@@ -19,6 +21,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
@@ -40,6 +43,148 @@ logger = logging.getLogger(__name__)
 # across repeated on_startup calls (test reruns, multiple Pipeline instances).
 # AnalyzerEngine instances are still rebuilt per startup.
 _nlp_engine_cache: dict[str, Any] = {}
+
+
+# ---------------------------------------------------------------------------
+# NER thread configuration (KORAK 3 — torch/BLAS intra-op cap)
+# ---------------------------------------------------------------------------
+
+
+def _ner_thread_limit() -> int:
+    """Intra-op thread count for a SINGLE NER inference (torch + BLAS).
+
+    NER is serialized on a dedicated single-worker executor
+    (``Pipeline._ner_executor``), so there is never a second concurrent
+    inference to over-subscribe — one inference may safely use every allocated
+    vCPU. This caps the *intra-op* parallelism of that one inference (torch's
+    thread pool via ``torch.set_num_threads`` for the GLiNER forward pass, and
+    OpenMP/BLAS via the ``OMP_NUM_THREADS`` env for spaCy/thinc/blis).
+
+    Env-tunable via ``PII_FILTER_NER_TORCH_THREADS`` (default 4 = the Cloud Run
+    vCPU allocation); a malformed or <1 value falls back to 1.
+
+    ``os.cpu_count()`` is deliberately NOT used as the default: on Cloud Run it
+    reports the host's core count, not the container's cgroup quota, which is
+    exactly the over-subscription trap this cap exists to avoid. The Dockerfile
+    sets ``OMP_NUM_THREADS``/``OPENBLAS_NUM_THREADS``/``MKL_NUM_THREADS`` to the
+    same value so the BLAS side (which ``torch.set_num_threads`` does not touch)
+    is capped too; keep the env and this default in sync when tuning.
+    """
+    raw = os.environ.get("PII_FILTER_NER_TORCH_THREADS", "4")
+    try:
+        n = int(raw)
+    except ValueError:
+        return 1
+    return n if n >= 1 else 1
+
+
+def _debug_unmask_log_enabled() -> bool:
+    """Whether the plaintext-PII debug log is on (env PII_DEBUG_UNMASK_LOG).
+
+    OFF by default and MUST stay off in production / Cloud Run: it logs the
+    original PII value next to its placeholder so a local OpenWebUI chat can be
+    watched live (`docker logs -f ... | grep PII_DEBUG`). Read per-call so the
+    flag can be toggled in tests; the cost is one dict lookup.
+    """
+    return os.environ.get("PII_DEBUG_UNMASK_LOG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _debug_color_enabled() -> bool:
+    """Whether the debug block uses ANSI color (env PII_DEBUG_COLOR).
+
+    Default OFF so piped/grepped logs stay free of escape codes; enable only when
+    watching `docker logs -f` directly in a color terminal.
+    """
+    return os.environ.get("PII_DEBUG_COLOR", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _debug_log_mask(
+    original_text: str,
+    masked_text: str,
+    remask_spans: list[dict[str, Any]],
+    inturn_forward: dict[str, str],
+) -> None:
+    """Emit a readable multi-line `[PII_DEBUG]` block: the original text, the
+    masked text, and each original->placeholder mapping with its occurrence
+    count in the original (the "identified in every place" signal). The map is
+    the vault re-masked values (`remask_spans`) plus values minted this turn
+    (`inturn_forward`), ordered by first appearance in the text.
+
+    No-op unless `_debug_unmask_log_enabled()`. Only called from the mask path,
+    so it never fires when masking is off. Logs plaintext PII by design — the
+    caller gates it on the env flag; see `_debug_unmask_log_enabled`. Color is
+    opt-in via PII_DEBUG_COLOR (off by default so piped logs stay clean).
+    """
+    if not _debug_unmask_log_enabled():
+        return
+
+    mapping: dict[str, str] = {}
+    for span in remask_spans:
+        original = span.get("original")
+        placeholder = span.get("placeholder")
+        if original and placeholder:
+            mapping[original] = placeholder
+    mapping.update(inturn_forward)
+
+    # Drop subsumed sub-values from the display: a partial detection (bare
+    # surname "Kovac") that shares a placeholder with a longer value containing
+    # it ("Ana Kovac" -> same [PERSON_1]) is never masked independently
+    # (longest-first consumes the full value), so listing it double-counts one
+    # entity. Masking is unaffected — this only de-clutters the report.
+    mapping = {
+        value: ph
+        for value, ph in mapping.items()
+        if not any(
+            other != value and other_ph == ph and value in other
+            for other, other_ph in mapping.items()
+        )
+    }
+
+    color = _debug_color_enabled()
+
+    def _paint(code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if color else s
+
+    def cyan(s: str) -> str:
+        return _paint("36", s)
+
+    def yellow(s: str) -> str:
+        return _paint("33", s)
+
+    def bold(s: str) -> str:
+        return _paint("1", s)
+
+    # Order the mapping by where each value first appears in the original text
+    # so the list reads top-to-bottom in reading order.
+    ordered = sorted(mapping.items(), key=lambda kv: (original_text.find(kv[0]), kv[0]))
+
+    lines = [
+        bold("[PII_DEBUG] PII mask report"),
+        f"  original : {original_text}",
+        f"  masked   : {masked_text}",
+    ]
+    if ordered:
+        lines.append(f"  values   : {len(ordered)} masked")
+        for original_value, placeholder in ordered:
+            count = original_text.count(original_value)
+            times = "1 place" if count == 1 else f"{count} places"
+            lines.append(
+                f"    • {cyan(repr(original_value))} → {yellow(placeholder)}  ({times})"
+            )
+    else:
+        lines.append("  values   : (none)")
+
+    logger.info("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -467,9 +612,85 @@ def _collapse_same_type_containment(
     return kept
 
 
+# Max whitespace gap (chars) between two same-type spans still treated as one
+# entity by _merge_adjacent_same_type. A normal name token boundary is a single
+# space; 3 covers double/triple spacing without merging across a large gap that
+# more likely separates two distinct entities.
+_ADJACENCY_MAX_WS_GAP = 3
+
+
+def _merge_adjacent_same_type(
+    results: list[RecognizerResult], text: str
+) -> list[RecognizerResult]:
+    """Merge CONSECUTIVE same-type spans whose only gap is short whitespace into
+    one span, so a name GLiNER emitted as separate sub-tokens ('first name' +
+    'last name') collapses to the full name.
+
+    Complements `_collapse_same_type_containment`, which only merges ENCLOSED
+    spans: on a repeated name GLiNER may return the first mention as adjacent
+    "Robert"+"Plant" sub-tokens (no enclosing span) and the second as the full
+    "Robert Plant" — leaving the first fragmented into two placeholders. Here two
+    same-type spans separated only by whitespace (``<= _ADJACENCY_MAX_WS_GAP``
+    chars, or directly touching) become one [start_of_first, end_of_last] span
+    with the max score. Merging only ever GROWS a masked span, so the worst case
+    is over-masking (fail-safe), never a leak. A gap containing any non-space
+    character (comma, "and", newline-run beyond the cap) blocks the merge, so
+    genuinely distinct adjacent entities stay separate. Returned order is not
+    significant — the caller re-sorts.
+    """
+    if len(results) < 2:
+        return list(results)
+    ordered = sorted(results, key=lambda r: (r.entity_type, r.start))
+    merged: list[RecognizerResult] = []
+    cur = ordered[0]
+    for nxt in ordered[1:]:
+        gap = text[cur.end : nxt.start]
+        contiguous = (
+            nxt.entity_type == cur.entity_type
+            and nxt.start >= cur.end
+            and len(gap) <= _ADJACENCY_MAX_WS_GAP
+            and (gap == "" or gap.isspace())
+        )
+        if contiguous:
+            cur = RecognizerResult(
+                entity_type=cur.entity_type,
+                start=cur.start,
+                end=max(cur.end, nxt.end),
+                score=max(cur.score, nxt.score),
+            )
+        else:
+            merged.append(cur)
+            cur = nxt
+    merged.append(cur)
+    return merged
+
+
 class GLiNER2Detector:
     """GLiNER2-PII wrapper. Vraća list[RecognizerResult]; pokreće se jednom po tekstu,
     jezično-agnostički, IZVAN per-language Presidio analyzera."""
+
+    # Input chunking (OOM + recall fix; isolation-measured 2026-07-16).
+    # gliner2 does NO internal chunking: the whole text went into ONE mdeberta
+    # forward. mdeberta uses relative position embeddings, so long input does
+    # not error — it silently costs O(n²) attention memory (5 KB → +1 GB RSS,
+    # 10 KB → OOM at a 5 GB cap) AND collapses recall (5 KB dense text: 12
+    # detections whole vs 92 as 1 KB chunks, same wall-clock, ±0 MB).
+    #
+    #  * CHUNK_SIZE 1024 chars: measured sweet spot — ~+63 MB peak per forward,
+    #    recall intact (the model was trained on short sequences).
+    #  * CHUNK_OVERLAP 256 chars: must exceed the longest entity this mapping
+    #    can emit, or a window cut severs it and the model misses both halves
+    #    (a LEAK, not a degradation). Longest realistic mapped entities: full
+    #    address (street + number + postal + city, ~120–150 chars), API key
+    #    (~64), full person name with titles (~80). 256 ≥ 2× the worst case.
+    #    GUARANTEE: with stride = size − overlap, any span of length L ≤ overlap
+    #    starting at p lies fully inside the window k = floor(p / stride):
+    #    k·stride ≤ p and p + L < k·stride + stride + overlap = window end.
+    #  * ACCEPTED residual: an entity LONGER than the overlap (e.g. an 800-char
+    #    JWT) may be seen only as fragments; each window still detects/masks
+    #    the fragment it sees, so coverage degrades to partial, never to zero.
+    _DEFAULT_CHUNK_SIZE = 1024
+    _DEFAULT_CHUNK_OVERLAP = 256
 
     def __init__(
         self,
@@ -479,17 +700,43 @@ class GLiNER2Detector:
         threshold: float = 0.5,
         map_location: str = "cpu",
         local_files_only: bool = False,  # True za Path B (vendored model)
+        chunk_size: int = _DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
     ) -> None:
+        # Reject any params that break the coverage guarantee: chunk_size <= 0
+        # gives a non-positive stride (infinite loop), chunk_overlap <= 0 makes
+        # windows abut with no overlap so a boundary-straddling entity is
+        # severed and lost (a LEAK), and overlap >= size collapses the stride.
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size ({chunk_size}) must be positive")
+        if chunk_overlap <= 0:
+            raise ValueError(f"chunk_overlap ({chunk_overlap}) must be positive")
+        if chunk_overlap >= chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({chunk_overlap}) must be smaller than "
+                f"chunk_size ({chunk_size})"
+            )
         self.model_name = model_name
         self.entity_mapping = entity_mapping or GLINER2_ENTITY_MAPPING
         self.label_descriptions = label_descriptions or GLINER2_LABEL_DESCRIPTIONS
         self.threshold = threshold
         self.map_location = map_location
         self.local_files_only = local_files_only
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
         self._model: Any = None
 
     def load(self) -> None:
+        import torch  # lazy import (heavy); bundled with gliner2[local]
         from gliner2 import GLiNER2  # lazy import (heavy: torch/transformers)
+
+        # KORAK 3: cap torch intra-op threads for the GLiNER forward pass. With
+        # NER serialized on the single-worker executor there is no concurrent
+        # inference, so this one may use every allocated vCPU (default 4) — but
+        # it must never exceed the cgroup quota, hence the explicit cap instead
+        # of torch's host-core default. spaCy/BLAS is capped separately via the
+        # OMP_NUM_THREADS env (Dockerfile); see `_ner_thread_limit`.
+        torch.set_num_threads(_ner_thread_limit())
 
         kwargs: dict[str, Any] = {"map_location": self.map_location}
         if self.local_files_only:
@@ -518,39 +765,82 @@ class GLiNER2Detector:
                 return idx, idx + len(span_text)
         return None, None
 
-    def detect(self, text: str) -> list[RecognizerResult]:
-        out_results: list[RecognizerResult] = []
-        if not text or self._model is None:
-            return out_results
-        try:
-            raw = self._model.extract_entities(
-                text, self._labels(), include_confidence=True, include_spans=True
-            )
-        except Exception:
-            logger.exception("GLiNER2 inference failed; skipping contextual NER")
-            return out_results
-        entities = raw.get("entities", {}) if isinstance(raw, dict) else {}
-        for gliner_label, spans in entities.items():
-            presidio_type = self.entity_mapping.get(gliner_label)
-            if presidio_type is None:
-                continue
-            for span in spans:
-                if not isinstance(span, dict):
-                    continue
-                score = float(span.get("confidence", self.threshold))
-                if score < self.threshold:
-                    continue
-                s, e = self._reconcile(
-                    text, span.get("text", ""), span.get("start"), span.get("end")
-                )
-                if s is None or e is None:
-                    continue
-                out_results.append(
-                    RecognizerResult(entity_type=presidio_type, start=s, end=e, score=score)
-                )
+    def _iter_chunks(self, text: str):
+        """Yield ``(offset, window)`` pairs covering `text` with overlapping
+        windows of ``chunk_size`` chars advancing by ``chunk_size - chunk_overlap``.
 
-        # Collapse same-type containment (full name vs its sub-token spans).
-        return _collapse_same_type_containment(out_results)
+        Texts up to one window yield a single ``(0, text)`` — identical to the
+        pre-chunking behavior. Coverage guarantee (incl. why no entity shorter
+        than the overlap can be severed by a cut) is documented on the class
+        constants above.
+        """
+        if len(text) <= self.chunk_size:
+            yield 0, text
+            return
+        stride = self.chunk_size - self.chunk_overlap
+        start = 0
+        while start < len(text):
+            yield start, text[start : start + self.chunk_size]
+            if start + self.chunk_size >= len(text):
+                break
+            start += stride
+
+    def detect(self, text: str) -> list[RecognizerResult]:
+        if not text or self._model is None:
+            return []
+        # Dedup across overlapping windows: an entity in the overlap zone is
+        # seen by BOTH adjacent windows and would double up. Exact-span
+        # duplicates (same type + same ORIGINAL-text offsets) collapse to the
+        # highest-scoring one; partial edge detections (a window that saw only
+        # a severed fragment) are absorbed by the same-type containment
+        # collapse below, exactly as sub-token spans always were.
+        seen: dict[tuple[str, int, int], RecognizerResult] = {}
+        labels = self._labels()  # invariant per call; hoist out of the chunk loop
+        for offset, chunk in self._iter_chunks(text):
+            try:
+                raw = self._model.extract_entities(
+                    chunk, labels, include_confidence=True, include_spans=True
+                )
+            except Exception:
+                logger.exception(
+                    "GLiNER2 inference failed for chunk at offset %d; skipping chunk",
+                    offset,
+                )
+                continue
+            entities = raw.get("entities", {}) if isinstance(raw, dict) else {}
+            for gliner_label, spans in entities.items():
+                presidio_type = self.entity_mapping.get(gliner_label)
+                if presidio_type is None:
+                    continue
+                for span in spans:
+                    if not isinstance(span, dict):
+                        continue
+                    score = float(span.get("confidence", self.threshold))
+                    if score < self.threshold:
+                        continue
+                    # Reconcile within the WINDOW (the coordinates the model
+                    # emitted), then remap into ORIGINAL-text offsets — the
+                    # splice/mask path downstream slices the original text.
+                    s, e = self._reconcile(
+                        chunk, span.get("text", ""), span.get("start"), span.get("end")
+                    )
+                    if s is None or e is None:
+                        continue
+                    key = (presidio_type, offset + s, offset + e)
+                    prev = seen.get(key)
+                    if prev is None or score > prev.score:
+                        seen[key] = RecognizerResult(
+                            entity_type=presidio_type,
+                            start=offset + s,
+                            end=offset + e,
+                            score=score,
+                        )
+
+        # Collapse same-type containment (full name vs its sub-token spans —
+        # and, with chunking, severed edge fragments inside the full span). The
+        # adjacency merge of separately-emitted sub-tokens runs later in the
+        # inlet, on the final accepted set (detector-agnostic).
+        return _collapse_same_type_containment(list(seen.values()))
 
 
 def _select_accepted_detections(
@@ -598,6 +888,27 @@ def _select_accepted_detections(
     """
     if not text or not detections:
         return []
+
+    # Step 0: Placeholder overlap filter (TRAU-522).
+    # Re-analysis of already-masked content (multi-turn history / background
+    # tasks) feeds existing `[TYPE_N]` placeholders back through detection.
+    # Regex/checksum recognizers never match a placeholder, but GLiNER (neural)
+    # re-detects them as entities ([PERSON_1]->PERSON, [ADDRESS_1]->ADDRESS).
+    # Left unchecked, that would re-mask a placeholder (mint a NEW number keyed
+    # on the literal "[PERSON_1]"), renumbering it and breaking inlet<->outlet
+    # vault parity so restore returns the placeholder instead of the real value.
+    # Drop any detection whose span OVERLAPS a placeholder span; adjacent real
+    # names (non-overlapping) are untouched. This is the single, source-agnostic
+    # idempotency guard that lets the per-message already-masked skip be removed.
+    placeholder_spans = [(m.start(), m.end()) for m in _PLACEHOLDER_RE.finditer(text)]
+    if placeholder_spans:
+        detections = [
+            d
+            for d in detections
+            if not any(d.start < ph_end and d.end > ph_start for ph_start, ph_end in placeholder_spans)
+        ]
+        if not detections:
+            return []
 
     # Step 1: Whitelist filter
     candidates: list[RecognizerResult] = [
@@ -852,6 +1163,174 @@ def mask_text(
 # `CREDIT_CARD`), an underscore, then a positive integer counter. Compiled
 # once at module load so `restore_text` does not pay re.compile per call.
 _PLACEHOLDER_RE = re.compile(r"\[[A-Z_]+_\d+\]")
+
+# Extracts the standard entity type from a placeholder: `[HR_OIB_1]` -> `HR_OIB`.
+# The type may itself contain underscores, so the trailing `_<digits>` counter is
+# stripped by anchoring the digit run at the end.
+_PLACEHOLDER_TYPE_RE = re.compile(r"^\[([A-Z_]+)_\d+\]$")
+
+
+def _entity_type_from_placeholder(placeholder: str) -> str | None:
+    """Return the standard entity type encoded in a `[TYPE_n]` placeholder, or
+    None if the string is not a well-formed placeholder (defensive — vault
+    values are always well-formed, so this only guards against corruption)."""
+    m = _PLACEHOLDER_TYPE_RE.match(placeholder)
+    return m.group(1) if m else None
+
+
+def _build_vault_remasker(forward: dict[str, str]) -> re.Pattern[str] | None:
+    """Compile a single deterministic re-mask pattern over the vault's known
+    originals for this thread (TRAU-522 Option A).
+
+    `forward` is the vault snapshot's ``{original -> placeholder}`` map. Because
+    it is keyed by original, EVERY distinct original is preserved even when
+    several share one placeholder (surname coreference: both "Robert Plant" and
+    "Plant" -> [PERSON_1]) — so building the matcher here never drops an entry.
+
+    The alternation is ordered longest-original-first so a longer original wins
+    at a shared start position (Python alternation is leftmost, first-match):
+    "Robert Plant" is tried before "Plant". Each original is bounded by
+    ``(?<!\\w)``/``(?!\\w)`` and matched case-sensitively, so "Plant" does not
+    fire inside "Plantation" and "ann" does not match a vaulted "Ann". These
+    lookarounds are used instead of ``\\b`` because ``\\b`` only matches at a
+    word/non-word transition, so it would never match an original that begins or
+    ends with a non-word character (e.g. a "+385…" phone or a "@handle") — the
+    lookarounds keep the "not inside a larger word" guard while still matching
+    those. Returns None when there is nothing to re-mask (empty snapshot),
+    letting callers skip the pass entirely.
+    """
+    if not forward:
+        return None
+    originals = sorted((o for o in forward if o), key=len, reverse=True)
+    if not originals:
+        return None
+    alternation = "|".join(re.escape(o) for o in originals)
+    return re.compile(r"(?<!\w)(?:" + alternation + r")(?!\w)")
+
+
+def _apply_vault_remask(
+    text: str, pattern: re.Pattern[str] | None, forward: dict[str, str]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Replace every known vault original in `text` with its placeholder in ONE
+    left-to-right pass (TRAU-522 Option A), returning `(masked_text, spans)`.
+
+    `spans` is the list of masked occurrences, each
+    ``{start, end, original, placeholder, entity_type}`` where `start`/`end` are
+    offsets into the *original* `text` (the matcher runs over the input, before
+    any substitution) and `entity_type` is derived from the placeholder (None if
+    it is malformed). These serve two purposes: (1) they feed the PII card so a
+    repeated vaulted mention — which the deterministic re-mask handles before the
+    analyzers, so it never reaches the NER `accepted` path that normally
+    populates the card — still shows up; and (2) they are the analyzed<->original
+    offset map (`_analyzed_to_original_offset`) that translates NER offsets on a
+    NEW name back to the original message. Original coordinates let the frontend
+    slice the value straight out of the user's own message text. EVERY masked
+    occurrence is recorded (even with entity_type=None) so the offset map is
+    complete; only the card emitter skips the type-less entries.
+
+    Single left-to-right pass means an inserted ``[TYPE_N]`` is never re-scanned,
+    so there is no cascade or double-masking. Existing placeholders are never
+    targets — originals are real values, never placeholder-shaped — so this is a
+    no-op on already-masked text (idempotent). Returns `(text, [])` when there is
+    no matcher or no original occurs.
+    """
+    if pattern is None or not text:
+        return text, []
+    pieces: list[str] = []
+    spans: list[dict[str, Any]] = []
+    last_end = 0
+    for m in pattern.finditer(text):
+        original = m.group(0)
+        placeholder = forward[original]
+        pieces.append(text[last_end : m.start()])
+        pieces.append(placeholder)
+        last_end = m.end()
+        # Record every masked occurrence so the offset map stays complete. A
+        # malformed placeholder (entity_type=None) still shifts offsets, so it
+        # must be in the map even though the card emitter will skip it.
+        spans.append(
+            {
+                "start": m.start(),
+                "end": m.end(),
+                "original": original,
+                "placeholder": placeholder,
+                "entity_type": _entity_type_from_placeholder(placeholder),
+            }
+        )
+    pieces.append(text[last_end:])
+    return "".join(pieces), spans
+
+
+def _mask_full_values_all_occurrences(
+    text: str, forward: dict[str, str]
+) -> str:
+    """Mask EVERY occurrence of each in-turn detected value in `text`, keyed by
+    the ``{detected_surface -> placeholder}`` map minted this message.
+
+    This runs on the un-fragmented `analyzed` text BEFORE any positional splice,
+    so it fixes the asymmetric-recall leak: when a repeated name is detected
+    fully at one mention but only partially at another (GLiNER returns just the
+    surname "Kovac" for the first "Ana Kovac"), masking the full LITERAL value
+    at every position covers the partially-detected mention wholesale — the
+    first name never leaks. Because it re-derives positions by string search,
+    the (removed) offset-remap of a positional splice is unnecessary.
+
+    Uses the same safe matcher as the vault re-mask (`_build_vault_remasker`):
+    longest-original-first so a full name wins over its bare surname at a shared
+    start, ``(?<!\\w)..(?!\\w)`` word boundaries so "Ana" never fires inside
+    "Anamarija", and case-sensitive matching. A single left-to-right `re.sub`
+    pass never re-scans an inserted placeholder. Deliberately NOT built on
+    `_apply_vault_remask` (which also collects an offset-map for the card): the
+    card is built separately during minting, and only PRIMARY entity types reach
+    `forward` here — GLiNER sub-tokens ('first name'/'last name') already map to
+    PERSON and collapse, so there is no sub-token surface to special-case.
+
+    Masks ONLY values an analyzer already confirmed; worst case over-masks (two
+    people sharing a name string collapse to one placeholder — inherent to any
+    string masking, fail-safe), never a leak. Returns `text` unchanged when the
+    map is empty.
+    """
+    pattern = _build_vault_remasker(forward)
+    if pattern is None:
+        return text
+    return pattern.sub(lambda m: forward[m.group(0)], text)
+
+
+def _analyzed_to_original_offset(
+    pos: int, remask_spans: list[dict[str, Any]]
+) -> int | None:
+    """Map an offset in the re-masked `analyzed` text back to the original text.
+
+    The deterministic re-mask replaced known originals with placeholders BEFORE
+    the analyzers ran, so NER offsets are relative to the length-changed
+    `analyzed` string. `remask_spans` (from `_apply_vault_remask`, in ORIGINAL
+    coordinates, left-to-right) undoes those changes: for every placeholder that
+    lies fully before `pos` in `analyzed`, add back its
+    ``len(original) - len(placeholder)`` length delta.
+
+    Returns None when `pos` falls INSIDE a placeholder region — an undefined
+    mapping. This should be unreachable for accepted NER detections, which never
+    overlap a re-masked span (the Step-0 overlap filter drops placeholder
+    overlaps); the caller treats None defensively (skips the card entry, keeps
+    the mask). With no re-mask the list is empty and `pos` is returned unchanged.
+    """
+    cumulative = 0  # sum of (len_original - len_placeholder) applied so far
+    for span in remask_spans:
+        len_original = span["end"] - span["start"]
+        len_placeholder = len(span["placeholder"])
+        analyzed_start = span["start"] - cumulative
+        analyzed_end = analyzed_start + len_placeholder
+        if analyzed_end <= pos:
+            cumulative += len_original - len_placeholder
+        elif pos < analyzed_start:
+            # `pos` precedes this (and, since spans are ordered, every later)
+            # placeholder — nothing more to add.
+            break
+        else:
+            # analyzed_start <= pos < analyzed_end: `pos` is inside a placeholder.
+            return None
+    return pos + cumulative
+
 
 # Compiled once at module load so _select_accepted_detections pays no re.compile per call.
 # Each pattern uses a $ anchor so it only matches when the phone keyword is immediately
@@ -1661,24 +2140,20 @@ def _find_last_user_index(messages: list[dict[str, Any]]) -> int:
     return -1
 
 
-def _get_message_text_for_precheck(msg: dict[str, Any]) -> str:
-    """Return all text content from a message as a single string for regex pre-check.
+def _find_last_assistant_index(messages: list[dict[str, Any]]) -> int:
+    """Return the index of the last message with role=='assistant', or -1 if none.
 
-    Handles both str content and list[dict] multimodal content.
-    Image-only parts contribute nothing; returns '' if no text exists.
+    Mirror of `_find_last_user_index` for the middle-ground NER scope: the last
+    assistant message is where an LLM-generated name first appears, and it must
+    be NER-ed on the SAME turn so the KORAK 5 task skip's re-mask can cover it.
+    Kept separate (not a generalization of `_find_last_user_index`) so the Task 4
+    backward-compat contract of that helper stays untouched.
     """
-    content = msg.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text", "")
-                if isinstance(text, str):
-                    parts.append(text)
-        return " ".join(parts)
-    return ""
+    for i in range(len(messages) - 1, -1, -1):
+        message = messages[i]
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return i
+    return -1
 
 
 def _merge_dedupe_detections(
@@ -1736,6 +2211,27 @@ def _merge_dedupe_detections(
             merged[key] = det
 
     return list(merged.values()), spillover_dropped
+
+
+# OpenWebUI background-task types (carried on `metadata.task`) whose generated
+# output is consumed by the SAME LLM and never handed to a third party. For these
+# — and ONLY these — the inlet skips the NER detection pass (GLiNER + dual
+# Presidio) and relies on the deterministic vault re-mask alone (KORAK 5).
+#
+# Why skip: a single chat turn fans out into several heavy background-task
+# requests; running full NER on each spikes memory (OOM). The re-mask (regex, µs)
+# still runs, so every value vaulted on a prior turn stays masked here — only the
+# detection of brand-new names is skipped.
+#
+# Why ONLY these three: query_generation and image_prompt_generation are
+# deliberately EXCLUDED — their output is sent to an EXTERNAL service (RAG search
+# / image backend), where an un-vaulted name would leak to a third party, so they
+# must keep full NER. Every other task type (and any unknown value) also keeps
+# full NER by default — this is an allowlist, not `metadata.task`-generic.
+# Strings are the OpenWebUI `TASKS` enum values (open_webui/constants.py).
+_LLM_FACING_SKIP_NER_TASKS: frozenset[str] = frozenset(
+    {"title_generation", "tags_generation", "follow_up_generation"}
+)
 
 
 class Pipeline:
@@ -2122,14 +2618,6 @@ class Pipeline:
                 "processing (equivalent to disabling multi_turn_history_scope)."
             ),
         )
-        multi_turn_already_masked_pattern: str = Field(
-            default=r"\[[A-Z_]+_\d+\]",
-            description=(
-                "Regex pattern to detect messages already masked from a prior "
-                "inlet call. Messages matching this pattern are skipped without "
-                "calling Presidio (performance optimization)."
-            ),
-        )
 
     class UserValves(BaseModel):
         """Per-user toggles. Schema only — Task 8 wires the masking toggle.
@@ -2205,8 +2693,45 @@ class Pipeline:
         # The vault is built in `on_startup` from the current valves so
         # admin-edited vault settings take effect on Pipelines restart.
         self.vault: ThreadVault | None = None
+        # KORAK 4: dedicated single-worker executor for the CPU-bound, sync,
+        # NOT-thread-safe NER calls (Presidio spaCy + GLiNER torch). max_workers=1
+        # serializes all inferences onto one thread so the shared analyzer/model
+        # instances are never touched concurrently (thread-safety) while the
+        # event loop stays free to service other coroutines. Created lazily via
+        # `_get_ner_executor` and torn down in `on_shutdown`.
+        self._ner_executor: ThreadPoolExecutor | None = None
 
         logger.info("PII Filter pipeline initialized (analyzer not loaded yet)")
+
+    def _get_ner_executor(self) -> ThreadPoolExecutor:
+        """Return the single-worker NER executor, creating it on first use.
+
+        A single worker is load-bearing: Presidio's spaCy NLP pass and GLiNER's
+        torch forward pass are NOT thread-safe for concurrent calls on the shared
+        instances, so serializing every `analyze`/`detect` onto one thread is the
+        thread-safety guarantee (not a lock, not per-thread model copies). Lazy
+        creation keeps the offload path working even if `inlet` is somehow reached
+        before `on_startup` (e.g. tests inject fakes directly).
+        """
+        if self._ner_executor is None:
+            self._ner_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pii-ner"
+            )
+        return self._ner_executor
+
+    async def _offload_ner(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run a sync, CPU-bound NER call on the single-worker executor.
+
+        `run_in_executor` takes no kwargs, so bind them with `functools.partial`.
+        Awaiting the returned future yields the event loop while the worker thread
+        runs the inference — other coroutines (vault async DB, other requests)
+        progress meanwhile. Serialization across all callers is structural: the
+        executor has exactly one thread.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._get_ner_executor(), functools.partial(fn, *args, **kwargs)
+        )
 
     def _build_analyzer(self, lang_code: str) -> AnalyzerEngine:
         """Build a single-language AnalyzerEngine with all relevant recognizers.
@@ -2381,10 +2906,19 @@ class Pipeline:
             self._gliner.load()
             self._gliner.detect("warmup Ivan Horvat")  # warmup
 
+        # KORAK 4: (re)create the single-worker NER executor. A prior instance
+        # (on_startup re-called after on_shutdown on a Pipelines reload) is torn
+        # down first so we never leak worker threads.
+        if self._ner_executor is not None:
+            self._ner_executor.shutdown(wait=False)
+            self._ner_executor = None
+        self._get_ner_executor()
+
         logger.info(
-            "PII Filter on_startup: analyzers ready (hr=%s, en=%s)",
+            "PII Filter on_startup: analyzers ready (hr=%s, en=%s, ner_threads=%d)",
             self.analyzer_hr is not None,
             self.analyzer_en is not None,
+            _ner_thread_limit(),
         )
 
         # Vault initialization (Postgres-only). `initialize()` opens the
@@ -2441,6 +2975,15 @@ class Pipeline:
         logger.info("PII Filter on_shutdown")
         self.analyzer_hr = None
         self.analyzer_en = None
+        if self._ner_executor is not None:
+            # Don't block shutdown on an in-flight inference: shutdown(wait=False)
+            # returns immediately. The single worker is NOT a daemon thread (since
+            # Py3.9 ThreadPoolExecutor uses non-daemon workers joined via a
+            # concurrent.futures atexit handler), so it runs to the end of its
+            # current call and is joined at interpreter exit — fine here because
+            # NER calls are bounded and always return.
+            self._ner_executor.shutdown(wait=False)
+            self._ner_executor = None
         if self.vault is not None:
             await self.vault.aclose()
             self.vault = None
@@ -2529,6 +3072,23 @@ class Pipeline:
             return raw, raw
         return None, make_ephemeral_thread_id()
 
+    @staticmethod
+    def _resolve_task(body: dict[str, Any]) -> str | None:
+        """Return the OpenWebUI background-task type from `metadata.task`, or None.
+
+        A truthy `metadata.task` marks the request as an OWUI-generated background
+        task (title / tags / follow-ups / queries / image_prompt / …); a normal
+        chat completion has no such key. Used by the inlet's KORAK 5 NER-skip to
+        distinguish LLM-facing tasks (safe to skip NER) from external-facing ones
+        (must keep NER). None -> a normal chat turn (full NER).
+        """
+        metadata = body.get("metadata")
+        if isinstance(metadata, dict):
+            task = metadata.get("task")
+            if isinstance(task, str) and task:
+                return task
+        return None
+
     def _resolve_user_valves(self, user: dict[str, Any] | None) -> Pipeline.UserValves:
         """Build the effective UserValves for this request.
 
@@ -2556,17 +3116,19 @@ class Pipeline:
     async def inlet(
         self, body: dict[str, Any], user: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Detect PII in user messages, mask in place via the thread-scoped
-        vault (Task 5/5.1), and stash forward + reverse maps in
-        `body["metadata"]` so the outlet (Task 6) keeps reading the same
-        keys regardless of backend.
+        """Detect PII in the conversation's user and assistant messages, mask
+        in place via the thread-scoped vault (Task 5/5.1), and stash forward +
+        reverse maps in `body["metadata"]` so the outlet (Task 6) keeps reading
+        the same keys regardless of backend.
 
-        Task 8.5: by default (`multi_turn_history_scope=True`), ALL user
-        messages in `body["messages"]` are processed (up to
-        `multi_turn_history_max_messages`), not just the last one.  Already-
-        masked messages (matching `multi_turn_already_masked_pattern`) are
-        skipped via a cheap regex pre-check to avoid redundant Presidio calls.
-        Assistant messages pass through unchanged.
+        Task 8.5 / TRAU-522: by default (`multi_turn_history_scope=True`), ALL
+        user AND assistant messages in `body["messages"]` are processed (up to
+        `multi_turn_history_max_messages` from the tail), not just the last one.
+        Assistant history is masked too, so an outlet-restored real name from a
+        prior turn cannot leak back to the LLM. Every message is analyzed on
+        every turn; the deterministic vault re-mask plus the placeholder
+        overlap-filter (Step 0) keep re-analysis idempotent — existing
+        `[TYPE_N]` placeholders are never renumbered.
 
         Mutates each processed message's `content` field in place. All other
         body keys are left untouched. On analyzer / vault failure, behavior
@@ -2654,32 +3216,21 @@ class Pipeline:
             )
             return body
 
-        # Task 3.2/3.3 OpenWebUI integration: skip background tasks.
-        # OpenWebUI sends embedded chat history as user content for
-        # title/tags/follow-up generation, which would produce false-positive
-        # PII detections on assistant content inside the embedded history.
-        # Background tasks are identified by metadata["task"] key
-        # (e.g., "title_generation", "tags_generation", "follow_up_generation").
-        # The original user message has already been processed by the primary
-        # inlet call; outlet will still restore placeholders in task responses.
-        metadata = body.get("metadata")
-        if isinstance(metadata, dict):
-            task = metadata.get("task")
-            if task:
-                logger.info(
-                    "inlet: skipping OpenWebUI background task '%s' "
-                    "(chat_id=%s, body_size=%d chars)",
-                    task,
-                    metadata.get("chat_id"),
-                    sum(
-                        len(str(m.get("content", "")))
-                        for m in body.get("messages", [])
-                        if isinstance(m, dict)
-                    )
-                    if isinstance(body.get("messages"), list)
-                    else 0,
-                )
-                return body
+        # TRAU-522: OpenWebUI background tasks (title / tags / follow-up /
+        # image_prompt / queries / autocompletion / emoji / moa) embed the chat
+        # message as user content and were previously skipped here UNCONDITIONALLY
+        # — leaking raw PII to the external LLM even when per-chat masking was ON.
+        # The skip has been removed so task payloads flow through the normal
+        # detect -> get_placeholder -> splice path below. The toggle is honored in
+        # BOTH directions by the gates ABOVE this point, which run first:
+        #   * masking OFF short-circuits at the `pii_masking_enabled` gate, so a
+        #     task is never masked against the user's explicit opt-out;
+        #   * masking ON reaches here and is masked like any other turn.
+        # Because task payloads carry `metadata.chat_id`, `_resolve_chat_id`
+        # resolves the same thread as the main chat, so masked tasks reuse the
+        # existing vault mapping (same [PERSON_1]) rather than renumbering.
+        # NOTE: an equivalent unconditional task skip exists in the sibling
+        # pii-filter repo (pii_filter.py ~:2657) and must get the same removal.
 
         if self.analyzer_hr is None and self.analyzer_en is None:
             logger.warning("inlet called before on_startup completed; returning body unchanged")
@@ -2704,18 +3255,52 @@ class Pipeline:
                 return body
             target_indices = [last]
         else:
-            all_user_indices = [
-                i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"
+            # TRAU-522 Option A: process user AND assistant turns. The leak that
+            # NER-only masking left open lived in the ASSISTANT history turns —
+            # they carry the outlet-restored real name and were never re-masked.
+            # Including them lets the deterministic vault re-mask (and NER) cover
+            # assistant content too. system turns stay out (templates, no PII).
+            all_history_indices = [
+                i
+                for i, m in enumerate(messages)
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
             ]
-            if not all_user_indices:
-                logger.debug("inlet: no user messages found, skipping analysis")
+            if not all_history_indices:
+                logger.debug("inlet: no user/assistant messages found, skipping analysis")
                 return body
             cap = self.valves.multi_turn_history_max_messages
-            target_indices = all_user_indices[-cap:]
+            target_indices = all_history_indices[-cap:]
+
+        # Middle-ground NER scope (main chat): full NER runs ONLY on the last
+        # user and last assistant message; every other targeted history message
+        # gets the deterministic vault re-mask alone (seam below, next to the
+        # KORAK 5 task skip). Why exactly these two and not last-only:
+        #   * last USER message — where new user-typed PII enters this turn;
+        #   * last ASSISTANT message — where an LLM-generated name first
+        #     appears. NER-ing it vaults that name on the SAME turn, which is
+        #     the full-NER backstop the KORAK 5 task skip's safety argument
+        #     rests on (tasks re-mask from the vault instead of detecting).
+        # This makes inlet NER cost constant in history length (~2 jobs per
+        # turn instead of one per history message — the OOM/latency driver).
+        # -1 sentinels ("no such role") are harmless set members: msg_idx is
+        # always >= 0. An index outside the cap window (or outside the legacy
+        # single-message scope) is equally inert — the loop only visits
+        # `target_indices`, membership here just widens NER within it.
+        last_user_idx = _find_last_user_index(messages)
+        last_assistant_idx = _find_last_assistant_index(messages)
+        ner_indices = {last_user_idx, last_assistant_idx}
 
         raw_chat_id, thread_id = self._resolve_chat_id(body)
         if raw_chat_id is None:
             logger.warning("inlet: chat_id missing, using ephemeral thread_id=%s", thread_id)
+
+        # KORAK 5: decide once whether this request is an LLM-facing background
+        # task whose NER detection pass may be skipped (deterministic re-mask
+        # still runs). Allowlist only — external-facing tasks (queries /
+        # image_prompt) and normal chat turns keep full NER. See
+        # `_LLM_FACING_SKIP_NER_TASKS` and the per-part seam below for rationale.
+        task_type = self._resolve_task(body)
+        skip_ner_for_task = task_type in _LLM_FACING_SKIP_NER_TASKS
 
         # Decide whether to use the vault or fall back to per-request dicts.
         # Vault path requires `vault_enabled=True`, a vault instance, and
@@ -2767,20 +3352,40 @@ class Pipeline:
                     ) from None
                 use_vault = False
 
+        # TRAU-522 Option A: deterministic vault re-mask. NER re-derives masking
+        # every turn and its recall degrades on accumulated multi-turn context,
+        # so a previously-vaulted name can slip through unmasked (E2E: repeated
+        # name on turn 2+, carried in an assistant turn). Pull the START snapshot
+        # ONCE per request and build an exact-match matcher over the thread's
+        # known originals; the per-part loop applies it BEFORE any analyzer.
+        # Self-limiting: only originals already vaulted from PRIOR turns are
+        # re-masked — a name new to THIS turn is absent from the snapshot,
+        # untouched by re-mask, and caught by the normal NER path. This is one
+        # extra snapshot read per request (~ms, dwarfed by the GLiNER pass); the
+        # end-of-inlet snapshot (metadata) stays as-is since it must also reflect
+        # placeholders minted during this turn.
+        # KNOWN TRADE-OFF (accepted): two different people sharing a name string
+        # ("Ann" A vs "Ann" B) collapse to one placeholder. That is inherent to
+        # any string-based masking (the NER path collapses them too) and is
+        # OVER-masking (fail-safe), never a leak.
+        remask_forward: dict[str, str] = {}
+        remask_pattern: re.Pattern[str] | None = None
+        if use_vault:
+            assert self.vault is not None  # for mypy
+            try:
+                remask_forward, _ = await self.vault.snapshot_for_request(thread_id)
+            except Exception:
+                logger.exception(
+                    "inlet: vault snapshot for deterministic re-mask failed; "
+                    "proceeding NER-only for thread_id=%s",
+                    thread_id,
+                )
+                remask_forward = {}
+            remask_pattern = _build_vault_remasker(remask_forward)
+
         deny_set = frozenset(s.lower() for s in self.valves.ner_deny_list)
         exact_deny_set = frozenset(s.lower() for s in self.valves.ner_exact_deny_list)
         trailing_set = frozenset(s.lower() for s in self.valves.ner_trailing_token_strip)
-        # Per-call compile: respects operator changes to multi_turn_already_masked_pattern
-        # via valve without requiring a restart.
-        _default_masked_pattern = r"\[[A-Z_]+_\d+\]"
-        try:
-            already_masked_re = re.compile(self.valves.multi_turn_already_masked_pattern)
-        except re.error:
-            logger.error(
-                "inlet: invalid multi_turn_already_masked_pattern %r — falling back to default",
-                self.valves.multi_turn_already_masked_pattern,
-            )
-            already_masked_re = re.compile(_default_masked_pattern)
 
         messages_processed = 0
         messages_skipped = 0
@@ -2789,32 +3394,142 @@ class Pipeline:
             for msg_idx in target_indices:
                 target_msg = messages[msg_idx]
 
-                # Regex pre-check: skip messages already containing placeholders
-                # (from a prior inlet call). This avoids a redundant Presidio
-                # analyzer call — the dominant latency source — for history
-                # messages that were masked in an earlier turn.
-                full_content = _get_message_text_for_precheck(target_msg)
-                if already_masked_re.search(full_content):
-                    messages_skipped += 1
-                    continue
+                # TRAU-522: the per-message already-masked skip was removed here.
+                # It short-circuited any message containing a placeholder, which
+                # leaked on mixed content — an existing placeholder plus a NEW name
+                # in the same message (e.g. embedded follow-up history): the new
+                # name was never masked. Every message is now analyzed; the
+                # placeholder overlap-filter in `_select_accepted_detections`
+                # (Step 0) keeps re-analysis idempotent, so existing placeholders
+                # are never renumbered. `messages_skipped` is retained (now always
+                # 0) for log/return-guard compatibility. NOTE: the sibling
+                # pii-filter repo has the same skip (~pii_filter.py:2657) and needs
+                # the identical removal.
 
                 parts = list(self._iter_text_parts(target_msg))
                 if not parts:
                     continue
 
                 for text, write_back in parts:
+                    # TRAU-522 Option A step (a): deterministic vault re-mask
+                    # FIRST — before BOTH analyzers. Known originals become their
+                    # placeholders regardless of NER recall. Running it before
+                    # Presidio HR/EN (and their merge/spillover guard) and GLiNER
+                    # means every analyzer sees the SAME already-re-masked text,
+                    # and the Step-0 overlap-filter in `_select_accepted_detections`
+                    # protects the inserted placeholders from re-detection /
+                    # renumbering. All subsequent detection + splice work runs on
+                    # `analyzed`, whose offsets are what `write_back` persists.
+                    analyzed, remask_spans = _apply_vault_remask(
+                        text, remask_pattern, remask_forward
+                    )
+
+                    # KORAK 5 seam: LLM-facing background tasks (title / tags /
+                    # follow-ups) stop here — deterministic vault re-mask ONLY, no
+                    # NER. Persist the re-masked text (if the re-mask changed it)
+                    # and move on, reusing the existing "nothing to splice" branch.
+                    #
+                    #  * Why skip: one chat turn fans out into ~4 heavy
+                    #    background-task requests; running GLiNER + dual Presidio on
+                    #    each spikes memory (the OOM this fixes). The re-mask above
+                    #    is regex (µs) and already ran.
+                    #  * Why safe (no Layer-2 regression): the removed Layer-2 skip
+                    #    masked NOTHING; this skips only NEW-name DETECTION. The
+                    #    re-mask above already replaced every value vaulted on a
+                    #    prior turn with its placeholder, so known user PII stays
+                    #    masked. A name new to this payload entered via the main
+                    #    chat, whose full NER runs unconditionally and vaults it.
+                    #  * Why ONLY LLM-facing: these tasks' output is consumed by the
+                    #    SAME LLM. query_generation / image_prompt_generation go to
+                    #    an EXTERNAL service (search / image) where an un-vaulted
+                    #    name would leak to a third party — they are NOT in the
+                    #    allowlist and keep full NER (fall through below).
+                    #  * Why gated on `remask_pattern is not None`: the whole safety
+                    #    argument rests on the re-mask actually being active. When it
+                    #    is inert — vault disabled, degraded to passthrough, or an
+                    #    empty thread snapshot — `analyzed == text` and skipping NER
+                    #    would ship RAW user content to the LLM unmasked (reopening
+                    #    the Layer-2 leak). So we only skip when a re-mask matcher
+                    #    exists; otherwise we fall through to full NER. This keeps the
+                    #    OOM win where it matters (a large task payload means an
+                    #    established thread → non-empty vault → matcher present),
+                    #    while an empty/disabled vault (necessarily a small, early
+                    #    payload) safely runs NER.
+                    #
+                    # ACCEPTED behaviour: with the re-mask active, an LLM-generated
+                    # name appearing only in the current assistant turn is sent
+                    # UNMASKED to that same LLM inside a task payload (model output
+                    # fed back to the model, not user-typed PII); the main chat
+                    # vaults it on the next turn.
+                    #
+                    # Middle-ground NER scope (second disjunct): on MAIN chat
+                    # turns, history messages other than the last user / last
+                    # assistant one (`ner_indices`, computed above) also stop at
+                    # the re-mask — full NER runs only on the two messages where
+                    # new PII can enter this turn. The `remask_pattern is not
+                    # None` gate is shared and LOAD-BEARING for both disjuncts:
+                    # an empty/disabled vault (first turn) has no matcher, so
+                    # `analyzed == text` and skipping NER would ship raw history
+                    # unmasked (Layer-2 leak) — instead EVERYTHING falls through
+                    # to full NER until the vault has entries.
+                    # ACCEPTED residual (middle-ground): a never-vaulted name
+                    # sitting only in OLDER history is re-mask-only, i.e. sent
+                    # as-is — that is model output fed back to the model, or
+                    # user text the LLM already saw on the turn it was typed
+                    # (when NER ran on it in full); not a new leak surface.
+                    if (
+                        skip_ner_for_task or msg_idx not in ner_indices
+                    ) and remask_pattern is not None:
+                        if analyzed != text:
+                            write_back(analyzed)
+                        continue
+
+                    # TRAU-522 (card): feed the deterministic re-mask into the
+                    # card. A repeated vaulted name is masked here, BEFORE the
+                    # analyzers, so it never reaches the NER `accepted` loop below
+                    # that normally populates `all_enriched` -> without this the
+                    # card would silently stop showing on repeat mentions. These
+                    # spans carry ORIGINAL-text offsets, so the frontend slices
+                    # the value from the user's own message correctly. `remask_spans`
+                    # also doubles as the analyzed<->original offset map used just
+                    # below to translate NER offsets for NEW names in the same
+                    # message (skip type-less entries here, keep them in the map).
+                    for span in remask_spans:
+                        if span["entity_type"] is None:
+                            continue
+                        all_enriched.append(
+                            {
+                                "entity_type": span["entity_type"],
+                                "start": span["start"],
+                                "end": span["end"],
+                                "score": 1.0,  # deterministic vault hit, not probabilistic NER
+                                "raw_entity_type": span["entity_type"],
+                                "original": span["original"],
+                                "placeholder": span["placeholder"],
+                                "message_index": msg_idx,
+                            }
+                        )
+
+                    # KORAK 4: the three NER calls below are synchronous, CPU-bound
+                    # and NOT thread-safe (Presidio's spaCy NLP pass; GLiNER's torch
+                    # forward pass). Each is offloaded onto the single-worker NER
+                    # executor via `_offload_ner` so it runs on a worker thread
+                    # (event loop stays free) while `max_workers=1` serializes them
+                    # so the shared analyzer/model instances are never called
+                    # concurrently. Behaviour is identical to the prior sync calls —
+                    # same inputs, same results, same order — only the thread differs.
                     hr_results: list[RecognizerResult] = (
-                        self.analyzer_hr.analyze(text=text, language="hr")
+                        await self._offload_ner(self.analyzer_hr.analyze, text=analyzed, language="hr")
                         if self.analyzer_hr is not None
                         else []
                     )
                     en_results: list[RecognizerResult] = (
-                        self.analyzer_en.analyze(text=text, language="en")
+                        await self._offload_ner(self.analyzer_en.analyze, text=analyzed, language="en")
                         if self.analyzer_en is not None
                         else []
                     )
                     results, spillover_count = _merge_dedupe_detections(
-                        hr_results, en_results, text
+                        hr_results, en_results, analyzed
                     )
                     total_spillover_dropped += spillover_count
 
@@ -2823,11 +3538,13 @@ class Pipeline:
                     # not HR/EN duplicates so the spillover guard must not touch them)
                     # and BEFORE select, so whitelist + deny-list + trailing-strip +
                     # overlap resolution apply uniformly to GLiNER results too.
+                    # Offloaded onto the same single-worker NER executor (see above).
                     if self._gliner is not None:
-                        results.extend(self._gliner.detect(text))
+                        gliner_results = await self._offload_ner(self._gliner.detect, analyzed)
+                        results.extend(gliner_results)
 
                     accepted = _select_accepted_detections(
-                        text,
+                        analyzed,
                         results,
                         self.PRESIDIO_TO_STANDARD,
                         deny_set,
@@ -2835,22 +3552,58 @@ class Pipeline:
                         self.valves.ner_oib_phone_context_window,
                         exact_deny_set,
                     )
+                    # Merge adjacent same-type spans the analyzers emitted
+                    # separately (e.g. GLiNER 'first name' + 'last name' for one
+                    # mention of a full name, with no enclosing span to collapse)
+                    # so a person is masked as ONE placeholder, consistent with
+                    # occurrences the model returned whole. Detector-agnostic:
+                    # runs on the final merged accepted set (GLiNER + Presidio).
+                    # Offsets are in `analyzed`, the text the splice below uses.
+                    # Re-sort by start: the splice loop walks `accepted` in
+                    # position order (the merge groups by type), and coreference
+                    # resolution expects positional order too.
+                    accepted = sorted(
+                        _merge_adjacent_same_type(accepted, analyzed),
+                        key=lambda r: r.start,
+                    )
                     if not accepted:
+                        # No NEW names to mint, but re-mask may still have masked
+                        # known originals; persist it so the deterministic re-mask
+                        # is not lost when NER finds nothing.
+                        if analyzed != text:
+                            write_back(analyzed)
+                        # Live-watch debug: a re-mask-only turn (all PII already
+                        # vaulted, no new detection) must still be visible. No
+                        # in-turn mints here, so the map is the vault re-mask.
+                        _debug_log_mask(text, analyzed, remask_spans, {})
                         continue
 
                     # Within-message PERSON coreference: a bare surname reuses
                     # the placeholder of a same-message full name (valve-gated).
                     overrides = (
-                        _resolve_person_coreference(text, accepted)
+                        _resolve_person_coreference(analyzed, accepted)
                         if self.valves.ner_person_coreference_enabled
                         else {}
                     )
-                    pieces: list[str] = []
-                    last_end = 0
+                    # Values minted (or reused) in THIS message: detected surface
+                    # -> its placeholder. This drives the value-based mask below
+                    # (mask-all-full-values), which replaces the old per-position
+                    # splice: masking by value over the un-fragmented `analyzed`
+                    # text covers occurrences the analyzers detected only
+                    # partially (the asymmetric-recall leak). Keyed by surface,
+                    # not the coreference `key`: it is the string that physically
+                    # recurs in the text.
+                    inturn_forward: dict[str, str] = {}
+                    # Card entries built this message, held until inturn_forward
+                    # is complete so subsumed sub-values can be filtered out (a
+                    # bare surname "Kovac" that shares a placeholder with the full
+                    # "Ana Kovac" must not appear as a second card row).
+                    card_candidates: list[tuple[str, str, dict[str, Any]]] = []
                     for idx, det in enumerate(accepted):
-                        surface = text[det.start : det.end]
+                        surface = analyzed[det.start : det.end]
                         # Coreference may remap the placeholder *key* to a full
-                        # name; spliced span + enriched `original` stay surface.
+                        # name; the recorded surface + enriched `original` stay
+                        # the detected surface.
                         key = overrides.get(idx, surface)
                         standard_type = self.PRESIDIO_TO_STANDARD[det.entity_type]
                         placeholder: str
@@ -2869,16 +3622,67 @@ class Pipeline:
                                 reverse_map[placeholder] = key
                             else:
                                 placeholder = existing
-                        pieces.append(text[last_end : det.start])
-                        pieces.append(placeholder)
-                        last_end = det.end
+                        inturn_forward[surface] = placeholder
+                        # The card slices the ORIGINAL user message, but `det`
+                        # offsets are in the re-masked `analyzed` text. Translate
+                        # them back so a NEW name sharing a message with a
+                        # re-masked repeat still highlights the right span (fixes
+                        # the 'know Eleanor Fitz' shift). No-op when nothing was
+                        # re-masked. Length is preserved — no placeholder falls
+                        # inside an accepted NER span — so `end` tracks `start`.
+                        # None => the detection overlaps a re-masked placeholder
+                        # (Step-0 invariant violated, should be unreachable): the
+                        # mask above already applied (splice uses `det`), so we
+                        # only skip the — now undefined — card entry.
+                        orig_start = _analyzed_to_original_offset(det.start, remask_spans)
+                        if orig_start is None:
+                            logger.warning(
+                                "pii card: NER detection at analyzed offset %d overlaps a "
+                                "re-masked placeholder; skipping card entry",
+                                det.start,
+                            )
+                            continue
                         enriched_det = _build_enriched_detection(
-                            det, text, standard_type, surface, placeholder
+                            det, analyzed, standard_type, surface, placeholder
                         )
+                        enriched_det["start"] = orig_start
+                        enriched_det["end"] = orig_start + (det.end - det.start)
                         enriched_det["message_index"] = msg_idx
+                        card_candidates.append((surface, placeholder, enriched_det))
+                    # Drop subsumed card entries: a detection whose surface is a
+                    # substring of another detection's surface with the SAME
+                    # placeholder (bare surname "Kovac" inside "Ana Kovac" ->
+                    # both [PERSON_1]) is one entity, not two. It is still minted/
+                    # vaulted (keeps a later standalone "Kovac" re-masking
+                    # consistently) — only the card row is dropped.
+                    for surface, placeholder, enriched_det in card_candidates:
+                        if any(
+                            other != surface
+                            and other_ph == placeholder
+                            and surface in other
+                            for other, other_ph in inturn_forward.items()
+                        ):
+                            continue
                         all_enriched.append(enriched_det)
-                    pieces.append(text[last_end:])
-                    write_back("".join(pieces))
+                    # Mask every occurrence of each detected value over the
+                    # un-fragmented `analyzed` text (value-based, not per-position).
+                    # This is the single masking step — it REPLACES the old
+                    # positional splice. Masking by literal value covers a mention
+                    # the analyzers detected only partially: GLiNER's asymmetric
+                    # recall may return the full "Ana Kovac" at one mention but
+                    # only the surname "Kovac" at another; a per-position splice
+                    # would leave the first name "Ana" of the partial mention
+                    # unmasked (a leak). Longest-first + word boundary keep it
+                    # safe (see `_mask_full_values_all_occurrences`). No offset
+                    # remap: positions are re-derived by string search. The card
+                    # (all_enriched) was finalized in ORIGINAL coordinates during
+                    # minting above and is intentionally left as-is.
+                    masked = _mask_full_values_all_occurrences(analyzed, inturn_forward)
+                    write_back(masked)
+
+                    # Opt-in plaintext-PII debug log (env PII_DEBUG_UNMASK_LOG).
+                    # No-op unless the flag is on; local-only, never production.
+                    _debug_log_mask(text, masked, remask_spans, inturn_forward)
 
                 messages_processed += 1
 

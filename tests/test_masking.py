@@ -18,7 +18,7 @@ import pytest_asyncio
 from presidio_analyzer import RecognizerResult
 
 from pii_filter import CUSTOM_ENTITY_TYPES, GLiNER2Detector, Pipeline, mask_text, restore_text
-from tests.conftest import postgres_binary_missing
+from tests.conftest import FakeGliner, postgres_binary_missing
 from tests.helpers.mock_vault import MockThreadVault
 
 
@@ -492,11 +492,24 @@ async def test_inlet_coreference_merges_surname_placeholder(
     """Within-message coreference: a bare surname reuses the full name's
     placeholder through the real inlet/vault path.
 
-    NER-dependent: needs the analyzer to detect BOTH 'Ivana Lukić' (full) and a
-    bare 'Lukić' as PERSON. If this environment's NER doesn't produce both
-    spans, skip rather than fail (mirrors the EN-model skip convention used by
-    other integration tests in this module). The deterministic placeholder-key
-    logic is covered exhaustively by the `mask_text` and helper unit tests.
+    Drives a canned PERSON source rather than whatever NER this environment
+    happens to have. Previously this asked the live analyzer for both
+    'Ivana Lukić' and a bare 'Lukić' and called `pytest.skip` when it did not
+    get them — which meant that with GLiNER absent (the default: the conftest
+    stub returns no detections without torch installed), the test silently
+    skipped and the coreference path had NO automated coverage at all.
+
+    Injecting the detector makes the assertion unconditional and pins the exact
+    asymmetric-recall shape this logic exists for: the full name and the bare
+    surname both come back as PERSON, and the shorter one must not mint its own
+    placeholder. Real-model inference stays out of scope here — that is an
+    end-to-end concern, exercised by the docker/ stack.
+
+    Asserted on the masked TEXT rather than the detection list: since TRAU-529,
+    a sub-value subsumed by a longer value sharing its placeholder is masked by
+    the full-value pass and deliberately not recorded as its own detection (it
+    would double-count one entity). So `pii_detections` holds only
+    'Ivana Lukić', while both occurrences in the text are masked.
     """
     assert started_pipeline.valves.ner_person_coreference_enabled is True
     text = (
@@ -508,26 +521,42 @@ async def test_inlet_coreference_merges_surname_placeholder(
         "metadata": {"chat_id": "coref-inlet"},
     }
 
-    result = await started_pipeline.inlet(body)
+    real_gliner = started_pipeline._gliner
+    started_pipeline._gliner = FakeGliner(
+        name_spans={"Ivana Lukić": "PERSON", "Lukić": "PERSON"}
+    )
+    try:
+        result = await started_pipeline.inlet(body)
+    finally:
+        started_pipeline._gliner = real_gliner
 
     detections = result["metadata"].get("pii_detections", [])
     originals = {
         d["original"]: d["placeholder"] for d in detections if d["entity_type"] == "PERSON"
     }
-    if "Ivana Lukić" not in originals or "Lukić" not in originals:
-        pytest.skip(
-            "NER did not produce both 'Ivana Lukić' and a bare 'Lukić' as PERSON "
-            f"in this environment; got PERSON originals {sorted(originals)}"
-        )
-    # The bare surname reuses the full name's placeholder.
-    assert originals["Lukić"] == originals["Ivana Lukić"]
+    assert "Ivana Lukić" in originals, f"full name not detected; got {sorted(originals)}"
+    placeholder = originals["Ivana Lukić"]
     masked = result["messages"][-1]["content"]
-    assert masked.count(originals["Ivana Lukić"]) >= 2
+
+    # The bare surname reuses the full name's placeholder rather than minting
+    # its own, so the same placeholder covers both mentions...
+    assert masked.count(placeholder) == 2, masked
+    # ...and neither the full name nor the standalone surname survives raw.
+    assert "Ivana Lukić" not in masked, masked
+    assert "Lukić" not in masked, masked
 
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_inlet_skips_when_last_is_assistant(started_pipeline: Pipeline) -> None:
-    """If only assistant messages are present, inlet returns body unchanged."""
+    """An assistant-only turn carrying no PII comes back unchanged.
+
+    TRAU-522 (middle-ground NER scope) made inlet process the last assistant
+    message rather than bail on it, so the metadata keys are now always
+    populated instead of being absent. Assert they are EMPTY rather than
+    missing — that is the stronger claim, because it proves the analyzer ran
+    and found nothing, where the old key-absence check also passed whenever
+    the pipeline simply never looked.
+    """
     body: dict[str, Any] = {
         "messages": [{"role": "assistant", "content": "Hello, how can I help?"}],
         "metadata": {},
@@ -536,8 +565,8 @@ async def test_inlet_skips_when_last_is_assistant(started_pipeline: Pipeline) ->
     result = await started_pipeline.inlet(body)
 
     assert result["messages"][-1]["content"] == original_content
-    assert "pii_detections" not in result["metadata"]
-    assert "pii_placeholder_map" not in result["metadata"]
+    assert result["metadata"]["pii_detections"] == []
+    assert result["metadata"]["pii_placeholder_map"] == {}
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -1739,10 +1768,18 @@ async def test_inlet_masks_all_user_messages_in_history(
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_passes_through_assistant_messages(
+async def test_inlet_masks_pii_in_the_last_assistant_message(
     started_pipeline: Pipeline,
 ) -> None:
-    """Assistant messages must pass through inlet unchanged."""
+    """PII inside an assistant message is masked, not passed through.
+
+    Superseded contract: this asserted assistant messages pass through inlet
+    untouched. TRAU-522's middle-ground NER scope deliberately reversed that —
+    `_find_last_assistant_index` exists so the last assistant message is
+    analyzed on the SAME turn an LLM-generated value first appears. Leaving it
+    raw would ship the OIB the model just emitted straight back to the model on
+    the next turn, which is the leak this scope change closes.
+    """
     oib = _make_oib("9876543210")
     assistant_content = f"For reference, the OIB is {oib}."
     body: dict[str, Any] = {
@@ -1754,7 +1791,9 @@ async def test_inlet_passes_through_assistant_messages(
     }
     result = await started_pipeline.inlet(body)
 
-    assert result["messages"][0]["content"] == assistant_content
+    masked = result["messages"][0]["content"]
+    assert oib not in masked, "raw OIB must not survive in the assistant message"
+    assert masked == "For reference, the OIB is [HR_OIB_1]."
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -1895,10 +1934,23 @@ async def test_inlet_multi_turn_disabled_falls_back_to_task4_behavior(
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_already_masked_message_does_not_call_analyzer(
+async def test_inlet_reanalyzes_already_masked_message_without_corrupting_it(
     started_pipeline: Pipeline,
 ) -> None:
-    """Presidio analyzer must not be invoked for messages that already contain placeholders."""
+    """An already-masked message is re-analyzed, and its placeholders survive.
+
+    Superseded contract: the analyzer was skipped outright for any message
+    containing a placeholder, and this asserted exactly one analyzer call.
+    TRAU-522 removed that shortcut — skipping a whole message because it holds
+    one placeholder is what let raw PII ride along beside it (see the mixed
+    message test below). Re-analysis is safe because the placeholder
+    overlap-filter drops detections landing on existing placeholders, so they
+    are not renumbered; that filter has dedicated coverage in
+    tests/test_placeholder_overlap_filter.py.
+
+    What matters here is the outcome, not the call count: the masked content
+    must come back byte-identical.
+    """
     from unittest.mock import MagicMock
 
     already_masked = "Kontaktiraj [PERSON_1] o [HR_OIB_1]."
@@ -1919,17 +1971,28 @@ async def test_inlet_already_masked_message_does_not_call_analyzer(
     finally:
         started_pipeline.analyzer_hr = real_analyzer
 
+    assert mock_analyzer.analyze.call_count == 2, (
+        "Expected both messages to be analyzed (the already-masked skip was removed "
+        f"in TRAU-522), got {mock_analyzer.analyze.call_count}"
+    )
     assert (
-        mock_analyzer.analyze.call_count == 1
-    ), f"Expected 1 HR analyzer call (fresh message only), got {mock_analyzer.analyze.call_count}"
-    assert result["messages"][0]["content"] == already_masked
+        result["messages"][0]["content"] == already_masked
+    ), "Re-analysis must leave existing placeholders untouched"
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_inlet_partial_placeholder_message_is_skipped(
+async def test_inlet_masks_raw_pii_in_partially_masked_message(
     started_pipeline: Pipeline,
 ) -> None:
-    """A message with both a placeholder AND raw PII is treated as already-masked (known limitation)."""
+    """A message holding a placeholder AND raw PII gets the raw PII masked too.
+
+    Superseded contract: this asserted the message was left ENTIRELY unchanged
+    and called it "a documented limitation". That limitation was a leak — one
+    stale placeholder anywhere in the text was enough to wave an unmasked OIB
+    through to the model. TRAU-522 (c5caa77, "correct new-name offsets in mixed
+    messages") closed it, so the raw value is now masked while the existing
+    placeholder is left as-is.
+    """
     oib = _make_oib("7777777777")
     mixed_content = f"Moj OIB je {oib}, a [PERSON_1] mi je kolega."
     body: dict[str, Any] = {
@@ -1937,10 +2000,10 @@ async def test_inlet_partial_placeholder_message_is_skipped(
         "metadata": {"chat_id": "task8.5-partial-skip"},
     }
     result = await started_pipeline.inlet(body)
+    content = result["messages"][0]["content"]
 
-    assert (
-        result["messages"][0]["content"] == mixed_content
-    ), "Mixed message (placeholder + raw PII) must be left unchanged as a documented limitation"
+    assert oib not in content, f"raw OIB leaked through a mixed message: {content}"
+    assert "[PERSON_1]" in content, "the pre-existing placeholder must be preserved"
 
 
 @pytest.mark.asyncio(loop_scope="module")
@@ -1974,7 +2037,13 @@ async def test_inlet_metadata_logger_reports_processed_and_skipped_counts(
     started_pipeline: Pipeline,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The inlet info log line must include messages_processed and messages_skipped_already_masked."""
+    """The inlet info log line must carry both message counters.
+
+    The counter VALUES moved with TRAU-522: with the already-masked skip gone,
+    both messages are processed and nothing is skipped, where this previously
+    expected 1 processed / 1 skipped. The field names are the contract here —
+    they are what the audit log is parsed on — so both are still asserted.
+    """
     import logging
 
     body: dict[str, Any] = {
@@ -1993,8 +2062,8 @@ async def test_inlet_metadata_logger_reports_processed_and_skipped_counts(
     )
     assert log_line is not None, "Expected log line with 'messages_processed=' not found"
     assert "messages_skipped_already_masked=" in log_line
-    assert "messages_processed=1" in log_line
-    assert "messages_skipped_already_masked=1" in log_line
+    assert "messages_processed=2" in log_line
+    assert "messages_skipped_already_masked=0" in log_line
 
 
 # --- Integration tests with vault ---
@@ -2387,11 +2456,21 @@ async def test_inlet_logger_includes_ner_spillover_count(
 
 
 @pytest.mark.asyncio
-async def test_inlet_skips_openwebui_background_task_title_generation(
+async def test_inlet_masks_openwebui_background_task_title_generation(
     started_pipeline: Pipeline,
 ) -> None:
-    """OpenWebUI background tasks must skip inlet to avoid false positives
-    on embedded chat history."""
+    """OpenWebUI background tasks are masked like any other LLM-facing payload.
+
+    Superseded contract: v0.9.1 skipped background tasks entirely to dodge
+    false positives on the chat history they embed, and this asserted the OIB
+    survived untouched. But these payloads DO go to the LLM, so skipping them
+    shipped raw PII to the model — the leak TRAU-522 was opened for. They are
+    masked now, reusing the vault's existing placeholders so the title the
+    model returns stays consistent with the main chat.
+
+    See tests/test_inlet_task_masking.py for the placeholder-reuse half of this
+    contract; the two files previously asserted opposite things.
+    """
     body = {
         "messages": [
             {
@@ -2405,10 +2484,11 @@ async def test_inlet_skips_openwebui_background_task_title_generation(
         },
     }
     result = await started_pipeline.inlet(body)
-    # Body returned unchanged — no metadata.pii_detections added
-    assert "pii_detections" not in result.get("metadata", {})
-    # Content unchanged (no masking applied)
-    assert "12345678903" in result["messages"][0]["content"]
+
+    content = result["messages"][0]["content"]
+    assert "12345678903" not in content, f"raw OIB reached the LLM in a background task: {content}"
+    assert "[HR_OIB_1]" in content
+    assert result["metadata"]["pii_detections"], "the masking must be recorded in metadata"
 
 
 @pytest.mark.asyncio

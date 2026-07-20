@@ -1,0 +1,120 @@
+# Local end-to-end stack for testing this repo's pii_filter.py in OpenWebUI.
+#
+#   docker compose -f docker/docker-compose.yaml up -d --build
+#   open http://localhost:3000
+#
+# Run from the REPO ROOT — the build context is `..` so the Dockerfile can COPY
+# pii_filter.py, which lives at the root rather than in docker/.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pii
+      POSTGRES_PASSWORD: pii
+      POSTGRES_DB: pii
+    # The vault creates its own tables idempotently at on_startup; no init SQL.
+    volumes:
+      - pii-postgres:/var/lib/postgresql/data
+    # pii_filter's on_startup raises when vault_enabled=true and Postgres is
+    # unreachable, so gate the pipelines container on a real readiness probe
+    # rather than mere container start.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pii -d pii"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pipelines:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: pii-filter-pipelines:local
+    ports:
+      - "9099:9099"
+    volumes:
+      # Live-mount the filter over the copy baked into the image, so editing
+      # pii_filter.py and running `docker compose restart pipelines` is enough
+      # — no rebuild. The Dockerfile's COPY is still what makes the image
+      # self-contained when run without this compose file; the mount shadows it.
+      #
+      # The whole repo root is mounted (not just the single file) on purpose:
+      # a single-file bind mount pins one inode, and editors that save
+      # atomically (write temp + rename) swap the inode, so the container would
+      # keep seeing the ORIGINAL file forever while the host shows new content.
+      # Mounting the directory and pointing at a file inside it re-resolves the
+      # path on every open, which survives atomic saves.
+      - ..:/src:ro
+    # Refresh the filter from the mount, then hand off to the image's normal
+    # entrypoint. This runs on every container start, so `restart` is enough to
+    # pick up edits. `exec` keeps start.sh as PID 1 so signals/shutdown behave.
+    entrypoint:
+      - bash
+      - -c
+      - cp /src/pii_filter.py /app/pipelines/pii_filter_pipeline.py && exec bash start.sh
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PIPELINES_API_KEY: 0p3n-w3bu!
+
+      # --- vault -----------------------------------------------------------
+      # vault_enabled defaults to true and on_startup fails closed without a
+      # DSN, so this is required, not optional.
+      PII_FILTER_POSTGRES_URL: postgresql://pii:pii@postgres:5432/pii
+      PII_FILTER_VAULT_ENABLED: "true"
+
+      # Vault keys come from docker/.env (gitignored) — see docker/.env.example.
+      # Deliberately NOT defaulted inline: a key committed to the repo is one
+      # people copy into somewhere real, and it trips secret scanners. The `:?`
+      # form fails the stack immediately with this message instead of booting a
+      # half-configured vault.
+      #
+      # The blind-index key is required whenever the vault runs, even with
+      # encryption OFF: lookup_hash is NOT NULL and part of the primary key
+      # (spec D1), so _build_vault_crypto fails closed without it.
+      PII_FILTER_VAULT_BLIND_INDEX_KEY: ${PII_FILTER_VAULT_BLIND_INDEX_KEY:?set it in docker/.env — copy docker/.env.example and generate a key}
+
+      # Encryption-at-rest is OFF by default in this repo (the deployment copy
+      # defaults it ON). These pass through from docker/.env when set there, and
+      # stay empty otherwise, which leaves encryption off.
+      PII_FILTER_VAULT_ENCRYPTION_ENABLED: ${PII_FILTER_VAULT_ENCRYPTION_ENABLED:-false}
+      PII_FILTER_VAULT_ENCRYPTION_KEY: ${PII_FILTER_VAULT_ENCRYPTION_KEY:-}
+      PII_FILTER_VAULT_ENCRYPTION_STRICT: ${PII_FILTER_VAULT_ENCRYPTION_STRICT:-false}
+
+      # --- debugging -------------------------------------------------------
+      # TRAU-529's mask report: logs original vs masked text plus a
+      # value -> placeholder list with per-value occurrence counts. This is the
+      # fastest way to see what the ported work actually did to a message.
+      PII_DEBUG_UNMASK_LOG: "true"
+      PII_DEBUG_COLOR: "true"
+
+      # degradation_mode defaults to "block" in this repo (fail-closed): if the
+      # analyzer errors, the request is rejected rather than forwarded
+      # unfiltered. Kept as-is deliberately — during testing you want failures
+      # loud. Set to "passthrough" to match the deployment default.
+      # PII_FILTER_DEGRADATION_MODE: passthrough
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    depends_on:
+      - pipelines
+    environment:
+      # Registers the Pipelines server as an OpenAI-compatible connection so the
+      # PII filter shows up under Admin > Settings > Pipelines. You still need a
+      # real LLM connection for chat — add it in the UI, or uncomment the
+      # OpenAI pair below and supply a key.
+      OPENAI_API_BASE_URL: http://pipelines:9099
+      OPENAI_API_KEY: 0p3n-w3bu!
+      # OPENAI_API_BASE_URLS: "http://pipelines:9099;https://api.openai.com/v1"
+      # OPENAI_API_KEYS: "0p3n-w3bu!;sk-..."
+    volumes:
+      - pii-open-webui:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  pii-postgres: {}
+  pii-open-webui: {}
