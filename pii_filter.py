@@ -3558,6 +3558,14 @@ class Pipeline:
         counter_state: dict[str, int] = {}
         forward_map: dict[str, str] = {}
         reverse_map: dict[str, str] = {}
+        # Fallback-only dedup index, the vault-less mirror of `lookup_hash`:
+        # `normalized key -> placeholder`. Kept SEPARATE from `forward_map`
+        # because that one is published as `metadata.pii_placeholder_map`, whose
+        # documented contract is `original_value -> placeholder` — literal text,
+        # matching what the vault path puts there via `snapshot_for_request`.
+        # Merging the two would make the fallback's metadata disagree with the
+        # vault's for the same input (TRAU-530).
+        fallback_lookup: dict[str, str] = {}
         all_enriched: list[dict[str, Any]] = []
         total_spillover_dropped: int = 0
 
@@ -3869,15 +3877,23 @@ class Pipeline:
                             )
                         else:
                             # Vault-less fallback mirrors the same split: dedup on
-                            # the normalized `key`, restore the literal
-                            # `canonical`. First-write-wins, matching the vault's
-                            # ON CONFLICT semantics.
-                            existing = forward_map.get(key)
+                            # the normalized `key` (via `fallback_lookup`, the
+                            # stand-in for `lookup_hash`), but publish the LITERAL
+                            # `canonical` in `forward_map`/`reverse_map` — those
+                            # two are the `metadata.pii_placeholder_map` /
+                            # `pii_reverse_map` payload and must carry the same
+                            # literal-keyed shape the vault snapshot produces.
+                            # Recording only on mint reproduces the vault's
+                            # first-write-wins (ON CONFLICT never rewrites
+                            # `original_value`), so a later whitespace variant
+                            # reuses the placeholder without adding an entry.
+                            existing = fallback_lookup.get(key)
                             if existing is None:
                                 n = counter_state.get(standard_type, 0) + 1
                                 counter_state[standard_type] = n
                                 placeholder = f"[{standard_type}_{n}]"
-                                forward_map[key] = placeholder
+                                fallback_lookup[key] = placeholder
+                                forward_map[canonical] = placeholder
                                 reverse_map[placeholder] = canonical
                             else:
                                 placeholder = existing

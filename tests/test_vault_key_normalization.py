@@ -207,6 +207,59 @@ async def test_t3_both_literal_forms_mask_in_one_message():
 
 
 # ---------------------------------------------------------------------------
+# Vault-less fallback must expose the SAME metadata shape as the vault path
+# ---------------------------------------------------------------------------
+
+
+async def test_fallback_placeholder_map_is_keyed_by_the_literal_value():
+    """`metadata.pii_placeholder_map` is documented as `original_value ->
+    placeholder` (pii_filter.py:1242) and the vault path fills it from
+    `snapshot_for_request`, whose keys are literal stored originals.
+
+    The vault-less fallback builds the map itself, so it must publish the same
+    literal-keyed shape. An interim revision keyed it by the NORMALIZED lookup
+    value, which made the two paths disagree for the same input and broke
+    lookups by the literal text for any whitespace-variant value.
+    """
+    pipe = make_gliner_pipeline(name_spans={ADDR_MULTILINE: "ADDRESS"})
+    pipe.analyzer_hr = FakeAnalyzer({})
+    pipe.valves.vault_enabled = False  # force the fallback path
+
+    out = await pipe.inlet(
+        _body("chat-fallback", [_u(f"A: {ADDR_MULTILINE}")]), user=user_payload(True)
+    )
+    forward = out["metadata"]["pii_placeholder_map"]
+    reverse = out["metadata"]["pii_reverse_map"]
+
+    assert ADDR_MULTILINE in forward, f"map is not keyed by the literal value: {forward}"
+    assert ADDR_SINGLELINE not in forward, "normalized key leaked into the metadata map"
+    assert reverse["[ADDRESS_1]"] == ADDR_MULTILINE
+
+
+async def test_fallback_still_dedupes_whitespace_variants():
+    """The literal-keyed map must not cost us the dedup: both variants in one
+    message share a placeholder, and only the first is recorded (first-write-
+    wins, mirroring the vault's ON CONFLICT)."""
+    pipe = make_gliner_pipeline(
+        name_spans={ADDR_MULTILINE: "ADDRESS", ADDR_SINGLELINE: "ADDRESS"}
+    )
+    pipe.analyzer_hr = FakeAnalyzer({})
+    pipe.valves.vault_enabled = False
+
+    out = await pipe.inlet(
+        _body("chat-fallback-2", [_u(f"Prvo {ADDR_MULTILINE} pa {ADDR_SINGLELINE}.")]),
+        user=user_payload(True),
+    )
+    content = out["messages"][0]["content"]
+    forward = out["metadata"]["pii_placeholder_map"]
+
+    assert content.count("[ADDRESS_1]") == 2, content
+    assert "[ADDRESS_2]" not in content, content
+    assert len(forward) == 1, f"first-write-wins broken: {forward}"
+    assert ADDR_MULTILINE in forward
+
+
+# ---------------------------------------------------------------------------
 # T4 — normalization must not merge what it should not
 # ---------------------------------------------------------------------------
 
