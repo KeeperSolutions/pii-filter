@@ -768,3 +768,95 @@ async def test_primary_key_is_on_lookup_hash(postgres_vault: ThreadVault) -> Non
     pk_cols = {row["col"] for row in rows}
     assert pk_cols == {"chat_id", "entity_type", "lookup_hash"}
     assert "original_value" not in pk_cols
+
+
+# ---------------------------------------------------------------------------
+# lookup_value vs original — the TRAU-530 split
+# ---------------------------------------------------------------------------
+
+_ADDR_MULTILINE = "45 Baggot Street Lower,\nDublin 2"
+_ADDR_SINGLELINE = "45 Baggot Street Lower, Dublin 2"
+
+
+async def test_stored_value_is_never_the_normalized_form(
+    postgres_vault: ThreadVault,
+) -> None:
+    """INVARIANT: `original_value` keeps the LITERAL text, newline and all.
+
+    This pins the boundary an interim TRAU-530 revision broke. Normalizing the
+    stored value made `snapshot_for_request` return whitespace-collapsed
+    originals, which made the `re.escape`d `_build_vault_remasker` pattern stop
+    matching the multi-line occurrence in history — a silent PII leak. It also
+    reformatted the user's own value on restore.
+
+    Read straight from the column so no in-memory helper can mask a regression.
+    """
+    placeholder = await postgres_vault.get_placeholder(
+        "chatA", _ADDR_MULTILINE, "ADDRESS", lookup_value=_ADDR_SINGLELINE
+    )
+
+    pool = postgres_vault._pool
+    assert pool is not None
+    async with pool.acquire() as conn:
+        stored: str = await conn.fetchval(
+            "SELECT original_value FROM pii_thread_mappings "
+            "WHERE chat_id = $1 AND placeholder = $2",
+            "chatA",
+            placeholder,
+        )
+
+    decrypted = VaultCipher(VAULT_TEST_ENC_KEY).decrypt(stored)
+    assert decrypted == _ADDR_MULTILINE
+    assert "\n" in decrypted, "the newline was normalized out of the STORED value"
+    # And the round-trip through the public API agrees.
+    assert await postgres_vault.restore("chatA", placeholder) == _ADDR_MULTILINE
+
+
+async def test_lookup_value_dedupes_whitespace_variants(
+    postgres_vault: ThreadVault,
+) -> None:
+    """Two literal forms sharing one `lookup_value` collapse to ONE row and one
+    placeholder — the actual TRAU-530 fix, at the vault layer."""
+    first = await postgres_vault.get_placeholder(
+        "chatA", _ADDR_MULTILINE, "ADDRESS", lookup_value=_ADDR_SINGLELINE
+    )
+    second = await postgres_vault.get_placeholder(
+        "chatA", _ADDR_SINGLELINE, "ADDRESS", lookup_value=_ADDR_SINGLELINE
+    )
+
+    assert first == second == "[ADDRESS_1]"
+
+    pool = postgres_vault._pool
+    assert pool is not None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT original_value FROM pii_thread_mappings WHERE chat_id = $1",
+            "chatA",
+        )
+    assert len(rows) == 1, "whitespace variants minted separate rows"
+    # First-write-wins: the multi-line form claimed the key and keeps it.
+    assert VaultCipher(VAULT_TEST_ENC_KEY).decrypt(rows[0]["original_value"]) == (
+        _ADDR_MULTILINE
+    )
+
+
+async def test_lookup_value_defaults_to_original(postgres_vault: ThreadVault) -> None:
+    """Backward compatibility: callers that omit `lookup_value` (the test
+    doubles, `mask_text`) hash the `original`, exactly as before."""
+    a = await postgres_vault.get_placeholder("chatA", "Ivan Horvat", "PERSON")
+    b = await postgres_vault.get_placeholder(
+        "chatA", "Ivan Horvat", "PERSON", lookup_value="Ivan Horvat"
+    )
+    assert a == b == "[PERSON_1]"
+
+
+async def test_distinct_lookup_values_stay_distinct(postgres_vault: ThreadVault) -> None:
+    """The split must not become a fuzzy match: different lookup values mint
+    different placeholders even when the literal texts look similar."""
+    a = await postgres_vault.get_placeholder(
+        "chatA", "Dublin 2", "ADDRESS", lookup_value="Dublin 2"
+    )
+    b = await postgres_vault.get_placeholder(
+        "chatA", "Dublin 3", "ADDRESS", lookup_value="Dublin 3"
+    )
+    assert a != b

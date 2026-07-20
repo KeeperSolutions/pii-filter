@@ -191,8 +191,10 @@ class FakeVault:
     """
 
     def __init__(self) -> None:
-        # (chat_id, entity_type, original) -> placeholder
+        # (chat_id, entity_type, lookup_value) -> placeholder
         self._mappings: dict[tuple[str, str, str], str] = {}
+        # same key -> the LITERAL original stored for it (first-write-wins)
+        self._originals: dict[tuple[str, str, str], str] = {}
         # (chat_id, entity_type) -> next index
         self._counters: dict[tuple[str, str], int] = {}
         self.get_placeholder_calls: list[tuple[str, str, str]] = []
@@ -203,9 +205,19 @@ class FakeVault:
     async def get_or_create_thread(self, chat_id: str) -> None:
         return None
 
-    async def get_placeholder(self, chat_id: str, original: str, entity_type: str) -> str:
+    async def get_placeholder(
+        self,
+        chat_id: str,
+        original: str,
+        entity_type: str,
+        lookup_value: str | None = None,
+    ) -> str:
+        """Mirrors `ThreadVault.get_placeholder`, including the TRAU-530 split:
+        dedup on `lookup_value` (normalized identity), store `original` (the
+        literal text). First-write-wins on the stored value, matching the real
+        vault's `ON CONFLICT DO UPDATE` which never rewrites `original_value`."""
         self.get_placeholder_calls.append((chat_id, original, entity_type))
-        key = (chat_id, entity_type, original)
+        key = (chat_id, entity_type, original if lookup_value is None else lookup_value)
         existing = self._mappings.get(key)
         if existing is not None:
             return existing
@@ -213,13 +225,17 @@ class FakeVault:
         self._counters[(chat_id, entity_type)] = n
         placeholder = f"[{entity_type}_{n}]"
         self._mappings[key] = placeholder
+        self._originals[key] = original
         return placeholder
 
     async def snapshot_for_request(self, chat_id: str) -> tuple[dict[str, str], dict[str, str]]:
         forward: dict[str, str] = {}
         reverse: dict[str, str] = {}
-        for (cid, _etype, original), placeholder in self._mappings.items():
-            if cid == chat_id:
+        for key, placeholder in self._mappings.items():
+            if key[0] == chat_id:
+                # Keyed/valued on the LITERAL stored text, never the lookup key —
+                # `_build_vault_remasker` matches these against raw message text.
+                original = self._originals[key]
                 forward[original] = placeholder
                 reverse[placeholder] = original
         return forward, reverse

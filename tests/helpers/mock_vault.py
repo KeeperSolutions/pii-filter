@@ -9,12 +9,17 @@ Storage model — one entry per chat_id::
 
     {
         "chatA": {
-            "forward":  {"Ivan Horvat": "[PERSON_1]", ...},
+            "lookup":   {"Ivan Horvat": "[PERSON_1]", ...},   # normalized key
+            "forward":  {"Ivan Horvat": "[PERSON_1]", ...},   # literal original
             "reverse":  {"[PERSON_1]": "Ivan Horvat", ...},
             "counters": {"PERSON": 1, "HR_OIB": 1, ...},
         },
         ...
     }
+
+`lookup` is keyed by the normalized `lookup_value` (dedup identity) while
+`forward`/`reverse` hold the LITERAL stored text — the TRAU-530 split, mirrored
+from the real vault so tests exercise the same semantics.
 
 No TTL semantics — entries live for the lifetime of the instance.
 """
@@ -25,13 +30,14 @@ from typing import Any, TypedDict
 
 
 class _ThreadState(TypedDict):
+    lookup: dict[str, str]
     forward: dict[str, str]
     reverse: dict[str, str]
     counters: dict[str, int]
 
 
 def _new_thread_state() -> _ThreadState:
-    return {"forward": {}, "reverse": {}, "counters": {}}
+    return {"lookup": {}, "forward": {}, "reverse": {}, "counters": {}}
 
 
 class MockThreadVault:
@@ -69,10 +75,16 @@ class MockThreadVault:
         chat_id: str,
         original_value: str,
         entity_type: str,
+        lookup_value: str | None = None,
     ) -> str:
+        """Dedup on `lookup_value` (normalized identity), store `original_value`
+        (the literal text). Mirrors the real vault's TRAU-530 split, including
+        first-write-wins: `ON CONFLICT DO UPDATE` never rewrites the stored
+        value, so the first literal form to claim a key keeps it."""
         state = self._threads.setdefault(chat_id, _new_thread_state())
+        key = original_value if lookup_value is None else lookup_value
 
-        existing = state["forward"].get(original_value)
+        existing = state["lookup"].get(key)
         if existing is not None:
             return existing
 
@@ -80,6 +92,7 @@ class MockThreadVault:
         state["counters"][entity_type] = counter
         placeholder = f"[{entity_type}_{counter}]"
 
+        state["lookup"][key] = placeholder
         state["forward"][original_value] = placeholder
         state["reverse"][placeholder] = original_value
         return placeholder
