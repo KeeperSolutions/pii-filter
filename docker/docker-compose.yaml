@@ -32,6 +32,26 @@ services:
     image: pii-filter-pipelines:local
     ports:
       - "9099:9099"
+    volumes:
+      # Live-mount the filter over the copy baked into the image, so editing
+      # pii_filter.py and running `docker compose restart pipelines` is enough
+      # — no rebuild. The Dockerfile's COPY is still what makes the image
+      # self-contained when run without this compose file; the mount shadows it.
+      #
+      # The whole repo root is mounted (not just the single file) on purpose:
+      # a single-file bind mount pins one inode, and editors that save
+      # atomically (write temp + rename) swap the inode, so the container would
+      # keep seeing the ORIGINAL file forever while the host shows new content.
+      # Mounting the directory and pointing at a file inside it re-resolves the
+      # path on every open, which survives atomic saves.
+      - ..:/src:ro
+    # Refresh the filter from the mount, then hand off to the image's normal
+    # entrypoint. This runs on every container start, so `restart` is enough to
+    # pick up edits. `exec` keeps start.sh as PID 1 so signals/shutdown behave.
+    entrypoint:
+      - bash
+      - -c
+      - cp /src/pii_filter.py /app/pipelines/pii_filter_pipeline.py && exec bash start.sh
     depends_on:
       postgres:
         condition: service_healthy

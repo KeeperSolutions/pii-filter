@@ -51,14 +51,35 @@ for chat — add one in the UI, or fill in the commented `OPENAI_API_BASE_URLS` 
 
 ## Iterating on the filter
 
-`pii_filter.py` is baked into the image at build time, so after editing it:
+Edit `pii_filter.py`, then:
 
 ```sh
-docker compose -f docker/docker-compose.yaml up -d --build pipelines
+docker compose -f docker/docker-compose.yaml restart pipelines
 ```
 
-The rebuild is a single `COPY` layer, so it is fast. Startup itself takes
-~30-60s: the spaCy models and the 300M-parameter GLiNER model load into RAM.
+No rebuild. The repo root is mounted read-only at `/src`, and the container's
+entrypoint copies `/src/pii_filter.py` into place on every start, so a restart
+always runs the current code.
+
+A rebuild (`up -d --build pipelines`) is only needed when the *image* changes —
+a new dependency in the frontmatter `requirements:` line, or a change to the
+Dockerfile.
+
+Startup takes ~30-60s regardless: the spaCy models and the 300M-parameter
+GLiNER model load into RAM. That is the floor on the iteration loop.
+
+### Why the whole repo is mounted, not just the one file
+
+A single-file bind mount pins one inode. Editors that save atomically (write a
+temp file, then rename over the original) swap the inode, so the container
+would keep seeing the *original* file indefinitely while the host shows the new
+content — a genuinely confusing failure, because nothing errors. Mounting the
+directory and reading a path inside it re-resolves on every open, which
+survives atomic saves.
+
+The image still `COPY`s the filter at build time. That is what keeps the image
+self-contained if it is ever run without this compose file; the mount just
+shadows it.
 
 ## Watching what the filter does
 
