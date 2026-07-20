@@ -4,39 +4,40 @@ Runs this repo's `pii_filter.py` as a filter inside an OpenWebUI Pipelines
 server, backed by Postgres, so the masking behaviour can be exercised from a
 real chat UI.
 
-## Prerequisite: build the base image once
+## Setup
 
-This repo contains only `pii_filter.py`. It has none of the Pipelines server
-code (`main.py`, `start.sh`, `utils/`) and none of the heavy runtime the filter
-needs — CPU torch, the spaCy `hr`/`en` 3.7.0 models, and the vendored
-GLiNER2-PII model. The sibling `keeper/pipelines-v4` repo's Dockerfile already
-assembles all of that, so this image layers on top of it:
+Create the env file and generate a vault key:
 
 ```sh
-cd ../pipelines-v4
-docker compose build pipelines      # ~30 min, several GB — one time only
+cp docker/.env.example docker/.env
+python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+# paste the result as PII_FILTER_VAULT_BLIND_INDEX_KEY in docker/.env
 ```
 
-That produces `pipelines-v4-pipelines:latest`, which `docker/Dockerfile` uses
-as its base. Building on top of it takes seconds instead of repeating the
-dependency bake here.
+`docker/.env` is gitignored. No key is committed to the repo — the compose file
+fails immediately with a named error if the variable is missing, rather than
+booting a half-configured vault.
 
-**Trade-off:** the test image is coupled to a locally-built tag that is not
-reproducible from this repo alone. That is deliberate — it buys a fast
-edit/test loop. If you ever need a standalone image, copy the builder stage
-from `pipelines-v4/Dockerfile` into `docker/Dockerfile` and vendor the
-Pipelines server code alongside it.
+Keep that key **stable** for the life of the `pii-postgres` volume. The blind
+index is a keyed HMAC, so changing it orphans every row already written:
+existing placeholders stop resolving and outlet quietly stops restoring
+originals.
 
 ## Run
 
 From the **repo root** (the build context is `..` so the Dockerfile can reach
-`pii_filter.py`):
+`pii_filter.py` and `requirements.txt`):
 
 ```sh
 docker compose -f docker/docker-compose.yaml up -d --build
 ```
 
 Then open <http://localhost:3000>.
+
+The first build takes ~20-30 min and produces a multi-GB image — almost all of
+it CPU torch plus the three models (spaCy `hr`/`en` 3.7.0 and GLiNER2-PII,
+vendored so startup needs no HuggingFace egress). It builds from public images
+only, so it is reproducible on any machine, and it caches afterwards.
 
 | Service      | Port | Purpose                                  |
 |--------------|------|------------------------------------------|
@@ -100,15 +101,14 @@ file leaves all three at the **repo** default:
 - `degradation_mode: "block"` — fail-closed. If the analyzer errors, the
   request is rejected rather than forwarded unfiltered. Kept so failures are
   loud during testing; the deployment copy uses `passthrough`.
-- `vault_encryption_enabled: false` — no ENC1 envelope. See the compose file
-  for how to turn it on.
+- `vault_encryption_enabled: false` — no ENC1 envelope. See `.env.example` for
+  how to turn it on.
 - `priority: 0` — the deployment copy uses `-10` purely to order the PII filter
   ahead of the Langfuse filter, which this stack does not run.
 
 The blind-index key **is** required even with encryption off (`lookup_hash` is
-`NOT NULL` and part of the primary key, spec D1). The compose file supplies a
-fixed throwaway key for that reason. It is a local-test value only — never use
-it anywhere deployed.
+`NOT NULL` and part of the primary key, spec D1), which is why setup asks for
+one regardless.
 
 ## Teardown
 

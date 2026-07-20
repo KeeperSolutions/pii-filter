@@ -18,7 +18,7 @@ import pytest_asyncio
 from presidio_analyzer import RecognizerResult
 
 from pii_filter import CUSTOM_ENTITY_TYPES, GLiNER2Detector, Pipeline, mask_text, restore_text
-from tests.conftest import postgres_binary_missing
+from tests.conftest import FakeGliner, postgres_binary_missing
 from tests.helpers.mock_vault import MockThreadVault
 
 
@@ -492,11 +492,24 @@ async def test_inlet_coreference_merges_surname_placeholder(
     """Within-message coreference: a bare surname reuses the full name's
     placeholder through the real inlet/vault path.
 
-    NER-dependent: needs the analyzer to detect BOTH 'Ivana Lukić' (full) and a
-    bare 'Lukić' as PERSON. If this environment's NER doesn't produce both
-    spans, skip rather than fail (mirrors the EN-model skip convention used by
-    other integration tests in this module). The deterministic placeholder-key
-    logic is covered exhaustively by the `mask_text` and helper unit tests.
+    Drives a canned PERSON source rather than whatever NER this environment
+    happens to have. Previously this asked the live analyzer for both
+    'Ivana Lukić' and a bare 'Lukić' and called `pytest.skip` when it did not
+    get them — which meant that with GLiNER absent (the default: the conftest
+    stub returns no detections without torch installed), the test silently
+    skipped and the coreference path had NO automated coverage at all.
+
+    Injecting the detector makes the assertion unconditional and pins the exact
+    asymmetric-recall shape this logic exists for: the full name and the bare
+    surname both come back as PERSON, and the shorter one must not mint its own
+    placeholder. Real-model inference stays out of scope here — that is an
+    end-to-end concern, exercised by the docker/ stack.
+
+    Asserted on the masked TEXT rather than the detection list: since TRAU-529,
+    a sub-value subsumed by a longer value sharing its placeholder is masked by
+    the full-value pass and deliberately not recorded as its own detection (it
+    would double-count one entity). So `pii_detections` holds only
+    'Ivana Lukić', while both occurrences in the text are masked.
     """
     assert started_pipeline.valves.ner_person_coreference_enabled is True
     text = (
@@ -508,21 +521,29 @@ async def test_inlet_coreference_merges_surname_placeholder(
         "metadata": {"chat_id": "coref-inlet"},
     }
 
-    result = await started_pipeline.inlet(body)
+    real_gliner = started_pipeline._gliner
+    started_pipeline._gliner = FakeGliner(
+        name_spans={"Ivana Lukić": "PERSON", "Lukić": "PERSON"}
+    )
+    try:
+        result = await started_pipeline.inlet(body)
+    finally:
+        started_pipeline._gliner = real_gliner
 
     detections = result["metadata"].get("pii_detections", [])
     originals = {
         d["original"]: d["placeholder"] for d in detections if d["entity_type"] == "PERSON"
     }
-    if "Ivana Lukić" not in originals or "Lukić" not in originals:
-        pytest.skip(
-            "NER did not produce both 'Ivana Lukić' and a bare 'Lukić' as PERSON "
-            f"in this environment; got PERSON originals {sorted(originals)}"
-        )
-    # The bare surname reuses the full name's placeholder.
-    assert originals["Lukić"] == originals["Ivana Lukić"]
+    assert "Ivana Lukić" in originals, f"full name not detected; got {sorted(originals)}"
+    placeholder = originals["Ivana Lukić"]
     masked = result["messages"][-1]["content"]
-    assert masked.count(originals["Ivana Lukić"]) >= 2
+
+    # The bare surname reuses the full name's placeholder rather than minting
+    # its own, so the same placeholder covers both mentions...
+    assert masked.count(placeholder) == 2, masked
+    # ...and neither the full name nor the standalone surname survives raw.
+    assert "Ivana Lukić" not in masked, masked
+    assert "Lukić" not in masked, masked
 
 
 @pytest.mark.asyncio(loop_scope="module")

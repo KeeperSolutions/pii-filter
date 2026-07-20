@@ -64,22 +64,23 @@ services:
       PII_FILTER_POSTGRES_URL: postgresql://pii:pii@postgres:5432/pii
       PII_FILTER_VAULT_ENABLED: "true"
 
-      # THROWAWAY LOCAL-TEST KEYS — NEVER use these anywhere deployed.
-      # They are the byte ranges 0x00..0x1f and 0x20..0x3f, the same fixed dev
-      # pair tests/conftest.py uses, so the stack boots with no setup step.
+      # Vault keys come from docker/.env (gitignored) — see docker/.env.example.
+      # Deliberately NOT defaulted inline: a key committed to the repo is one
+      # people copy into somewhere real, and it trips secret scanners. The `:?`
+      # form fails the stack immediately with this message instead of booting a
+      # half-configured vault.
       #
       # The blind-index key is required whenever the vault runs, even with
       # encryption OFF: lookup_hash is NOT NULL and part of the primary key
       # (spec D1), so _build_vault_crypto fails closed without it.
-      PII_FILTER_VAULT_BLIND_INDEX_KEY: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="
+      PII_FILTER_VAULT_BLIND_INDEX_KEY: ${PII_FILTER_VAULT_BLIND_INDEX_KEY:?set it in docker/.env — copy docker/.env.example and generate a key}
 
       # Encryption-at-rest is OFF by default in this repo (the deployment copy
-      # defaults it ON). Uncomment both lines to exercise the ENC1 envelope
-      # path; the encryption key must differ from the blind-index key above.
-      # Generate a real pair with:
-      #   python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
-      # PII_FILTER_VAULT_ENCRYPTION_ENABLED: "true"
-      # PII_FILTER_VAULT_ENCRYPTION_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+      # defaults it ON). These pass through from docker/.env when set there, and
+      # stay empty otherwise, which leaves encryption off.
+      PII_FILTER_VAULT_ENCRYPTION_ENABLED: ${PII_FILTER_VAULT_ENCRYPTION_ENABLED:-false}
+      PII_FILTER_VAULT_ENCRYPTION_KEY: ${PII_FILTER_VAULT_ENCRYPTION_KEY:-}
+      PII_FILTER_VAULT_ENCRYPTION_STRICT: ${PII_FILTER_VAULT_ENCRYPTION_STRICT:-false}
 
       # --- debugging -------------------------------------------------------
       # TRAU-529's mask report: logs original vs masked text plus a
